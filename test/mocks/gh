@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Just echo what was requested if debug enabled
+[[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "gh mock called with: $*" >&2
+
+# Return mock data or success based on environment variables
+case "${GH_MOCK_EXIT:-0}" in
+  0)
+    case "${GH_MOCK_OUTPUT:-}" in
+      "") echo '{"default_branch":"main"}' ;;
+      *) echo "$GH_MOCK_OUTPUT" ;;
+    esac
+    ;;
+  *) exit "${GH_MOCK_EXIT}" ;;
+esac

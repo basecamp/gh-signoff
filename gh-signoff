@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEBUG=${SIGNOFF_DEBUG:-}
+VERSION="0.1.0"
+
+trap 'fail "Unexpected error on line $LINENO ($?)"' ERR
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git command not found" >&2
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "Error: gh command not found. Please install GitHub CLI: https://cli.github.com" >&2
+  exit 1
+fi
+
+debug() {
+  if [[ -n "$DEBUG" ]]; then
+    echo "Debug: $*" >&2
+  fi
+}
+
+fail() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+is_clean() {
+  local git_cmd=$(command -v git)
+
+  if [[ -n "$($git_cmd status --porcelain)" ]]; then
+    debug "found uncommitted changes"
+    return 1
+  fi
+
+  if ! $git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null; then
+    debug "no tracking branch found"
+    fail "current branch is not tracking a remote branch"
+  fi
+
+  if [[ -n "$($git_cmd log @{push}..)" ]]; then
+    debug "found unpushed changes"
+    return 1
+  fi
+
+  return 0
+}
+
+cmd_create() {
+  local force=false
+  if [[ "${1:-}" == "-f" ]]; then
+    force=true
+    shift
+  fi
+
+  if ! $force && ! is_clean; then
+    fail "repository has uncommitted or unpushed changes"
+  fi
+
+  local user
+  user=$(git config user.name) || fail "failed to get git user name"
+  [[ -z "$user" ]] && fail "git user.name is not set"
+
+  local sha
+  sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+
+  debug "creating status for commit ${sha} by ${user}"
+
+  gh api \
+    --method POST \
+    "repos/:owner/:repo/statuses/${sha}" \
+    -f state=success \
+    -f context=signoff \
+    -f "description=${user} signed off" || fail "failed to create status"
+
+  echo "✓ Signed off on ${sha}"
+}
+
+cmd_install() {
+  local branch
+  branch="${1:-}"
+
+  if [[ -z "$branch" ]]; then
+    branch=$(gh api repos/:owner/:repo --jq .default_branch) ||
+      fail "failed to get default branch"
+  fi
+  [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  debug "installing protection on branch: ${branch}"
+
+  gh api "/repos/basecamp/signoff/branches/${branch}/protection" \
+    --method PUT \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --field "required_status_checks[strict]=false" \
+    --field "required_status_checks[contexts][]=signoff" \
+    --field "enforce_admins=null" \
+    --field "required_pull_request_reviews=null" \
+    --field "restrictions=null" >/dev/null || fail "failed to set branch protection"
+
+  echo "✓ GitHub ${branch} branch now requires signoff"
+}
+
+cmd_uninstall() {
+  local branch
+  if [[ -z "${1:-}" ]]; then
+    branch=$(gh api repos/:owner/:repo --jq .default_branch) || fail "failed to get default branch"
+  else
+    branch="$1"
+  fi
+  [[ -z "$branch" ]] && fail "branch name cannot be empty"
+  debug "removing protection from branch: ${branch}"
+
+  gh api \
+    --method DELETE \
+    "repos/:owner/:repo/branches/${branch}/protection" || fail "failed to remove branch protection"
+
+  echo "✓ GitHub ${branch} branch no longer requires signoff"
+}
+
+cmd_check() {
+  local branch
+  branch="${1:-}"
+
+  if [[ -z "$branch" ]]; then
+    branch=$(gh api repos/:owner/:repo --jq .default_branch) ||
+      fail "failed to get default branch"
+  fi
+  [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  debug "checking protection for branch: ${branch}"
+
+  if gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null | jq -e '.required_status_checks.contexts | contains(["signoff"])' >/dev/null 2>&1; then
+    echo "✓ GitHub ${branch} branch requires signoff"
+  else
+    echo "✗ GitHub ${branch} branch does not require signoff"
+  fi
+}
+
+cmd_completion() {
+  cat <<'EOF'
+# bash completion for gh signoff
+
+_gh_signoff() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  case "$prev" in
+    signoff)
+      COMPREPLY=( $(compgen -W "create install uninstall check version -f --help" -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  return 0
+}
+
+complete -F _gh_signoff gh-signoff
+EOF
+}
+
+cmd_version() {
+  echo "gh-signoff ${VERSION}"
+}
+
+cmd_help() {
+  cat <<'EOF'
+Sign off on commits without CI infrastructure.
+
+USAGE
+  gh signoff [flags] [command]
+
+COMMANDS
+  create (default) Sign off on the current commit
+  install          Install signoff requirement
+  uninstall        Uninstall signoff requirement
+  check            Check if signoff is required
+  version          Show gh-signoff version
+  completion       Output shell completion code
+
+FLAGS
+  -f  Force sign off (ignore uncommitted/unpushed changes)
+
+EXAMPLES
+  gh signoff             # Sign off on current commit
+  gh signoff -f          # Force sign off
+  gh signoff install     # Require signoff on default branch
+  gh signoff check main  # Check specific branch
+
+COMPLETION
+  # Add to ~/.bashrc:
+  eval "$(gh signoff completion)"
+EOF
+}
+
+case "${1:-}" in
+  "")               cmd_create "$@" ;;
+  "create")         shift; cmd_create "$@" ;;
+  "install")        shift; cmd_install "$@" ;;
+  "uninstall")      shift; cmd_uninstall "$@" ;;
+  "check")          shift; cmd_check "$@" ;;
+  "version")        cmd_version ;;
+  "completion")     cmd_completion ;;
+  "-h" | "--help")  cmd_help ;;
+  *)                cmd_help; exit 1 ;;
+esac
