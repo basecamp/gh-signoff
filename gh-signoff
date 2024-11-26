@@ -73,7 +73,7 @@ cmd_create() {
     "repos/:owner/:repo/statuses/${sha}" \
     -f state=success \
     -f context=signoff \
-    -f "description=${user} signed off" || fail "failed to create status"
+    -f "description=${user} signed off" >/dev/null || fail "failed to create status"
 
   echo "✓ Signed off on ${sha}"
 }
@@ -115,7 +115,7 @@ cmd_uninstall() {
 
   gh api \
     --method DELETE \
-    "repos/:owner/:repo/branches/${branch}/protection" || fail "failed to remove branch protection"
+    "repos/:owner/:repo/branches/${branch}/protection" >/dev/null || fail "failed to remove branch protection"
 
   echo "✓ GitHub ${branch} branch no longer requires signoff"
 }
