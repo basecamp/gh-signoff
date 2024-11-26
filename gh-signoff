@@ -35,7 +35,7 @@ is_clean() {
     return 1
   fi
 
-  if ! $git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null; then
+  if ! $git_cmd rev-parse --abbrev-ref @{push} >/dev/null 2>&1; then
     debug "no tracking branch found"
     fail "current branch is not tracking a remote branch"
   fi
