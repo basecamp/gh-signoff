@@ -90,7 +90,7 @@ cmd_install() {
 
   debug "installing protection on branch: ${branch}"
 
-  gh api "/repos/basecamp/signoff/branches/${branch}/protection" \
+  gh api "/repos/:owner/:repo/branches/${branch}/protection" \
     --method PUT \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
