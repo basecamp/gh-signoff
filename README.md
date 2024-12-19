@@ -17,19 +17,22 @@ Run your test suite (`rails test`) and sign off on your work when it passes (`si
 You're the CI now. ✌️👀
 
 
-## How to set up your app
+## How to sign off
 
 ```bash
 # Install the extension
 gh extension install basecamp/gh-signoff
 
-# Require signoff to merge PRs
-gh signoff install
-
 # When your tests pass, sign off on your PR
 gh signoff
 ```
 
+### To require signoff for PR merges
+
+```bash
+# Require signoff to merge PRs
+gh signoff install
+```
 
 ### Bash completion
 
