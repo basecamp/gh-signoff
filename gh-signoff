@@ -186,7 +186,7 @@ FLAGS
 
 EXAMPLES
   gh signoff             # Sign off on current commit
-  gh signoff -f          # Force sign off
+  gh signoff create -f   # Force sign off
   gh signoff install     # Require signoff on default branch
   gh signoff check main  # Check specific branch
 
