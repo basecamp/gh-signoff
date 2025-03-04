@@ -12,7 +12,7 @@ A green GitHub commit status is just the ticket, but it's quite a hassle to get 
 
 So let's do it ourselves. Bring CI back in-house.
 
-Run your test suite (`rails test`) and sign off on your work when it passes (`signoff`).
+Run your test suite (`rails test`) and sign off on your work when it passes (`gh signoff`).
 
 You're the CI now. ✌️👀
 
