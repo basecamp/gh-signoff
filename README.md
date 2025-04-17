@@ -27,16 +27,16 @@ gh extension install basecamp/gh-signoff
 gh signoff
 ```
 
-### To require sign-off for PR merges
+### To require signoff for PR merges
 
 ```bash
-# Require sign-off to merge PRs
+# Require signoff to merge PRs
 gh signoff install
 ```
 
-## Advanced usage: Partial sign-off
+## Advanced usage: Partial signoff
 
-A single sign-off is all you need for most projects. If you're feeling extra fancy, picky, or organized, you can use *partial* sign-off to reflect each CI step, each build platform (e.g. linux, macos, windows), each sign-off role (e.g. qa, dev, ops), etc.
+A single signoff is all you need for most projects. If you're feeling extra fancy, picky, or organized, you can use *partial* signoff to reflect each CI step, each build platform (e.g. linux, macos, windows), each signoff role (e.g. qa, dev, ops), etc.
 
 ```bash
 # Sign off on CI steps
@@ -48,21 +48,40 @@ gh signoff security   # Security scan is happy
 gh signoff tests lint security
 ```
 
-To require partial sign-off:
+To require partial signoff:
 
 ```bash
-# Require partial sign-off for the default branch
+# Require partial signoff for the default branch
 gh signoff install security
 
-# Require multiple sign-offs at once
+# Require multiple signoffs at once
 gh signoff install tests lint security
 
 # With a specific branch
 gh signoff install --branch main tests lint security
 
-# Check if partial sign-off is required
+# Check if partial signoff is required
 gh signoff check tests
 gh signoff check --branch main tests lint security
+```
+
+### Checking signoff status
+
+Check whether you've signed off on the current commit:
+
+```bash
+gh signoff status
+✓ signoff
+```
+
+With partial signoff:
+
+```bash
+gh signoff status
+✓ signoff
+✓ tests
+✗ lint
+✗ security
 ```
 
 ### Bash completion

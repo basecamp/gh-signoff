@@ -1,16 +1,117 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Just echo what was requested if debug enabled
-[[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "gh mock called with: $*" >&2
+# --- Default Mock Responses & Exit Codes ---
+# These can be overridden by environment variables in specific tests
+: ${MOCK_DEFAULT_BRANCH_JSON:='{"default_branch":"main"}'}
+: ${MOCK_DEFAULT_BRANCH_EXIT:=0}
 
-# Return mock data or success based on environment variables
-case "${GH_MOCK_EXIT:-0}" in
-  0)
-    case "${GH_MOCK_OUTPUT:-}" in
-      "") echo '{"default_branch":"main"}' ;;
-      *) echo "$GH_MOCK_OUTPUT" ;;
-    esac
-    ;;
-  *) exit "${GH_MOCK_EXIT}" ;;
-esac
+: ${MOCK_COMMIT_STATUS_JSON:='{"statuses":[]}'}
+: ${MOCK_COMMIT_STATUS_EXIT:=0}
+
+: ${MOCK_BRANCH_PROTECTION_JSON:=''} # Empty means no protection found
+: ${MOCK_BRANCH_PROTECTION_EXIT:=1}  # Default to exit 1 (like 404 Not Found)
+
+: ${MOCK_POST_STATUS_EXIT:=0}
+: ${MOCK_PUT_PROTECTION_EXIT:=0}
+: ${MOCK_DELETE_PROTECTION_EXIT:=0}
+
+# --- Debugging ---
+if [[ -n "${GH_MOCK_DEBUG:-}" ]]; then
+  echo "--- gh mock called ---" >&2
+  echo "Args: $*" >&2
+  echo "Env Vars:" >&2
+  compgen -e | grep '^MOCK_' | while read -r var; do
+    echo "  ${var}=${!var}" >&2
+  done
+  echo "----------------------" >&2
+fi
+
+# --- Argument Parsing & Mock Logic ---
+api_method="GET" # Default method
+api_path=""
+jq_filter=""
+
+# Simple argument parsing loop
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    api)
+      shift # Consume 'api'
+      ;;
+    --method)
+      api_method="$2"
+      shift 2
+      ;;
+    --jq)
+      jq_filter="$2"
+      shift 2
+      ;;
+    # Assume the first non-flag argument after 'api' is the path
+    -*)
+      # Ignore other flags for now (like -f, -H)
+      shift
+      if [[ "$1" != -* && $# -gt 0 ]]; then
+         shift # Consume flag argument
+      fi
+      ;;
+    *)
+      if [[ -z "$api_path" ]]; then
+        api_path="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# --- Determine Response Based on API Call ---
+
+# Default Branch Call
+if [[ "$api_path" == "repos/:owner/:repo" && "$jq_filter" == ".default_branch" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Default Branch" >&2
+  if [[ "$MOCK_DEFAULT_BRANCH_EXIT" -eq 0 ]]; then
+    # Extract just the default_branch value using jq, not the entire JSON
+    echo "$MOCK_DEFAULT_BRANCH_JSON" | jq -r '.default_branch'
+  fi
+  exit "$MOCK_DEFAULT_BRANCH_EXIT"
+
+# Commit Status Call (GET)
+elif [[ "$api_method" == "GET" && "$api_path" == *"commits/"*"/status"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Commit Status" >&2
+  if [[ "$MOCK_COMMIT_STATUS_EXIT" -eq 0 ]]; then
+    echo "$MOCK_COMMIT_STATUS_JSON"
+  fi
+  exit "$MOCK_COMMIT_STATUS_EXIT"
+
+# Branch Protection Call (GET)
+elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Branch Protection" >&2
+  if [[ "$MOCK_BRANCH_PROTECTION_EXIT" -eq 0 ]]; then
+    echo "$MOCK_BRANCH_PROTECTION_JSON"
+  fi
+  exit "$MOCK_BRANCH_PROTECTION_EXIT"
+
+# Create Status Call (POST)
+elif [[ "$api_method" == "POST" && "$api_path" == *"statuses/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched POST Commit Status" >&2
+  # POST usually doesn't output significant JSON on success in this script's usage
+  exit "$MOCK_POST_STATUS_EXIT"
+
+# Update Branch Protection Call (PUT)
+elif [[ "$api_method" == "PUT" && "$api_path" == *"branches/"*"/protection"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Branch Protection" >&2
+  exit "$MOCK_PUT_PROTECTION_EXIT"
+
+# Delete Branch Protection Call (DELETE)
+elif [[ "$api_method" == "DELETE" && "$api_path" == *"branches/"*"/protection"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Branch Protection" >&2
+  exit "$MOCK_DELETE_PROTECTION_EXIT"
+
+# Fallback for unhandled calls
+else
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: No specific match found for '$api_method $api_path'" >&2
+  # Default success for other potential calls like 'gh auth status' etc.
+  # Or fail if strict matching is desired:
+  # echo "Error: Unhandled mock API call: $api_method $api_path" >&2
+  # exit 99
+  exit 0
+fi

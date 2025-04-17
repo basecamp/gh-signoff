@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-VERSION="0.1.0"
+VERSION="0.2.0"
+
+# Status symbols for consistent display - export them for both script and tests
+export STATUS_SUCCESS="✓"
+export STATUS_PENDING="⟳"
+export STATUS_FAILURE="✗"
 
 trap 'fail "Unexpected error on line $LINENO ($?)"' ERR
 
@@ -25,6 +31,35 @@ debug() {
 fail() {
   echo "Error: $*" >&2
   exit 1
+}
+
+# Get signoff contexts from branch protection
+get_signoff_contexts() {
+  local branch="${1:-}"
+  local contexts=()
+
+  # If branch not specified, use default branch
+  if [[ -z "$branch" ]]; then
+    branch=$(gh api repos/:owner/:repo --jq .default_branch 2>/dev/null) || return 0
+  fi
+
+  # Get branch protection
+  local protection
+  protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || return 0
+
+  # Extract signoff contexts (strip 'signoff/' prefix for display)
+  while read -r ctx; do
+    [[ -z "$ctx" ]] && continue
+    if [[ "$ctx" == "signoff/"* ]]; then
+      contexts+=("${ctx#signoff/}")
+    elif [[ "$ctx" == "signoff" ]]; then
+      # Skip the default signoff context
+      continue
+    fi
+  done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
+
+  # Return contexts
+  printf "%s\n" "${contexts[@]}"
 }
 
 is_clean() {
@@ -105,19 +140,19 @@ cmd_create() {
       -f state=success \
       -f context="${context_name}" \
       -f "description=${user} signed off" >/dev/null; then
-      
+
       # Build success message
       if [[ -z "$context" ]]; then
-        success_messages+=("✓ Signed off on ${sha}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha}")
       else
-        success_messages+=("✓ Signed off on ${sha} for ${context}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha} for ${context}")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "✗ Failed to sign off on ${sha}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${sha}" >&2
       else
-        echo "✗ Failed to sign off on ${sha} for ${context}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${sha} for ${context}" >&2
       fi
     fi
   done
@@ -134,7 +169,7 @@ cmd_install() {
   local branch=""
   local contexts=()
   # All arguments except --branch are contexts
-  
+
   # Process arguments with proper option handling
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -174,7 +209,7 @@ cmd_install() {
   api_fields+=("--field" "enforce_admins=null")
   api_fields+=("--field" "required_pull_request_reviews=null")
   api_fields+=("--field" "restrictions=null")
-  
+
   for context in "${contexts[@]}"; do
     local context_name="signoff"
     if [[ -n "$context" ]]; then
@@ -193,13 +228,13 @@ cmd_install() {
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "✓ GitHub ${branch} branch now requires signoff"
+    echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "✓ GitHub ${branch} branch now requires signoff"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
       else
-        echo "✓ GitHub ${branch} branch now requires signoff on ${context}"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff on ${context}"
       fi
     done
   fi
@@ -209,7 +244,7 @@ cmd_uninstall() {
   local branch=""
   local contexts=()
   # All arguments except --branch are contexts
-  
+
   # Process arguments with option handling
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -235,7 +270,7 @@ cmd_uninstall() {
     branch=$(gh api repos/:owner/:repo --jq .default_branch) || fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
-  
+
   # TODO: Implement context-specific uninstall that preserves other contexts
   # For now we just remove all branch protection which is the current behavior
   debug "removing protection from branch: ${branch}"
@@ -251,13 +286,13 @@ cmd_uninstall() {
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "✓ GitHub ${branch} branch no longer requires signoff"
+    echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "✓ GitHub ${branch} branch no longer requires signoff"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
       else
-        echo "✓ GitHub ${branch} branch no longer requires signoff on ${context}"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
       fi
     done
   fi
@@ -267,7 +302,7 @@ cmd_check() {
   local branch=""
   local contexts=()
   # All arguments except --branch are contexts
-  
+
   # Process arguments with option handling
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -305,9 +340,9 @@ cmd_check() {
   protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || {
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "✗ GitHub ${branch} branch does not require signoff"
+        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
       else
-        echo "✗ GitHub ${branch} branch does not require signoff on ${context}"
+        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
       fi
     done
     return 1
@@ -324,23 +359,134 @@ cmd_check() {
 
     if echo "$protection" | jq -e ".required_status_checks.contexts | contains([\"${context_name}\"])" >/dev/null 2>&1; then
       if [[ -z "$context" ]]; then
-        echo "✓ GitHub ${branch} branch requires signoff"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
       else
-        echo "✓ GitHub ${branch} branch requires signoff on ${context}"
+        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff on ${context}"
       fi
     else
       if [[ -z "$context" ]]; then
-        echo "✗ GitHub ${branch} branch does not require signoff"
+        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
       else
-        echo "✗ GitHub ${branch} branch does not require signoff on ${context}"
+        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
       fi
     fi
   done
 }
 
+cmd_status() {
+  local branch=""
+  local sha=""
+
+  # Process arguments with option handling
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        if [[ -z "$2" || "$2" == -* ]]; then
+          fail "option --branch requires an argument"
+        fi
+        branch="$2"
+        shift 2
+        ;;
+      -*)
+        fail "unknown option: $1"
+        ;;
+      *)
+        # For now we don't support filtering by context
+        fail "unexpected argument: $1"
+        ;;
+    esac
+  done
+
+  # If branch not specified, use default branch
+  if [[ -z "$branch" ]]; then
+    branch=$(gh api repos/:owner/:repo --jq .default_branch) || fail "failed to get default branch"
+  fi
+  [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  # Get current SHA
+  sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+
+  # Get commit statuses
+  local statuses
+  statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" 2>/dev/null) || {
+    echo "${STATUS_FAILURE} Could not get status for commit ${sha}"
+    return 1
+  }
+
+  # Create required contexts list - always start with "signoff"
+  local required=("signoff")
+
+  # Add any additional contexts from branch protection
+  local protection
+  protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || debug "No branch protection found"
+  if [[ -n "$protection" ]]; then
+    # Add required signoff contexts from branch protection
+    while read -r ctx; do
+      [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
+      required+=("$ctx")
+    done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
+  fi
+
+  # Create a map of actual contexts and their states
+  declare -A context_states
+  while read -r context state; do
+    [[ -z "$context" ]] && continue
+    context_states["$context"]="$state"
+  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' 2>/dev/null)
+
+  # Add any actual contexts that aren't in required list
+  while read -r context; do
+    [[ -z "$context" ]] && continue
+
+    # Check if this context is already in required list
+    local found=false
+    for req in "${required[@]}"; do
+      if [[ "$req" == "$context" ]]; then
+        found=true
+        break
+      fi
+    done
+
+    # If not in required list, add it
+    if [[ "$found" == "false" ]]; then
+      required+=("$context")
+    fi
+  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | .context' 2>/dev/null)
+
+  # Generate status output for all contexts (required + actual)
+  local all_results=()
+  for context in "${required[@]}"; do
+    local display_name="$context"
+    [[ "$context" == "signoff/"* ]] && display_name="${context#signoff/}"
+    [[ "$context" == "signoff" ]] && display_name="signoff"
+
+    # Check if we have a status for this context - use safe array access
+    if [[ -n "${context_states[$context]:-}" && "${context_states[$context]:-}" == "success" ]]; then
+      all_results+=("${STATUS_SUCCESS} $display_name")
+    else
+      all_results+=("${STATUS_FAILURE} $display_name")
+    fi
+  done
+
+  # Print all results
+  printf "%s\n" "${all_results[@]}"
+}
+
 cmd_completion() {
+  # Check if --contexts flag is passed
+  if [[ "${1:-}" == "--contexts" ]]; then
+    get_signoff_contexts
+    return
+  fi
+
   cat <<'EOF'
 # bash completion for gh signoff
+
+_gh_signoff_contexts() {
+  # Get dynamic contexts from branch protection
+  contexts=$(gh signoff completion --contexts 2>/dev/null)
+  echo "$contexts"
+}
 
 _gh_signoff() {
   local cur prev
@@ -349,15 +495,18 @@ _gh_signoff() {
 
   case "$prev" in
     signoff)
-      COMPREPLY=( $(compgen -W "create install uninstall check version -f --help tests lint security docs" -- "$cur") )
+      # Include dynamic contexts in top-level completion
+      local contexts=$(_gh_signoff_contexts)
+      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --help $contexts" -- "$cur") )
       return 0
       ;;
-    install|uninstall|check)
-      COMPREPLY=( $(compgen -W "--branch tests lint security docs performance" -- "$cur") )
+    create|install|uninstall|check)
+      local contexts=$(_gh_signoff_contexts)
+      COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
       return 0
       ;;
-    --branch)
-      COMPREPLY=( $(compgen -W "main develop" -- "$cur") )
+    status)
+      COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
       return 0
       ;;
   esac
@@ -365,6 +514,17 @@ _gh_signoff() {
   # If we are halfway through typing an option
   if [[ $cur == --* ]]; then
     COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
+    return 0
+  fi
+
+  # For partial signoffs, suggest context names
+  if [[ $COMP_CWORD -gt 1 && "${COMP_WORDS[1]}" != "install" &&
+        "${COMP_WORDS[1]}" != "uninstall" && "${COMP_WORDS[1]}" != "check" &&
+        "${COMP_WORDS[1]}" != "status" && "${COMP_WORDS[1]}" != "version" &&
+        "${COMP_WORDS[1]}" != "completion" && "${COMP_WORDS[1]}" != "--help" &&
+        "${COMP_WORDS[1]}" != "-h" ]]; then
+    local contexts=$(_gh_signoff_contexts)
+    COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
     return 0
   fi
 
@@ -391,6 +551,7 @@ COMMANDS
   install          Install signoff requirement
   uninstall        Uninstall signoff requirement
   check            Check if signoff is required
+  status           Show signoff status for the current commit
   version          Show gh-signoff version
   completion       Output shell completion code
 
@@ -401,16 +562,13 @@ OPTIONS
   --branch <branch>  Branch to operate on (for install, uninstall, check)
 
 EXAMPLES
-  gh signoff                           # Sign off on current commit
-  gh signoff tests                     # Sign off that tests pass for current commit
-  gh signoff tests lint security       # Sign off on multiple aspects at once
-  gh signoff create -f                 # Force sign off
-  gh signoff install                   # Require signoff on default branch
-  gh signoff install --branch main     # Require signoff on main branch
-  gh signoff install security          # Require security signoff on default branch
-  gh signoff install tests lint        # Require multiple signoffs
-  gh signoff check --branch main       # Check specific branch
-  gh signoff check tests lint          # Check multiple signoff statuses
+  gh signoff                         # Sign off on current commit
+  gh signoff create -f               # Force signoff
+  gh signoff install                 # Require signoff on default branch
+  gh signoff install --branch other  # Require signoff on a specific branch
+  gh signoff check                   # Check if signoff is required
+  gh signoff check --branch other    # Check if signoff is required on branch
+  gh signoff status                  # Show completed/pending signoff status
 
 COMPLETION
   # Add to ~/.bashrc:
@@ -424,8 +582,21 @@ case "${1:-}" in
   "install")        shift; cmd_install "$@" ;;
   "uninstall")      shift; cmd_uninstall "$@" ;;
   "check")          shift; cmd_check "$@" ;;
+  "status")         shift; cmd_status "$@" ;;
   "version")        cmd_version ;;
-  "completion")     cmd_completion ;;
+  "completion")     shift; cmd_completion "$@" ;;
   "-h" | "--help")  cmd_help ;;
-  *)                cmd_help; exit 1 ;;
+  *)
+    # Handle partial signoff contexts directly
+    if [[ "$1" == "-f" ]]; then
+      # Special case - forced signoff with no context
+      cmd_create -f
+    elif [[ "$1" == -* ]]; then
+      # Unknown option
+      cmd_help; exit 1
+    else
+      # Treat as partial signoff context(s)
+      cmd_create "$@"
+    fi
+    ;;
 esac
