@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.2.0"
+readonly VERSION="0.2.1"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
