@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -e
 
-if bats test/*.bats; then
-  ./gh-signoff tests
+# Directory containing this script
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$DIR")"
+DOCKER_DIR="$REPO_ROOT/test/docker"
+
+PASSED=true
+
+for version in 3 4 5; do
+  echo -e "\n\033[1;35mBash $version\033[0m"
+
+  docker build --quiet --pull -t "gh-signoff-test:bash$version" \
+    --build-arg "BASH_VERSION=$version" \
+    -f "$DOCKER_DIR/Dockerfile" \
+    "$DOCKER_DIR" >/dev/null
+
+  if docker run --rm -v "$REPO_ROOT:/app" "gh-signoff-test:bash$version"; then
+    echo "✅ Tests passed for Bash $version"
+    ./gh-signoff "bash-$version" || true
+  else
+    echo "❌ Tests failed for Bash $version"
+    PASSED=false
+  fi
+done
+
+if $PASSED; then
+  echo -e "\n✅ Tests passed for all Bash versions"
+  ./gh-signoff
+  exit 0
+else
+  exit 1
 fi
