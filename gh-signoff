@@ -427,12 +427,17 @@ cmd_status() {
     done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
   fi
 
-  # Create a map of actual contexts and their states
-  declare -A context_states
-  while read -r context state; do
+  # Extract context/state pairs into a string-based lookup map
+  # Format: "context1=state1;context2=state2;..."
+  # This is a lightweight alternative to associative arrays for Bash 3
+  local context_map=""
+
+  # Extract all contexts with success state
+  while IFS=$'\t' read -r context state; do
     [[ -z "$context" ]] && continue
-    context_states["$context"]="$state"
-  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' 2>/dev/null)
+    # Add to our string-based map
+    context_map="${context_map}${context}=${state};"
+  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' 2>/dev/null || echo "")
 
   # Add any actual contexts that aren't in required list
   while read -r context; do
@@ -451,7 +456,7 @@ cmd_status() {
     if [[ "$found" == "false" ]]; then
       required+=("$context")
     fi
-  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | .context' 2>/dev/null)
+  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | .context' 2>/dev/null || echo "")
 
   # Generate status output for all contexts (required + actual)
   local all_results=()
@@ -460,8 +465,9 @@ cmd_status() {
     [[ "$context" == "signoff/"* ]] && display_name="${context#signoff/}"
     [[ "$context" == "signoff" ]] && display_name="signoff"
 
-    # Check if we have a status for this context - use safe array access
-    if [[ -n "${context_states[$context]:-}" && "${context_states[$context]:-}" == "success" ]]; then
+    # Check if we have a successful status for this context
+    # by looking for "context=success;" in our map
+    if [[ "$context_map" == *"${context}=success;"* ]]; then
       all_results+=("${STATUS_SUCCESS} $display_name")
     else
       all_results+=("${STATUS_FAILURE} $display_name")
