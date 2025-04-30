@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-VERSION="0.2.0"
+readonly VERSION="0.2.0"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -22,6 +22,9 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
+# Cache for default branch
+DEFAULT_BRANCH=""
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -33,6 +36,14 @@ fail() {
   exit 1
 }
 
+# Get default branch with caching
+default_branch() {
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    DEFAULT_BRANCH=$(gh api repos/:owner/:repo --jq .default_branch 2>/dev/null) || return 1
+  fi
+  echo "$DEFAULT_BRANCH"
+}
+
 # Get signoff contexts from branch protection
 get_signoff_contexts() {
   local branch="${1:-}"
@@ -40,7 +51,7 @@ get_signoff_contexts() {
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
-    branch=$(gh api repos/:owner/:repo --jq .default_branch 2>/dev/null) || return 0
+    branch=$(default_branch) || return 0
   fi
 
   # Get branch protection
@@ -193,7 +204,7 @@ cmd_install() {
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
-    branch=$(gh api repos/:owner/:repo --jq .default_branch) ||
+    branch=$(default_branch) ||
       fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
@@ -267,7 +278,7 @@ cmd_uninstall() {
   done
 
   if [[ -z "$branch" ]]; then
-    branch=$(gh api repos/:owner/:repo --jq .default_branch) || fail "failed to get default branch"
+    branch=$(default_branch) || fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
@@ -325,8 +336,7 @@ cmd_check() {
   done
 
   if [[ -z "$branch" ]]; then
-    branch=$(gh api repos/:owner/:repo --jq .default_branch) ||
-      fail "failed to get default branch"
+    branch=$(default_branch) || fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
@@ -399,7 +409,7 @@ cmd_status() {
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
-    branch=$(gh api repos/:owner/:repo --jq .default_branch) || fail "failed to get default branch"
+    branch=$(default_branch) || fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
