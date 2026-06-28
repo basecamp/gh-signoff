@@ -129,6 +129,27 @@ checkout_fork_pull_request() {
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
+@test "create signs off on specified sha" {
+  export MOCK_EXPECT_STATUS_SHA=abc123
+  run -0 gh-signoff create --sha abc123
+  [[ "$output" == *"Signed off on abc123"* ]]
+  unset MOCK_EXPECT_STATUS_SHA
+}
+
+@test "direct signoff signs off on specified sha" {
+  export MOCK_EXPECT_STATUS_SHA=def456
+  run -0 gh-signoff --sha def456
+  [[ "$output" == *"Signed off on def456"* ]]
+  unset MOCK_EXPECT_STATUS_SHA
+}
+
+@test "direct partial signoff signs off on specified sha" {
+  export MOCK_EXPECT_STATUS_SHA=def456
+  run -0 gh-signoff --sha def456 linux
+  [[ "$output" == *"Signed off on def456 for linux"* ]]
+  unset MOCK_EXPECT_STATUS_SHA
+}
+
 @test "check shows status for protected branch" {
   # Simulate protection requiring default signoff
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
@@ -258,6 +279,20 @@ checkout_fork_pull_request() {
 
   run -0 gh-signoff status
   [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
+}
+
+@test "status checks specified sha" {
+  # Mock: Protection requires 'signoff', Commit status has successful 'signoff'
+  export MOCK_EXPECT_STATUS_SHA=abc123
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"}]}'
+  export MOCK_COMMIT_STATUS_EXIT=0
+
+  run -0 gh-signoff status --sha abc123
+  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]]
+
+  unset MOCK_EXPECT_STATUS_SHA MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
 }
 
 @test "status shows missing default signoff" {
