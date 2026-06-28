@@ -45,6 +45,12 @@ fail() {
   exit 1
 }
 
+validate_sha() {
+  if [[ ! "$1" =~ ^[0-9a-fA-F]{4,40}$ ]]; then
+    fail "invalid sha: $1"
+  fi
+}
+
 # Get default branch with caching
 #
 # Two conventions apply to every gh call below. Filtering uses gh's built-in
@@ -287,6 +293,7 @@ cmd_create() {
           fail "option --sha requires an argument"
         fi
         sha="$2"
+        validate_sha "$sha"
         shift 2
         ;;
 
@@ -590,6 +597,7 @@ cmd_status() {
           fail "option --sha requires an argument"
         fi
         sha="$2"
+        validate_sha "$sha"
         shift 2
         ;;
       -*)
@@ -719,7 +727,7 @@ _gh_signoff() {
       ;;
     create)
       local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "--sha $contexts" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-f --sha $contexts" -- "$cur") )
       return 0
       ;;
     status)
@@ -735,7 +743,17 @@ _gh_signoff() {
 
   # If we are halfway through typing an option
   if [[ $cur == --* ]]; then
-    COMPREPLY=( $(compgen -W "--branch --sha" -- "$cur") )
+    case "${COMP_WORDS[1]}" in
+      create|status)
+        COMPREPLY=( $(compgen -W "--sha" -- "$cur") )
+        ;;
+      install|uninstall|check)
+        COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
+        ;;
+      *)
+        COMPREPLY=( $(compgen -W "--sha --help" -- "$cur") )
+        ;;
+    esac
     return 0
   fi
 

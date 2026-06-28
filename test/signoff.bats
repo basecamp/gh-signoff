@@ -136,6 +136,11 @@ checkout_fork_pull_request() {
   unset MOCK_EXPECT_STATUS_SHA
 }
 
+@test "create rejects invalid sha" {
+  run -1 gh-signoff create --sha 'abc/status'
+  [[ "$output" == *"invalid sha: abc/status"* ]]
+}
+
 @test "direct signoff signs off on specified sha" {
   export MOCK_EXPECT_STATUS_SHA=def456
   run -0 gh-signoff --sha def456
