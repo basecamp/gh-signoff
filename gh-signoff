@@ -476,6 +476,7 @@ cmd_status() {
   if [[ -n "$protection" ]]; then
     # Add required signoff contexts from branch protection
     while read -r ctx; do
+      ctx=${ctx%$'\r'}
       [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
       required+=("$ctx")
     done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
@@ -488,6 +489,8 @@ cmd_status() {
 
   # Extract all contexts with success state
   while IFS=$'\t' read -r context state; do
+    context=${context%$'\r'}
+    state=${state%$'\r'}
     [[ -z "$context" ]] && continue
     # Add to our string-based map
     context_map="${context_map}${context}=${state};"
@@ -495,6 +498,7 @@ cmd_status() {
 
   # Add any actual contexts that aren't in required list
   while read -r context; do
+    context=${context%$'\r'}
     [[ -z "$context" ]] && continue
 
     # Check if this context is already in required list

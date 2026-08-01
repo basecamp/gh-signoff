@@ -239,6 +239,28 @@ add_bare_remote() {
   unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
 }
 
+@test "status handles CRLF output from jq" {
+  # Reproduce the CRLF emitted by jq on Windows while keeping the test portable.
+  local jq_path
+  jq_path="$(command -v jq)"
+  cat > "$TEST_DIR/jq" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"$jq_path" "\$@" | sed 's/\r$//; s/\$/\r/'
+EOF
+  chmod +x "$TEST_DIR/jq"
+
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"},{"context":"signoff/tests","state":"success","description":"Test User signed off"}]}'
+  export MOCK_COMMIT_STATUS_EXIT=0
+
+  run -0 gh-signoff status
+  [[ "$output" == $'✓ signoff\n✓ tests' ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+}
+
 @test "status shows signoffs even without branch protection" {
   # Mock: No protection (exit 1), Commit status has 'tests' and 'lint' successful
   export MOCK_BRANCH_PROTECTION_EXIT=1
