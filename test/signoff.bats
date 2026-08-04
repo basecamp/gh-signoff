@@ -24,8 +24,38 @@ setup() {
   git commit --no-gpg-sign --allow-empty -m "Initial commit" >/dev/null
 }
 
+# Remove the test's scratch repositories, tolerating concurrent writers.
+#
+# Every test builds real git repositories under TEST_DIR, and plenty of things
+# write into a git repository behind our back: trace2 event daemons, fsmonitor,
+# background `git maintenance` jobs, editor and IDE git integrations, file
+# indexers (Spotlight/mds) and antivirus scanners. Any of them can drop a file
+# into a directory rm is midway through emptying, and rm then fails with
+# "Directory not empty". Left unhandled that makes teardown return nonzero and
+# bats reports the test as failed with every assertion having passed — a
+# different test each run, which is what makes it so confusing to chase.
+#
+# So retry, briefly and a bounded number of times: these writers arrive in a
+# short burst once the last git command exits, so a second attempt almost
+# always wins. Do not replace this with a bare `rm -rf`.
+#
+# Exhausting the retries warns rather than fails. A leaked directory under
+# TMPDIR is cheap and visible; a suite that reports phantom failures is not,
+# and teardown has no business deciding whether a test passed. The warning
+# goes to bats' terminal descriptor so a persistent leak still gets noticed.
 teardown() {
-  [ -d "$TEST_DIR" ] && rm -rf "$TEST_DIR"
+  local attempt=0
+
+  while [ -d "$TEST_DIR" ] && ! rm -rf "$TEST_DIR" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 10 ]; then
+      echo "# warning: could not remove $TEST_DIR, leaving it behind" >&3
+      break
+    fi
+    sleep 0.1
+  done
+
+  return 0
 }
 
 # Create a nested clean repository and cd into it. The top-level TEST_DIR repo
