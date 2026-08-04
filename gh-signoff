@@ -25,6 +25,9 @@ fi
 # Cache for default branch
 DEFAULT_BRANCH=""
 
+# Reason the working tree failed is_clean, for error reporting
+UNCLEAN_REASON=""
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -78,16 +81,28 @@ is_clean() {
 
   if [[ -n "$($git_cmd status --porcelain)" ]]; then
     debug "found uncommitted changes"
+    UNCLEAN_REASON="repository has uncommitted changes"
     return 1
   fi
 
-  if ! $git_cmd rev-parse --abbrev-ref @{push} >/dev/null 2>&1; then
-    debug "no tracking branch found"
-    fail "current branch is not tracking a remote branch"
+  # @{push} is authoritative for "are my commits pushed?", but under
+  # push.default=simple it only resolves when local and upstream names match.
+  # Fall back to @{upstream}: HEAD contained in the upstream is a sound proxy
+  # for "this SHA is on the remote".
+  local push_ref
+  push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) ||
+    push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) ||
+    true
+
+  if [[ -z "$push_ref" ]]; then
+    debug "neither @{push} nor @{upstream} resolves"
+    UNCLEAN_REASON="current branch has no push destination or upstream (check push.default and branch tracking; -f to override)"
+    return 1
   fi
 
-  if [[ -n "$($git_cmd log @{push}..)" ]]; then
+  if [[ -n "$($git_cmd log "$push_ref"..)" ]]; then
     debug "found unpushed changes"
+    UNCLEAN_REASON="repository has unpushed changes"
     return 1
   fi
 
@@ -118,7 +133,7 @@ cmd_create() {
   done
 
   if ! $force && ! is_clean; then
-    fail "repository has uncommitted or unpushed changes"
+    fail "$UNCLEAN_REASON"
   fi
 
   local user

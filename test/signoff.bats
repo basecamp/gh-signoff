@@ -28,6 +28,23 @@ teardown() {
   [ -d "$TEST_DIR" ] && rm -rf "$TEST_DIR"
 }
 
+# Create a nested clean repository and cd into it. The top-level TEST_DIR repo
+# holds the untracked gh-signoff and gh mock binaries (still on PATH), which
+# would trip is_clean's uncommitted-changes check before the paths under test.
+make_nested_repo() {
+  git init -q "$TEST_DIR/repo"
+  cd "$TEST_DIR/repo"
+  git config user.name "Test User"
+  git commit --no-gpg-sign --allow-empty -m "Initial commit" >/dev/null
+  [[ -z "$(git status --porcelain)" ]]
+}
+
+# Add a bare remote to the nested repository
+add_bare_remote() {
+  git init -q --bare "$TEST_DIR/remote.git"
+  git remote add origin "$TEST_DIR/remote.git"
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -290,4 +307,73 @@ teardown() {
   run -1 gh-signoff tests -f
   [[ "$output" == *"Failed to sign off on"*"for tests"* ]]
   unset MOCK_POST_STATUS_EXIT
+}
+
+# Cleanliness check tests (is_clean)
+@test "signoff succeeds via upstream fallback when @{push} does not resolve" {
+  # push.default=simple: @{push} fails for a branch whose name differs from
+  # its upstream's, but @{upstream} still proves HEAD is on the remote
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:some-branch
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/some-branch
+  git config push.default simple
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff via upstream fallback still catches unpushed changes" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:some-branch
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/some-branch
+  git config push.default simple
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff fails with clear message when no push destination or upstream" {
+  make_nested_repo
+
+  run -1 gh-signoff
+  [[ "$output" == *"no push destination or upstream"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff fails with uncommitted changes message for dirty worktree" {
+  make_nested_repo
+  touch untracked-file
+
+  run -1 gh-signoff
+  [[ "$output" == *"repository has uncommitted changes"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "@{push} stays authoritative over upstream when both resolve" {
+  # Triangular setup: feature tracks origin/main (which contains HEAD), but
+  # push.default=current resolves @{push} to origin/feature, which lacks HEAD.
+  # The upstream fallback must not engage.
+  make_nested_repo
+  add_bare_remote
+  git checkout -q -b feature
+  git push -q origin feature
+  git commit --no-gpg-sign --allow-empty -m "Second commit" >/dev/null
+  git push -q origin HEAD:main
+  git branch -q --set-upstream-to=origin/main
+  git config push.default current
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]]
 }
