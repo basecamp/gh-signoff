@@ -1,0 +1,19 @@
+test/signoff.bats
+  s_af2d188cde4283::t_7335ef9ea94194 574-576
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "35c3510ba99a5bea89b9492a85df0b11411f70be",
+  "prompts": {},
+  "sessions": {
+    "s_af2d188cde4283": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fcb37-f970-71e1-a2e7-381d515b7327",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Jeremy Daer <jeremydaer@gmail.com>"
+    }
+  }
+}
