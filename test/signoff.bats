@@ -841,6 +841,15 @@ complete_words() {
   _gh_signoff
 }
 
+# As complete_words, but the last argument is a partially typed word
+complete_prefix() {
+  eval "$(gh-signoff completion)"
+  COMP_WORDS=("$@")
+  COMP_CWORD=$(($# - 1))
+  COMPREPLY=()
+  _gh_signoff
+}
+
 @test "completion after leading -f offers create plus contexts" {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
@@ -860,6 +869,46 @@ complete_words() {
   [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
+}
+
+@test "completion after leading -f offers --commit" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after create offers -f and --commit" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff create
+  [[ " ${COMPREPLY[*]-} " == *" -f "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after --commit suggests nothing" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff --commit
+  [[ ${#COMPREPLY[@]} -eq 0 ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion finds the command past a leading --commit" {
+  # COMP_WORDS[1] here is --commit, not the command. Reading it directly would
+  # offer create's options in the middle of a status invocation.
+  complete_prefix gh-signoff --commit HEAD status --branch main --
+  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]]
 }
 
 @test "completion after trailing -f offers contexts without create" {

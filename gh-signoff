@@ -768,8 +768,21 @@ _gh_signoff_contexts() {
   echo "$contexts"
 }
 
+# The first word that is neither a global option nor its argument. -f and
+# --commit may precede the command, so COMP_WORDS[1] is not it.
+_gh_signoff_command() {
+  local i=1
+  while [[ $i -lt ${#COMP_WORDS[@]} ]]; do
+    case "${COMP_WORDS[$i]}" in
+      -f)       i=$((i+1)) ;;
+      --commit) i=$((i+2)) ;;
+      *)        echo "${COMP_WORDS[$i]}"; return ;;
+    esac
+  done
+}
+
 _gh_signoff() {
-  local cur prev
+  local cur prev command
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
@@ -780,12 +793,16 @@ _gh_signoff() {
       COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
       return 0
       ;;
+    --commit)
+      # A revision. Nothing worth guessing at.
+      return 0
+      ;;
     -f)
-      # A leading -f may be followed by the create command or a context;
-      # elsewhere only contexts remain
+      # A leading -f may be followed by the create command, --commit or a
+      # context; elsewhere only contexts remain
       local contexts=$(_gh_signoff_contexts)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "create $contexts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "create --commit $contexts" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
       fi
@@ -807,28 +824,30 @@ _gh_signoff() {
       ;;
   esac
 
+  command=$(_gh_signoff_command)
+
   # If we are halfway through typing an option
   if [[ $cur == --* ]]; then
-    case "${COMP_WORDS[1]}" in
-      create|status)
-        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
-        ;;
+    case "$command" in
       install|uninstall|check)
         COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
         ;;
+      status)
+        COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
+        ;;
       *)
-        COMPREPLY=( $(compgen -W "--commit --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
         ;;
     esac
     return 0
   fi
 
   # For partial signoffs, suggest context names
-  if [[ $COMP_CWORD -gt 1 && "${COMP_WORDS[1]}" != "install" &&
-        "${COMP_WORDS[1]}" != "uninstall" && "${COMP_WORDS[1]}" != "check" &&
-        "${COMP_WORDS[1]}" != "status" && "${COMP_WORDS[1]}" != "version" &&
-        "${COMP_WORDS[1]}" != "completion" && "${COMP_WORDS[1]}" != "--help" &&
-        "${COMP_WORDS[1]}" != "-h" ]]; then
+  if [[ $COMP_CWORD -gt 1 && "$command" != "install" &&
+        "$command" != "uninstall" && "$command" != "check" &&
+        "$command" != "status" && "$command" != "version" &&
+        "$command" != "completion" && "$command" != "--help" &&
+        "$command" != "-h" ]]; then
     local contexts=$(_gh_signoff_contexts)
     COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
     return 0
