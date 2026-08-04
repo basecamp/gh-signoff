@@ -45,9 +45,9 @@ fail() {
   exit 1
 }
 
-validate_sha() {
+validate_commit() {
   if [[ ! "$1" =~ ^[0-9a-fA-F]{4,40}$ ]]; then
-    fail "invalid sha: $1"
+    fail "invalid commit: $1"
   fi
 }
 
@@ -278,7 +278,7 @@ is_clean() {
 
 cmd_create() {
   local force=false
-  local sha=""
+  local commit=""
   local contexts=()
 
   # Process arguments
@@ -288,12 +288,12 @@ cmd_create() {
         force=true
         shift
         ;;
-      --sha)
+      --commit)
         if [[ -z "${2:-}" || "$2" == -* ]]; then
-          fail "option --sha requires an argument"
+          fail "option --commit requires an argument"
         fi
-        sha="$2"
-        validate_sha "$sha"
+        commit="$2"
+        validate_commit "$commit"
         shift 2
         ;;
 
@@ -308,7 +308,7 @@ cmd_create() {
     esac
   done
 
-  if [[ -z "$sha" ]] && ! $force && ! is_clean; then
+  if [[ -z "$commit" ]] && ! $force && ! is_clean; then
     fail "$UNCLEAN_REASON"
   fi
 
@@ -316,8 +316,8 @@ cmd_create() {
   user=$(git config user.name) || fail "failed to get git user name"
   [[ -z "$user" ]] && fail "git user.name is not set"
 
-  if [[ -z "$sha" ]]; then
-    sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
   fi
 
   # If no contexts specified, use default
@@ -335,27 +335,27 @@ cmd_create() {
       context_name="signoff/${context}"
     fi
 
-    debug "creating status for commit ${sha} by ${user} with context ${context_name}"
+    debug "creating status for commit ${commit} by ${user} with context ${context_name}"
 
     if gh api \
       --method POST \
-      "repos/:owner/:repo/statuses/${sha}" \
+      "repos/:owner/:repo/statuses/${commit}" \
       -f state=success \
       -f context="${context_name}" \
       -f "description=${user} signed off" >/dev/null; then
 
       # Build success message
       if [[ -z "$context" ]]; then
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit}")
       else
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha} for ${context}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for ${context}")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} Failed to sign off on ${sha}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
       else
-        echo "${STATUS_FAILURE} Failed to sign off on ${sha} for ${context}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
       fi
     fi
   done
@@ -580,7 +580,7 @@ cmd_check() {
 
 cmd_status() {
   local branch=""
-  local sha=""
+  local commit=""
 
   # Process arguments with option handling
   while [[ $# -gt 0 ]]; do
@@ -592,12 +592,12 @@ cmd_status() {
         branch="$2"
         shift 2
         ;;
-      --sha)
+      --commit)
         if [[ -z "${2:-}" || "$2" == -* ]]; then
-          fail "option --sha requires an argument"
+          fail "option --commit requires an argument"
         fi
-        sha="$2"
-        validate_sha "$sha"
+        commit="$2"
+        validate_commit "$commit"
         shift 2
         ;;
       -*)
@@ -616,18 +616,18 @@ cmd_status() {
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
-  # Get current SHA when one was not provided
-  if [[ -z "$sha" ]]; then
-    sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+  # Default to the current commit
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
   fi
 
   # Get the signoff statuses on this commit as context/state pairs. A filter
   # error surfaces here rather than silently rendering every context as failed.
   local statuses
-  statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" \
+  statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
     --jq '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' \
     2>/dev/null) || {
-    echo "${STATUS_FAILURE} Could not get status for commit ${sha}"
+    echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
   }
   statuses=${statuses//$'\r'/}
@@ -711,7 +711,7 @@ _gh_signoff() {
     signoff)
       # Include dynamic contexts in top-level completion
       local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --sha --help $contexts" -- "$cur") )
+      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
       return 0
       ;;
     -f)
@@ -727,11 +727,11 @@ _gh_signoff() {
       ;;
     create)
       local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "-f --sha $contexts" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-f --commit $contexts" -- "$cur") )
       return 0
       ;;
     status)
-      COMPREPLY=( $(compgen -W "--branch --sha" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
       return 0
       ;;
     install|uninstall|check)
@@ -745,13 +745,13 @@ _gh_signoff() {
   if [[ $cur == --* ]]; then
     case "${COMP_WORDS[1]}" in
       create|status)
-        COMPREPLY=( $(compgen -W "--sha" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
         ;;
       install|uninstall|check)
         COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
         ;;
       *)
-        COMPREPLY=( $(compgen -W "--sha --help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--commit --help" -- "$cur") )
         ;;
     esac
     return 0
@@ -787,11 +787,11 @@ USAGE
   gh signoff [flags] [command] [options]
 
 COMMANDS
-  create (default) Sign off on the current commit or a specific commit SHA
+  create (default) Sign off on the current commit or a specific commit
   install          Install signoff requirement
   uninstall        Uninstall signoff requirement
   check            Check if signoff is required
-  status           Show signoff status for the current commit or a specific commit SHA
+  status           Show signoff status for the current commit or a specific commit
   version          Show gh-signoff version
   completion       Output shell completion code
 
@@ -800,19 +800,19 @@ FLAGS
 
 OPTIONS
   --branch <branch>  Branch to operate on (for install, uninstall, check, status)
-  --sha <sha>        Commit SHA to operate on (for create, status)
+  --commit <sha>     Commit to operate on (for create, status)
 
 EXAMPLES
-  gh signoff                         # Sign off on current commit
-  gh signoff --sha abc123            # Sign off on a specific commit
-  gh signoff create -f               # Force signoff
-  gh signoff create --sha abc123     # Sign off on a specific commit
-  gh signoff install                 # Require signoff on default branch
-  gh signoff install --branch other  # Require signoff on a specific branch
-  gh signoff check                   # Check if signoff is required
-  gh signoff check --branch other    # Check if signoff is required on branch
-  gh signoff status                  # Show completed/pending signoff status
-  gh signoff status --sha abc123     # Show status for a specific commit
+  gh signoff                           # Sign off on current commit
+  gh signoff --commit abc1234          # Sign off on a specific commit
+  gh signoff create -f                 # Force signoff
+  gh signoff create --commit abc1234   # Sign off on a specific commit
+  gh signoff install                   # Require signoff on default branch
+  gh signoff install --branch other    # Require signoff on a specific branch
+  gh signoff check                     # Check if signoff is required
+  gh signoff check --branch other      # Check if signoff is required on branch
+  gh signoff status                    # Show completed/pending signoff status
+  gh signoff status --commit abc1234   # Show status for a specific commit
 
 COMPLETION
   # Add to ~/.bashrc:
@@ -844,8 +844,8 @@ case "${1:-}" in
   "version")        reject_force; cmd_version ;;
   "completion")     reject_force; shift; cmd_completion "$@" ;;
   "-h" | "--help")  reject_force; cmd_help ;;
-  "--sha")
-    # An explicit sha with no command is a create
+  "--commit")
+    # An explicit commit with no command is a create
     cmd_create ${force:+-f} "$@"
     ;;
   -*)

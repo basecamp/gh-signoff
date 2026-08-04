@@ -113,8 +113,8 @@ if [[ "$api_path" == "repos/:owner/:repo" && "$jq_filter" == ".default_branch" ]
 # Commit Status Call (GET)
 elif [[ "$api_method" == "GET" && "$api_path" == *"commits/"*"/status"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Commit Status" >&2
-  if [[ -n "${MOCK_EXPECT_STATUS_SHA:-}" && "$api_path" != *"${MOCK_EXPECT_STATUS_SHA}"* ]]; then
-    echo "Expected commit status SHA ${MOCK_EXPECT_STATUS_SHA}, got path ${api_path}" >&2
+  if [[ -n "${MOCK_EXPECT_COMMIT:-}" && "$api_path" != *"${MOCK_EXPECT_COMMIT}"* ]]; then
+    echo "Expected commit status ${MOCK_EXPECT_COMMIT}, got path ${api_path}" >&2
     exit 99
   fi
   if [[ "$MOCK_COMMIT_STATUS_EXIT" -eq 0 ]]; then
@@ -137,8 +137,8 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]];
 # Create Status Call (POST)
 elif [[ "$api_method" == "POST" && "$api_path" == *"statuses/"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched POST Commit Status" >&2
-  if [[ -n "${MOCK_EXPECT_STATUS_SHA:-}" && "$api_path" != *"${MOCK_EXPECT_STATUS_SHA}"* ]]; then
-    echo "Expected status SHA ${MOCK_EXPECT_STATUS_SHA}, got path ${api_path}" >&2
+  if [[ -n "${MOCK_EXPECT_COMMIT:-}" && "$api_path" != *"${MOCK_EXPECT_COMMIT}"* ]]; then
+    echo "Expected status commit ${MOCK_EXPECT_COMMIT}, got path ${api_path}" >&2
     exit 99
   fi
   # POST usually doesn't output significant JSON on success in this script's usage
