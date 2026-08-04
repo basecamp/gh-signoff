@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.2.1"
+readonly VERSION="0.2.2"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -40,40 +40,44 @@ fail() {
 }
 
 # Get default branch with caching
+#
+# Two conventions apply to every gh call below. Filtering uses gh's built-in
+# --jq rather than an external jq: gh is the only dependency this script checks
+# for at startup, and being Go it never translates line endings the way jq does
+# on Windows. Captures still get their CRs stripped anyway, since we can't test
+# Windows from here and a stray \r matches nothing. And gh prints API error
+# bodies to stdout, so every failure path has to reset its capture rather than
+# leave {"message":"Not Found"} looking like a response.
 default_branch() {
   if [[ -z "$DEFAULT_BRANCH" ]]; then
-    DEFAULT_BRANCH=$(gh api repos/:owner/:repo --jq .default_branch 2>/dev/null) || return 1
+    DEFAULT_BRANCH=$(gh api repos/:owner/:repo --jq .default_branch 2>/dev/null) || {
+      DEFAULT_BRANCH=""
+      return 1
+    }
+    DEFAULT_BRANCH=${DEFAULT_BRANCH//$'\r'/}
   fi
   echo "$DEFAULT_BRANCH"
 }
 
-# Get signoff contexts from branch protection
+# Get signoff contexts from branch protection, stripping the 'signoff/' prefix.
+# select() drops the bare 'signoff' context, which has no display name.
 get_signoff_contexts() {
   local branch="${1:-}"
-  local contexts=()
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
     branch=$(default_branch) || return 0
   fi
 
-  # Get branch protection
-  local protection
-  protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || return 0
+  local contexts
+  contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
+    --jq '.required_status_checks.contexts[]? | select(startswith("signoff/")) | ltrimstr("signoff/")' \
+    2>/dev/null) || return 0
+  contexts=${contexts//$'\r'/}
 
-  # Extract signoff contexts (strip 'signoff/' prefix for display)
-  while read -r ctx; do
-    [[ -z "$ctx" ]] && continue
-    if [[ "$ctx" == "signoff/"* ]]; then
-      contexts+=("${ctx#signoff/}")
-    elif [[ "$ctx" == "signoff" ]]; then
-      # Skip the default signoff context
-      continue
-    fi
-  done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
-
-  # Return contexts
-  printf "%s\n" "${contexts[@]}"
+  if [[ -n "$contexts" ]]; then
+    echo "$contexts"
+  fi
 }
 
 # @{upstream} is a sound stand-in for an unresolvable @{push} only in the
@@ -389,9 +393,10 @@ cmd_check() {
     contexts=("")
   fi
 
-  # Fetch branch protection once
-  local protection
-  protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || {
+  # Fetch the required contexts once, one per line
+  local protection_contexts
+  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
+    --jq '.required_status_checks.contexts[]?' 2>/dev/null) || {
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
         echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
@@ -401,6 +406,7 @@ cmd_check() {
     done
     return 1
   }
+  protection_contexts=${protection_contexts//$'\r'/}
 
   # Check each context
   for context in "${contexts[@]}"; do
@@ -411,7 +417,8 @@ cmd_check() {
 
     debug "checking protection for branch: ${branch} with context: ${context_name}"
 
-    if echo "$protection" | jq -e ".required_status_checks.contexts | contains([\"${context_name}\"])" >/dev/null 2>&1; then
+    # Whole-line match, so 'signoff' isn't satisfied by 'signoff/tests'
+    if [[ $'\n'"$protection_contexts"$'\n' == *$'\n'"${context_name}"$'\n'* ]]; then
       if [[ -z "$context" ]]; then
         echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
       else
@@ -460,61 +467,50 @@ cmd_status() {
   # Get current SHA
   sha=$(git rev-parse HEAD) || fail "failed to get current commit"
 
-  # Get commit statuses
+  # Get the signoff statuses on this commit as context/state pairs. A filter
+  # error surfaces here rather than silently rendering every context as failed.
   local statuses
-  statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" 2>/dev/null) || {
+  statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" \
+    --jq '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' \
+    2>/dev/null) || {
     echo "${STATUS_FAILURE} Could not get status for commit ${sha}"
     return 1
   }
+  statuses=${statuses//$'\r'/}
 
   # Create required contexts list - always start with "signoff"
   local required=("signoff")
 
   # Add any additional contexts from branch protection
-  local protection
-  protection=$(gh api "repos/:owner/:repo/branches/${branch}/protection" 2>/dev/null) || debug "No branch protection found"
-  if [[ -n "$protection" ]]; then
-    # Add required signoff contexts from branch protection
-    while read -r ctx; do
-      ctx=${ctx%$'\r'}
-      [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
-      required+=("$ctx")
-    done < <(echo "$protection" | jq -r '.required_status_checks?.contexts? | map(select(startswith("signoff"))) | .[]?' 2>/dev/null || echo "")
-  fi
+  local protection_contexts
+  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
+    --jq '.required_status_checks.contexts[]? | select(startswith("signoff"))' \
+    2>/dev/null) || {
+    debug "No branch protection found"
+    protection_contexts=""
+  }
+  protection_contexts=${protection_contexts//$'\r'/}
 
-  # Extract context/state pairs into a string-based lookup map
-  # Format: "context1=state1;context2=state2;..."
-  # This is a lightweight alternative to associative arrays for Bash 3
-  local context_map=""
+  local ctx
+  while read -r ctx; do
+    [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
+    required+=("$ctx")
+  done <<< "$protection_contexts"
 
-  # Extract all contexts with success state
+  # Map contexts to states as "context1=state1;context2=state2;..."
+  # A lightweight stand-in for associative arrays, which Bash 3 lacks
+  local context_map="" context state found req
   while IFS=$'\t' read -r context state; do
-    context=${context%$'\r'}
-    state=${state%$'\r'}
     [[ -z "$context" ]] && continue
-    # Add to our string-based map
     context_map="${context_map}${context}=${state};"
-  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' 2>/dev/null || echo "")
 
-  # Add any actual contexts that aren't in required list
-  while read -r context; do
-    context=${context%$'\r'}
-    [[ -z "$context" ]] && continue
-
-    # Check if this context is already in required list
-    local found=false
+    # Show contexts that were signed off even if protection doesn't require them
+    found=false
     for req in "${required[@]}"; do
-      if [[ "$req" == "$context" ]]; then
-        found=true
-        break
-      fi
+      [[ "$req" == "$context" ]] && { found=true; break; }
     done
-
-    # If not in required list, add it
-    if [[ "$found" == "false" ]]; then
-      required+=("$context")
-    fi
-  done < <(echo "$statuses" | jq -r '.statuses[]? | select(.context? | startswith("signoff")) | .context' 2>/dev/null || echo "")
+    $found || required+=("$context")
+  done <<< "$statuses"
 
   # Generate status output for all contexts (required + actual)
   local all_results=()
