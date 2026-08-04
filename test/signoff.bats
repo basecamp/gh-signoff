@@ -571,9 +571,9 @@ checkout_fork_pull_request() {
   make_nested_repo
   checkout_fork_pull_request
 
-  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
-  ! git rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1
-  ! git remote get-url --all "$TEST_DIR/fork.git" >/dev/null 2>&1
+  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1 || return 1
+  ! git rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1 || return 1
+  ! git remote get-url --all "$TEST_DIR/fork.git" >/dev/null 2>&1 || return 1
 
   run -0 gh-signoff
   [[ "$output" == *"Signed off on"* ]] || return 1
