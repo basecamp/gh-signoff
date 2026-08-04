@@ -31,6 +31,9 @@ DEFAULT_BRANCH=""
 # Reason the working tree failed is_clean, for error reporting
 UNCLEAN_REASON=""
 
+# Tip SHA url_remote_tip proved, for is_clean to check HEAD against
+URL_REMOTE_TIP=""
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -110,6 +113,117 @@ upstream_fallback_is_safe() {
     ! git config --get-all "remote.${remote}.push" >/dev/null 2>&1
 }
 
+# git accepts either a remote name or a URL wherever a remote is named, so
+# branch.<name>.remote may hold either. Distinguish them by enumeration rather
+# than by pattern: a value that matches a configured remote is a name, and
+# everything else git treats as a URL.
+remote_is_named() {
+  local remote="$1" name found=1
+
+  while read -r name; do
+    if [[ "$name" == "$remote" ]]; then
+      found=0
+    fi
+  done < <(git remote)
+
+  return "$found"
+}
+
+# `gh pr checkout` on a cross-repository (fork) pull request creates no named
+# remote. It points the branch at a bare URL instead:
+#
+#   branch.<name>.remote     = https://github.com/someone/gh-signoff.git
+#   branch.<name>.pushremote = https://github.com/someone/gh-signoff.git
+#   branch.<name>.merge      = refs/heads/<their-branch>
+#
+# git supports that natively, but a URL-valued remote has no remote-tracking
+# ref, so every local check dead-ends: @{push} and @{upstream} both fail with
+# "not stored as a remote-tracking branch", and upstream_fallback_is_safe's
+# `git remote get-url` errors with "No such remote '<url>'". Reviewing a
+# contributor's pull request and signing off on it is a core workflow for this
+# tool, so rather than refuse for want of a local ref, ask the remote itself.
+#
+# `git ls-remote <url> <ref>` advertises that ref's tip SHA. A repository
+# holding a commit holds all of its ancestors, and a commit's parents are part
+# of the object, so ancestry computed locally is ancestry on the remote too:
+# once the tip object is present here, "HEAD is contained in the tip" proves
+# HEAD is on that remote. That is precisely the inference is_clean already
+# makes about a remote-tracking ref — the tip SHA merely arrives over the wire
+# instead of from refs/remotes. When the tip object is absent locally there is
+# nothing to reason from: ls-remote yields ref tips, not history, so proving
+# containment would mean fetching. Refuse instead.
+#
+# Which repository we are proving things about still has to be the one a push
+# would reach, so the routing allowlist mirrors upstream_fallback_is_safe:
+# effective push.default simple, and the effective push remote this same URL.
+# Push refspecs need no check here — a [remote "<url>"] config section would
+# make the URL a configured remote, which remote_is_named already excludes.
+# url.*.pushInsteadOf does need one: it rewrites push URLs, and git offers no
+# way to expand the push side of an anonymous remote (`git remote get-url
+# --push` insists on a configured remote), so refuse rather than interrogate a
+# URL that a push would not use.
+#
+# Returns 0 with URL_REMOTE_TIP set to the proven tip, 1 with UNCLEAN_REASON
+# set when the branch tracks a URL but nothing can be proven about it, and 2
+# when the branch does not track a URL at all and the caller's own reason
+# should stand.
+url_remote_tip() {
+  local branch remote merge_ref push_default push_remote advertised sha ref
+
+  branch=$(git symbolic-ref --short -q HEAD) || return 2
+  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 2
+  [[ -n "$remote" && "$remote" != "." ]] || return 2
+  ! remote_is_named "$remote" || return 2
+
+  # Past here the branch provably tracks a URL, so failures say so instead of
+  # deferring to is_clean's generic "check push.default and branch tracking"
+  URL_REMOTE_TIP=""
+
+  merge_ref=$(git config "branch.${branch}.merge" 2>/dev/null) || merge_ref=""
+  # git resolves an unqualified merge ref against the remote's heads
+  [[ -z "$merge_ref" || "$merge_ref" == refs/* ]] || merge_ref="refs/heads/${merge_ref}"
+
+  push_default=$(git config push.default 2>/dev/null) || push_default="simple"
+  push_remote=$(git config "branch.${branch}.pushRemote" 2>/dev/null) ||
+    push_remote=$(git config remote.pushDefault 2>/dev/null) ||
+    push_remote="$remote"
+
+  if [[ -z "$merge_ref" || "$push_default" != "simple" || "$push_remote" != "$remote" ]] ||
+    git config --get-regexp '^url\..*\.pushinsteadof$' >/dev/null 2>&1; then
+    debug "branch ${branch} tracks the URL ${remote} but its push destination is not provably that URL"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and its push destination is not provably that URL; add a named remote for it, or -f to override)"
+    return 1
+  fi
+
+  advertised=$(git ls-remote "$remote" "$merge_ref" 2>/dev/null) || {
+    debug "could not reach ${remote} to look up ${merge_ref}"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and that remote could not be reached; -f to override)"
+    return 1
+  }
+
+  # ls-remote patterns match ref tails, so take the exact ref rather than the
+  # first line
+  while IFS=$'\t' read -r sha ref; do
+    if [[ "$ref" == "$merge_ref" ]]; then
+      URL_REMOTE_TIP="$sha"
+    fi
+  done <<<"$advertised"
+
+  if [[ -z "$URL_REMOTE_TIP" ]]; then
+    debug "${merge_ref} is not advertised by ${remote}"
+    UNCLEAN_REASON="repository has unpushed changes (${merge_ref} does not exist on ${remote})"
+    return 1
+  fi
+
+  if ! git cat-file -e "${URL_REMOTE_TIP}^{commit}" 2>/dev/null; then
+    debug "${remote} advertises ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (${remote} has ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository; git fetch ${remote} ${merge_ref}, or -f to override)"
+    return 1
+  fi
+
+  return 0
+}
+
 is_clean() {
   local git_cmd=$(command -v git)
 
@@ -126,8 +240,19 @@ is_clean() {
   local push_ref
   push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) || push_ref=""
 
-  if [[ -z "$push_ref" ]] && upstream_fallback_is_safe; then
-    push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) || push_ref=""
+  if [[ -z "$push_ref" ]]; then
+    if upstream_fallback_is_safe; then
+      push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) || push_ref=""
+    else
+      # Neither ref resolves for a branch tracking a bare URL, which has no
+      # remote-tracking ref at all: ask that remote for the tip instead
+      local tip_status=0
+      url_remote_tip || tip_status=$?
+      case "$tip_status" in
+        0) push_ref="$URL_REMOTE_TIP" ;;
+        1) return 1 ;;
+      esac
+    fi
   fi
 
   if [[ -z "$push_ref" ]]; then

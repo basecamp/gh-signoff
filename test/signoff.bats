@@ -92,6 +92,26 @@ add_bare_remote() {
   git remote add origin "$TEST_DIR/remote.git"
 }
 
+# Configure the current branch the way `gh pr checkout` configures a branch
+# taken from a cross-repository (fork) pull request: no named remote, just a
+# URL (git accepts a path here identically) and the head ref it tracks
+track_url_remote() {
+  local url="$1" ref="$2" branch
+  branch=$(git symbolic-ref --short HEAD)
+  git config "branch.${branch}.remote" "$url"
+  git config "branch.${branch}.pushremote" "$url"
+  git config "branch.${branch}.merge" "$ref"
+}
+
+# Stand up a bare repository playing the contributor's fork, with the pull
+# request's head branch at HEAD, and track it by URL from the current branch
+checkout_fork_pull_request() {
+  git init -q --bare "$TEST_DIR/fork.git"
+  git push -q "$TEST_DIR/fork.git" HEAD:refs/heads/their-branch
+  git checkout -q -b their-branch
+  track_url_remote "$TEST_DIR/fork.git" refs/heads/their-branch
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -541,6 +561,130 @@ add_bare_remote() {
   [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
 
   run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "signoff succeeds on a branch checked out from a fork pull request" {
+  # A URL-valued remote has no remote-tracking ref, so neither @{push} nor
+  # @{upstream} resolves and `git remote get-url` has no remote to look up.
+  # The fork itself is the only witness that HEAD is published.
+  make_nested_repo
+  checkout_fork_pull_request
+
+  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1 || return 1
+  ! git rev-parse --abbrev-ref "@{upstream}" >/dev/null 2>&1 || return 1
+  ! git remote get-url --all "$TEST_DIR/fork.git" >/dev/null 2>&1 || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "fork pull request signoff accepts a commit contained in the fork's tip" {
+  # The tip object is here, so its ancestry is checkable locally, and a
+  # repository holding a commit holds every ancestor of it
+  make_nested_repo
+  git checkout -q -b their-branch
+  git commit --no-gpg-sign --allow-empty -m "Their newer commit" >/dev/null
+  git init -q --bare "$TEST_DIR/fork.git"
+  git push -q "$TEST_DIR/fork.git" HEAD:refs/heads/their-branch
+  git reset -q --hard HEAD^
+  track_url_remote "$TEST_DIR/fork.git" refs/heads/their-branch
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "fork pull request signoff still catches unpushed changes" {
+  make_nested_repo
+  checkout_fork_pull_request
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]] || return 1
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "fork pull request signoff refuses when the fork's tip is not in this repository" {
+  # ls-remote advertises ref tips, not history: with the tip object absent
+  # there is nothing to compute containment against, and proving HEAD is on
+  # the fork would mean fetching
+  make_nested_repo
+  checkout_fork_pull_request
+  git clone -q --branch their-branch "$TEST_DIR/fork.git" "$TEST_DIR/contributor"
+  git -C "$TEST_DIR/contributor" config user.name "Contributor"
+  git -C "$TEST_DIR/contributor" commit --no-gpg-sign --allow-empty -m "Their newer commit" >/dev/null
+  git -C "$TEST_DIR/contributor" push -q origin HEAD:refs/heads/their-branch
+
+  run -1 gh-signoff
+  [[ "$output" == *"which is not in this repository"* ]] || return 1
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "fork pull request signoff refuses when the tracked ref is absent from the fork" {
+  make_nested_repo
+  checkout_fork_pull_request
+  git config branch.their-branch.merge refs/heads/never-pushed
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]] || return 1
+  [[ "$output" == *"refs/heads/never-pushed does not exist"* ]] || return 1
+}
+
+@test "fork pull request signoff refuses when the fork cannot be reached" {
+  make_nested_repo
+  checkout_fork_pull_request
+  track_url_remote "$TEST_DIR/no-such-fork.git" refs/heads/their-branch
+
+  run -1 gh-signoff
+  [[ "$output" == *"could not be reached"* ]] || return 1
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "fork pull request signoff refuses when the push destination is not that URL" {
+  # Proving HEAD is on the fork says nothing if a push would land elsewhere,
+  # so the same routing allowlist as the @{upstream} fallback applies
+  make_nested_repo
+  checkout_fork_pull_request
+  git init -q --bare "$TEST_DIR/elsewhere.git"
+
+  for mode in current nothing matching; do
+    git config push.default "$mode"
+    run -1 gh-signoff
+    [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
+  done
+  git config push.default simple
+
+  git config branch.their-branch.pushremote "$TEST_DIR/elsewhere.git"
+  run -1 gh-signoff
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
+  git config branch.their-branch.pushremote "$TEST_DIR/fork.git"
+
+  git config remote.pushDefault "$TEST_DIR/elsewhere.git"
+  git config --unset branch.their-branch.pushremote
+  run -1 gh-signoff
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
+  git config --unset remote.pushDefault
+
+  # url.*.pushInsteadOf rewrites push URLs, and git offers no way to expand
+  # the push side of an anonymous remote to compare against
+  git config "url.$TEST_DIR/elsewhere.git.pushInsteadOf" "$TEST_DIR/fork.git"
+  run -1 gh-signoff
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
+  git config --remove-section "url.$TEST_DIR/elsewhere.git"
+
+  git config --unset branch.their-branch.merge
+  run -1 gh-signoff
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
+  git config branch.their-branch.merge refs/heads/their-branch
+
+  # With nothing rerouting the push away from the tracked URL, the proof engages
+  run -0 gh-signoff
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
