@@ -906,9 +906,26 @@ complete_prefix() {
 @test "completion finds the command past a leading --commit" {
   # COMP_WORDS[1] here is --commit, not the command. Reading it directly would
   # offer create's options in the middle of a status invocation.
+  complete_prefix gh-signoff --commit HEAD status --
+  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]]
+
+  # Same, past the command's own option, so the option-fallback branch is the
+  # one doing the lookup rather than the previous-word case
   complete_prefix gh-signoff --commit HEAD status --branch main --
   [[ " ${COMPREPLY[*]-} " == *" --branch "* ]]
   [[ " ${COMPREPLY[*]-} " == *" --commit "* ]]
+}
+
+@test "completion --contexts survives the trailing-argument guard" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  # The completion function shells out to this on every tab
+  run -0 gh-signoff completion --contexts
+  [[ "$output" == *"tests"* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
 @test "completion after trailing -f offers contexts without create" {
