@@ -3,6 +3,23 @@
 # Require minimum bats version for run -N syntax
 bats_require_minimum_version 1.5.0
 
+# Every assertion in this file ends in `|| return 1`. It is not decoration:
+# bats relies on `set -e` to turn a failing assertion into a failing test, and
+# two holes make a bare assertion silently unenforced.
+#
+#   1. bash 3.2 does not honour `set -e` for a failing `[[ ]]` or `(( ))` at
+#      all -- execution simply continues. So on the bash 3 leg of the matrix
+#      every assertion but the last one in a test was a no-op, and a trailing
+#      command (this file used to end tests with `unset MOCK_...`) made even
+#      the last one a no-op by supplying a zero exit status.
+#   2. `set -e` is defined to skip a command prefixed with `!` on every bash
+#      version, so `! git rev-parse ...` never failed a test anywhere.
+#
+# `|| return 1` closes both, on bash 3.2 through 5.x, and bats still reports
+# the exact failing line. Do not drop it, and do not add a trailing command
+# after an assertion. Tests need no `unset` cleanup: bats runs each test in
+# its own process, so exported mocks never leak between them.
+
 # Load status symbol constants from the main script
 load_status_symbols() {
   # Source just the status symbol exports
@@ -66,7 +83,7 @@ make_nested_repo() {
   cd "$TEST_DIR/repo"
   git config user.name "Test User"
   git commit --no-gpg-sign --allow-empty -m "Initial commit" >/dev/null
-  [[ -z "$(git status --porcelain)" ]]
+  [[ -z "$(git status --porcelain)" ]] || return 1
 }
 
 # Add a bare remote to the nested repository
@@ -78,18 +95,18 @@ add_bare_remote() {
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
-  [[ "$output" == *"USAGE"* ]]
-  [[ "$output" == *"COMMANDS"* ]]
+  [[ "$output" == *"USAGE"* ]] || return 1
+  [[ "$output" == *"COMMANDS"* ]] || return 1
 }
 
 @test "shows version" {
   run -0 gh-signoff version
-  [[ "$output" == "gh-signoff"* ]]
+  [[ "$output" == "gh-signoff"* ]] || return 1
 }
 
 @test "create signs off on current commit" {
   run -0 gh-signoff create -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "check shows status for protected branch" {
@@ -97,25 +114,21 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   run -0 gh-signoff check
-  [[ "$output" == *"requires signoff"* ]]
-  # Unset for subsequent tests (though subshell isolation should handle this)
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ "$output" == *"requires signoff"* ]] || return 1
 }
 
 @test "install enables protection" {
   # Expect PUT protection call to succeed
   export MOCK_PUT_PROTECTION_EXIT=0
   run -0 gh-signoff install
-  [[ "$output" == *"now requires signoff"* ]]
-  unset MOCK_PUT_PROTECTION_EXIT
+  [[ "$output" == *"now requires signoff"* ]] || return 1
 }
 
 @test "uninstall removes protection" {
   # Expect DELETE protection call to succeed
   export MOCK_DELETE_PROTECTION_EXIT=0
   run -0 gh-signoff uninstall
-  [[ "$output" == *"no longer requires signoff"* ]]
-  unset MOCK_DELETE_PROTECTION_EXIT
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
 }
 
 # Context support tests
@@ -123,36 +136,32 @@ add_bare_remote() {
   # Expect POST status call to succeed
   export MOCK_POST_STATUS_EXIT=0
   run -0 gh-signoff create -f linux
-  [[ "$output" == *"Signed off on"* ]]
-  [[ "$output" == *"for linux"* ]]
-  unset MOCK_POST_STATUS_EXIT
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for linux"* ]] || return 1
 }
 
 @test "direct partial signoff" {
   # Expect POST status call to succeed
   export MOCK_POST_STATUS_EXIT=0
   run -0 gh-signoff linux -f
-  [[ "$output" == *"Signed off on"* ]]
-  [[ "$output" == *"for linux"* ]]
-  unset MOCK_POST_STATUS_EXIT
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for linux"* ]] || return 1
 }
 
 @test "direct multiple partial signoff" {
   # Expect POST status call to succeed
   export MOCK_POST_STATUS_EXIT=0
   run -0 gh-signoff linux macos windows -f
-  [[ "$output" == *"for linux"* ]]
-  [[ "$output" == *"for macos"* ]]
-  [[ "$output" == *"for windows"* ]]
-  unset MOCK_POST_STATUS_EXIT
+  [[ "$output" == *"for linux"* ]] || return 1
+  [[ "$output" == *"for macos"* ]] || return 1
+  [[ "$output" == *"for windows"* ]] || return 1
 }
 
 @test "install with context enables contextual protection" {
   # Expect PUT protection call to succeed
   export MOCK_PUT_PROTECTION_EXIT=0
   run -0 gh-signoff install windows
-  [[ "$output" == *"now requires signoff on windows"* ]]
-  unset MOCK_PUT_PROTECTION_EXIT
+  [[ "$output" == *"now requires signoff on windows"* ]] || return 1
 }
 
 @test "check with context shows contextual status" {
@@ -160,8 +169,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   run -0 gh-signoff check linux
-  [[ "$output" == *"requires signoff on linux"* ]]
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ "$output" == *"requires signoff on linux"* ]] || return 1
 }
 
 @test "check with missing context shows negative status" {
@@ -169,8 +177,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   run -0 gh-signoff check windows
-  [[ "$output" == *"does not require signoff on windows"* ]]
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ "$output" == *"does not require signoff on windows"* ]] || return 1
 }
 
 # Exact output, not substring: bats folds stderr into $output, so a leaked
@@ -184,23 +191,21 @@ add_bare_remote() {
   [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
 
   run -1 gh-signoff check windows
-  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on windows" ]]
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on windows" ]] || return 1
 }
 
 @test "uninstall with context removes contextual protection" {
   # Expect DELETE protection call to succeed
   export MOCK_DELETE_PROTECTION_EXIT=0
   run -0 gh-signoff uninstall macos
-  [[ "$output" == *"no longer requires signoff on macos"* ]]
-  unset MOCK_DELETE_PROTECTION_EXIT
+  [[ "$output" == *"no longer requires signoff on macos"* ]] || return 1
 }
 
 @test "install with branch and context arguments" {
   # Expect PUT protection call to succeed
   export MOCK_PUT_PROTECTION_EXIT=0
   run -0 gh-signoff install --branch main linux
-  [[ "$output" == *"now requires signoff on linux"* ]]
-  unset MOCK_PUT_PROTECTION_EXIT
+  [[ "$output" == *"now requires signoff on linux"* ]] || return 1
 }
 
 @test "status shows no signoff required when no protection exists" {
@@ -210,9 +215,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]] || return 1
 }
 
 @test "status shows no signoff required when no signoff contexts exist" {
@@ -223,9 +226,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]] || return 1
 }
 
 @test "status shows successful default signoff" {
@@ -236,9 +237,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
 }
 
 @test "status shows missing default signoff" {
@@ -249,9 +248,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_FAILURE} signoff"* ]] || return 1
 }
 
 @test "status shows partial signoffs" {
@@ -262,10 +259,8 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]]
-  [[ "$output" == *"${STATUS_FAILURE} lint"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} lint"* ]] || return 1
 }
 
 @test "status shows all signoffs complete with multiple contexts" {
@@ -276,22 +271,15 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]]
-  [[ "$output" == *"${STATUS_SUCCESS} lint"* ]]
-  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
+  [[ "$output" == *"${STATUS_SUCCESS} lint"* ]] || return 1
+  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]] || return 1
 }
 
 # MOCK_CRLF makes the gh mock terminate every line with \r\n, standing in for
 # the CRLF a Windows toolchain can hand back. A stray \r turns "success" into a
 # state that matches nothing and "signoff" into a second, distinct context, so
 # these assert exact output rather than substrings.
-#
-# Each ends on its assertion, with no trailing unset: bash 3.2's set -e does not
-# fire for a failing [[ ]] inside a function, so any command after the assertion
-# becomes the test's exit status and the assertion stops being enforced. Bats
-# runs each test in its own process, so the exports do not leak regardless.
 @test "status tolerates CRLF from gh on Windows" {
   export MOCK_CRLF=1
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
@@ -300,7 +288,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == "${STATUS_SUCCESS} signoff"$'\n'"${STATUS_SUCCESS} tests" ]]
+  [[ "$output" == "${STATUS_SUCCESS} signoff"$'\n'"${STATUS_SUCCESS} tests" ]] || return 1
 }
 
 @test "check tolerates CRLF from gh on Windows" {
@@ -309,7 +297,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   run -0 gh-signoff check
-  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]]
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
 }
 
 @test "check on a named context tolerates CRLF from gh on Windows" {
@@ -318,7 +306,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   run -0 gh-signoff check tests
-  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]]
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1
 }
 
 @test "completion contexts tolerate CRLF from gh on Windows" {
@@ -327,7 +315,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   run -0 gh-signoff completion --contexts
-  [[ "$output" == "tests"$'\n'"lint" ]]
+  [[ "$output" == "tests"$'\n'"lint" ]] || return 1
 }
 
 @test "completion contexts are empty when only plain signoff is required" {
@@ -335,7 +323,7 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   run -0 gh-signoff completion --contexts
-  [[ -z "$output" ]]
+  [[ -z "$output" ]] || return 1
 }
 
 @test "status shows signoffs even without branch protection" {
@@ -346,10 +334,8 @@ add_bare_remote() {
 
   run -0 gh-signoff status
   # Check that both contexts appear in the output with success markers
-  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]]
-  [[ "$output" == *"${STATUS_SUCCESS} lint"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]] || return 1
+  [[ "$output" == *"${STATUS_SUCCESS} lint"* ]] || return 1
 }
 
 @test "status shows partial complete signoffs without branch protection" {
@@ -359,10 +345,8 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]]
-  [[ "$output" == *"${STATUS_FAILURE} lint"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"${STATUS_SUCCESS} tests"* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} lint"* ]] || return 1
 }
 
 @test "status handles commit status API failure gracefully" {
@@ -370,9 +354,7 @@ add_bare_remote() {
   export MOCK_COMMIT_STATUS_EXIT=1
 
   run -1 gh-signoff status
-  [[ "$output" == *"Could not get status for commit"* ]]
-
-  unset MOCK_COMMIT_STATUS_EXIT
+  [[ "$output" == *"Could not get status for commit"* ]] || return 1
 }
 
 # Exact output, for the same reason as the check test above
@@ -383,7 +365,7 @@ add_bare_remote() {
   sha=$(git rev-parse HEAD)
 
   run -1 gh-signoff status
-  [[ "$output" == "${STATUS_FAILURE} Could not get status for commit ${sha}" ]]
+  [[ "$output" == "${STATUS_FAILURE} Could not get status for commit ${sha}" ]] || return 1
 }
 
 @test "completion --contexts returns signoff contexts" {
@@ -392,31 +374,27 @@ add_bare_remote() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   run -0 gh-signoff completion --contexts
-  [[ "$output" == *"tests"* ]]
-  [[ "$output" == *"lint"* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ "$output" == *"tests"* ]] || return 1
+  [[ "$output" == *"lint"* ]] || return 1
 }
 
 @test "direct signoff with unknown option shows help" {
   run -1 gh-signoff --unknown-option
-  [[ "$output" == *"USAGE"* ]]
-  [[ "$output" == *"COMMANDS"* ]]
+  [[ "$output" == *"USAGE"* ]] || return 1
+  [[ "$output" == *"COMMANDS"* ]] || return 1
 }
 
 @test "direct signoff with -f creates default signoff" {
   export MOCK_POST_STATUS_EXIT=0
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
-  [[ ! "$output" == *"for"* ]]  # Should not have "for" in output
-  unset MOCK_POST_STATUS_EXIT
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! "$output" == *"for"* ]] || return 1  # Should not have "for" in output
 }
 
 @test "direct signoff fails when commit status API fails" {
   export MOCK_POST_STATUS_EXIT=1
   run -1 gh-signoff tests -f
-  [[ "$output" == *"Failed to sign off on"*"for tests"* ]]
-  unset MOCK_POST_STATUS_EXIT
+  [[ "$output" == *"Failed to sign off on"*"for tests"* ]] || return 1
 }
 
 # Cleanliness check tests (is_clean)
@@ -431,7 +409,7 @@ add_bare_remote() {
   git config push.default simple
 
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "signoff via upstream fallback still catches unpushed changes" {
@@ -444,20 +422,20 @@ add_bare_remote() {
   git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
 
   run -1 gh-signoff
-  [[ "$output" == *"unpushed changes"* ]]
+  [[ "$output" == *"unpushed changes"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "signoff fails with clear message when no push destination or upstream" {
   make_nested_repo
 
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "upstream fallback refuses when pushes are rerouted to another remote" {
@@ -475,24 +453,24 @@ add_bare_remote() {
   git config push.default simple
 
   git config remote.pushDefault fork
-  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1 || return 1
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --unset remote.pushDefault
 
   git config branch.ci/gate.pushRemote fork
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --unset branch.ci/gate.pushRemote
 
   git config remote.origin.push "refs/heads/*:refs/heads/qa/*"
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --unset remote.origin.push
 
   # With no rerouting config the fallback engages again
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "upstream fallback refuses when fetch and push URLs differ" {
@@ -509,23 +487,23 @@ add_bare_remote() {
 
   git config remote.origin.pushurl "$TEST_DIR/fork.git"
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --unset remote.origin.pushurl
 
   git config "url.$TEST_DIR/fork.git.pushInsteadOf" "$TEST_DIR/remote.git"
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --remove-section "url.$TEST_DIR/fork.git"
 
   git config remote.origin.pushurl "$TEST_DIR/remote.git"
   git config --add remote.origin.pushurl "$TEST_DIR/fork.git"
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   git config --unset-all remote.origin.pushurl
 
   # With fetch and push URLs identical again the fallback engages
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "upstream fallback refuses unless effective push.default is simple" {
@@ -540,15 +518,15 @@ add_bare_remote() {
 
   for mode in current nothing matching; do
     git config push.default "$mode"
-    ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+    ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1 || return 1
     run -1 gh-signoff
-    [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+    [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
   done
 
   # The centralized renamed-branch case still succeeds
   git config push.default simple
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "upstream fallback refuses a purely local upstream" {
@@ -557,13 +535,13 @@ add_bare_remote() {
   git checkout -q -b ci/gate
   git branch -q --set-upstream-to=base
   git config push.default simple
-  [[ "$(git config branch.ci/gate.remote)" == "." ]]
+  [[ "$(git config branch.ci/gate.remote)" == "." ]] || return 1
 
   run -1 gh-signoff
-  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "signoff fails with uncommitted changes message for dirty worktree" {
@@ -571,10 +549,10 @@ add_bare_remote() {
   touch untracked-file
 
   run -1 gh-signoff
-  [[ "$output" == *"repository has uncommitted changes"* ]]
+  [[ "$output" == *"repository has uncommitted changes"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 # Completion tests for the leading -f grammar. Loads the generated completion
@@ -592,12 +570,10 @@ complete_words() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   complete_words gh-signoff -f
-  [[ " ${COMPREPLY[*]-} " == *" create "* ]]
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
-  [[ ! " ${COMPREPLY[*]-} " == *" status "* ]]
-  [[ ! " ${COMPREPLY[*]-} " == *" install "* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" install "* ]] || return 1
 }
 
 @test "completion after -f create offers contexts only" {
@@ -605,11 +581,9 @@ complete_words() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   complete_words gh-signoff -f create
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
-  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
-  [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
 }
 
 @test "completion after trailing -f offers contexts without create" {
@@ -617,28 +591,26 @@ complete_words() {
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   complete_words gh-signoff linux -f
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
-  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
 }
 
 # Leading -f dispatcher grammar tests
 @test "leading -f applies to contextual signoff" {
   run -0 gh-signoff -f linux
-  [[ "$output" == *"Signed off on"* ]]
-  [[ "$output" == *"for linux"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for linux"* ]] || return 1
 }
 
 @test "leading -f with explicit create signs off on default context" {
   run -0 gh-signoff -f create
-  [[ "$output" == *"Signed off on"* ]]
-  [[ ! "$output" == *"for"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! "$output" == *"for"* ]] || return 1
 }
 
 @test "leading -f is rejected for non-create commands" {
   run -1 gh-signoff -f status
-  [[ "$output" == *"-f is only valid for create"* ]]
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
 }
 
 @test "@{push} stays authoritative over upstream when both resolve" {
@@ -655,5 +627,5 @@ complete_words() {
   git config push.default current
 
   run -1 gh-signoff
-  [[ "$output" == *"unpushed changes"* ]]
+  [[ "$output" == *"unpushed changes"* ]] || return 1
 }
