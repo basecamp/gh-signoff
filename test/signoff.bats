@@ -385,6 +385,39 @@ add_bare_remote() {
   [[ "$output" == *"Signed off on"* ]]
 }
 
+@test "upstream fallback refuses when fetch and push URLs differ" {
+  # remote.<name>.pushurl and url.*.pushInsteadOf send pushes to a different
+  # repository than fetches come from; multiple push URLs have no single
+  # destination. The upstream ref proves nothing about any of them.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git init -q --bare "$TEST_DIR/fork.git"
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+  git config push.default simple
+
+  git config remote.origin.pushurl "$TEST_DIR/fork.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.origin.pushurl
+
+  git config "url.$TEST_DIR/fork.git.pushInsteadOf" "$TEST_DIR/remote.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --remove-section "url.$TEST_DIR/fork.git"
+
+  git config remote.origin.pushurl "$TEST_DIR/remote.git"
+  git config --add remote.origin.pushurl "$TEST_DIR/fork.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset-all remote.origin.pushurl
+
+  # With fetch and push URLs identical again the fallback engages
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
 @test "upstream fallback refuses unless effective push.default is simple" {
   # current would create the not-yet-existing origin/ci/gate; nothing and
   # matching have no single destination. In each, @{push} fails to resolve

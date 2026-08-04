@@ -83,7 +83,7 @@ get_signoff_contexts() {
 # destination independently of the upstream — refuse rather than guess at
 # git's push-routing rules.
 upstream_fallback_is_safe() {
-  local branch remote push_default
+  local branch remote push_default fetch_url push_url
   branch=$(git symbolic-ref --short -q HEAD) || return 1
 
   push_default=$(git config push.default 2>/dev/null) || push_default="simple"
@@ -91,6 +91,12 @@ upstream_fallback_is_safe() {
 
   remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 1
   [[ "$remote" != "." ]] || return 1
+
+  # Resolved URLs catch pushurl, pushInsteadOf rewrites, and multi-URL
+  # remotes: require exactly one fetch URL and one identical push URL
+  fetch_url=$(git remote get-url --all "$remote" 2>/dev/null) || return 1
+  push_url=$(git remote get-url --push --all "$remote" 2>/dev/null) || return 1
+  [[ "$fetch_url" == "$push_url" && "$fetch_url" != *$'\n'* ]] || return 1
 
   ! git config "branch.${branch}.pushRemote" >/dev/null 2>&1 &&
     ! git config remote.pushDefault >/dev/null 2>&1 &&
