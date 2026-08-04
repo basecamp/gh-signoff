@@ -34,6 +34,10 @@ UNCLEAN_REASON=""
 # Tip SHA url_remote_tip proved, for is_clean to check HEAD against
 URL_REMOTE_TIP=""
 
+# Results of the last resolve_commit call
+RESOLVED_COMMIT=""
+RESOLVED_COMMIT_IS_LOCAL=true
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -45,10 +49,39 @@ fail() {
   exit 1
 }
 
-validate_commit() {
-  if [[ ! "$1" =~ ^[0-9a-fA-F]{4,40}$ ]]; then
-    fail "invalid commit: $1"
+# Expand a revision — a short sha, a tag, a branch, HEAD~1 — to the full sha
+# of the commit it names. Reports via RESOLVED_COMMIT and, since a sha we
+# have no object for can't be checked against a remote, RESOLVED_COMMIT_IS_LOCAL.
+resolve_commit() {
+  local rev="$1"
+
+  if [[ -z "$rev" || "$rev" == -* ]]; then
+    fail "option --commit requires an argument"
   fi
+
+  RESOLVED_COMMIT=$(git rev-parse --verify --quiet "${rev}^{commit}" 2>/dev/null) || RESOLVED_COMMIT=""
+
+  if [[ -n "$RESOLVED_COMMIT" ]]; then
+    RESOLVED_COMMIT_IS_LOCAL=true
+    return
+  fi
+
+  # We have the object but it doesn't peel to a commit: a tree or a blob
+  if git cat-file -e "$rev" 2>/dev/null; then
+    fail "not a commit: $rev"
+  fi
+
+  # Unknown to git. A full sha may still name a commit we haven't fetched;
+  # anything shorter or non-hex is a typo, not a revision.
+  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $rev"
+  RESOLVED_COMMIT="$rev"
+  RESOLVED_COMMIT_IS_LOCAL=false
+}
+
+# Is the commit on a remote we know about? Remote-tracking refs are only as
+# fresh as the last fetch, so this is a local proxy; -f overrides.
+commit_is_on_a_remote() {
+  [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
 }
 
 # Get default branch with caching
@@ -278,7 +311,7 @@ is_clean() {
 
 cmd_create() {
   local force=false
-  local commit=""
+  local commit="" commit_is_local=true
   local contexts=()
 
   # Process arguments
@@ -289,11 +322,9 @@ cmd_create() {
         shift
         ;;
       --commit)
-        if [[ -z "${2:-}" || "$2" == -* ]]; then
-          fail "option --commit requires an argument"
-        fi
-        commit="$2"
-        validate_commit "$commit"
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
+        commit_is_local=$RESOLVED_COMMIT_IS_LOCAL
         shift 2
         ;;
 
@@ -308,8 +339,16 @@ cmd_create() {
     esac
   done
 
-  if [[ -z "$commit" ]] && ! $force && ! is_clean; then
-    fail "$UNCLEAN_REASON"
+  # Signing off on a named commit says nothing about the worktree, but the
+  # commit itself still has to have made it to a remote
+  if ! $force; then
+    if [[ -z "$commit" ]]; then
+      is_clean || fail "$UNCLEAN_REASON"
+    elif ! $commit_is_local; then
+      fail "cannot verify ${commit} is on a remote (not a local object; -f to override)"
+    elif ! commit_is_on_a_remote "$commit"; then
+      fail "commit ${commit} is not on any remote (-f to override)"
+    fi
   fi
 
   local user
@@ -593,11 +632,8 @@ cmd_status() {
         shift 2
         ;;
       --commit)
-        if [[ -z "${2:-}" || "$2" == -* ]]; then
-          fail "option --commit requires an argument"
-        fi
-        commit="$2"
-        validate_commit "$commit"
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
         shift 2
         ;;
       -*)

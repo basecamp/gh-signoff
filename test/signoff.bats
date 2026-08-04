@@ -112,6 +112,16 @@ checkout_fork_pull_request() {
   track_url_remote "$TEST_DIR/fork.git" refs/heads/their-branch
 }
 
+# A nested repository with two commits, both on origin, so that HEAD and HEAD~1
+# each satisfy the --commit remote check
+make_pushed_repo() {
+  make_nested_repo
+  add_bare_remote
+  git commit --no-gpg-sign --allow-empty -m "Second commit" >/dev/null
+  git push -q origin HEAD:main
+  git branch -q --set-upstream-to=origin/main
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -129,30 +139,111 @@ checkout_fork_pull_request() {
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
-@test "create signs off on specified commit" {
-  export MOCK_EXPECT_COMMIT=abc123
-  run -0 gh-signoff create --commit abc123
-  [[ "$output" == *"Signed off on abc123"* ]]
-  unset MOCK_EXPECT_COMMIT
+@test "create signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff create --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]]
 }
 
-@test "create rejects invalid commit" {
+@test "direct signoff signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]]
+}
+
+@test "direct partial signoff signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha" linux
+  [[ "$output" == *"Signed off on $sha for linux"* ]]
+}
+
+@test "--commit takes any revision git resolves" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD~1)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit HEAD~1
+  [[ "$output" == *"Signed off on $sha"* ]]
+}
+
+@test "--commit expands a short sha to the full 40 hex" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "${sha:0:8}"
+  [[ "$output" == *"Signed off on $sha"* ]]
+}
+
+@test "--commit rejects a revision git cannot resolve" {
   run -1 gh-signoff create --commit 'abc/status'
   [[ "$output" == *"invalid commit: abc/status"* ]]
 }
 
-@test "direct signoff signs off on specified commit" {
-  export MOCK_EXPECT_COMMIT=def456
-  run -0 gh-signoff --commit def456
-  [[ "$output" == *"Signed off on def456"* ]]
-  unset MOCK_EXPECT_COMMIT
+@test "--commit rejects a missing argument" {
+  run -1 gh-signoff create --commit
+  [[ "$output" == *"option --commit requires an argument"* ]]
 }
 
-@test "direct partial signoff signs off on specified commit" {
-  export MOCK_EXPECT_COMMIT=def456
-  run -0 gh-signoff --commit def456 linux
-  [[ "$output" == *"Signed off on def456 for linux"* ]]
+@test "--commit rejects an object that is not a commit" {
+  # A blob's sha is 40 hex and the object is right here, but it does not peel
+  # to a commit. Without the local-object check it would pass for unfetched.
+  make_pushed_repo
+  echo contents > file
+  git add file
+  git commit --no-gpg-sign -q -m "Add file"
+  blob=$(git rev-parse HEAD:file)
+
+  run -1 gh-signoff --commit "$blob"
+  [[ "$output" == *"not a commit: $blob"* ]]
+}
+
+@test "--commit refuses a sha with no local object to check" {
+  make_pushed_repo
+  unfetched=0123456789012345678901234567890123456789
+
+  run -1 gh-signoff --commit "$unfetched"
+  [[ "$output" == *"cannot verify ${unfetched} is on a remote"* ]]
+
+  export MOCK_EXPECT_COMMIT="$unfetched"
+  run -0 gh-signoff -f --commit "$unfetched"
+  [[ "$output" == *"Signed off on $unfetched"* ]]
+}
+
+@test "--commit refuses a commit that is on no remote" {
+  make_pushed_repo
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  sha=$(git rev-parse HEAD)
+
+  run -1 gh-signoff --commit "$sha"
+  [[ "$output" == *"commit ${sha} is not on any remote"* ]]
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff -f --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]]
+}
+
+@test "--commit checks the named commit, not the worktree" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  touch untracked-file
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]]
+
   unset MOCK_EXPECT_COMMIT
+  run -1 gh-signoff
+  [[ "$output" == *"repository has uncommitted changes"* ]]
 }
 
 @test "check shows status for protected branch" {
@@ -286,15 +377,16 @@ checkout_fork_pull_request() {
   [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
 }
 
-@test "status checks specified commit" {
+@test "status checks the commit named by --commit" {
   # Mock: Protection requires 'signoff', Commit status has successful 'signoff'
-  export MOCK_EXPECT_COMMIT=abc123
+  make_pushed_repo
+  export MOCK_EXPECT_COMMIT=$(git rev-parse HEAD~1)
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"}]}'
   export MOCK_COMMIT_STATUS_EXIT=0
 
-  run -0 gh-signoff status --commit abc123
+  run -0 gh-signoff status --commit HEAD~1
   [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]]
 
   unset MOCK_EXPECT_COMMIT MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
