@@ -49,6 +49,12 @@ fail() {
   exit 1
 }
 
+reject_extra_args() {
+  if [[ $# -gt 0 ]]; then
+    fail "unexpected argument: $1"
+  fi
+}
+
 # Expand a revision — a short sha, a tag, a branch, HEAD~1 — to the full sha
 # of the commit it names. Reports via RESOLVED_COMMIT and, since a sha we
 # have no object for can't be checked against a remote, RESOLVED_COMMIT_IS_LOCAL.
@@ -422,6 +428,12 @@ cmd_install() {
         branch="$2"
         shift 2
         ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
+        ;;
       -*)
         fail "unknown option: $1"
         ;;
@@ -497,6 +509,12 @@ cmd_uninstall() {
         branch="$2"
         shift 2
         ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
+        ;;
       -*)
         fail "unknown option: $1"
         ;;
@@ -554,6 +572,12 @@ cmd_check() {
         fi
         branch="$2"
         shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
         ;;
       -*)
         fail "unknown option: $1"
@@ -635,6 +659,9 @@ cmd_status() {
         resolve_commit "${2:-}"
         commit="$RESOLVED_COMMIT"
         shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
         ;;
       -*)
         fail "unknown option: $1"
@@ -725,9 +752,12 @@ cmd_status() {
 cmd_completion() {
   # Check if --contexts flag is passed
   if [[ "${1:-}" == "--contexts" ]]; then
+    shift
+    reject_extra_args "$@"
     get_signoff_contexts
     return
   fi
+  reject_extra_args "$@"
 
   cat <<'EOF'
 # bash completion for gh signoff
@@ -856,13 +886,30 @@ COMPLETION
 EOF
 }
 
-# A leading -f applies to create (explicit, implicit, or contextual)
-# and is rejected for every other command
+# A leading -f applies to create (explicit, implicit, or contextual); a leading
+# --commit to create and status. Both are rejected for every other command.
+#
+# The revision stays raw here: resolving it before the command is known would
+# report `gh signoff --commit nope install` as a bad revision, when what's
+# actually wrong is that install takes no --commit at all.
 force=""
-if [[ "${1:-}" == "-f" ]]; then
-  force="-f"
-  shift
-fi
+commit_opt=()
+while :; do
+  case "${1:-}" in
+    -f)
+      force="-f"
+      shift
+      ;;
+    --commit)
+      [[ -n "${2:-}" && "$2" != -* ]] || fail "option --commit requires an argument"
+      commit_opt=(--commit "$2")
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 reject_force() {
   if [[ -n "$force" ]]; then
@@ -870,26 +917,30 @@ reject_force() {
   fi
 }
 
+reject_commit() {
+  if [[ ${#commit_opt[@]} -gt 0 ]]; then
+    fail "--commit is only valid for create and status"
+  fi
+}
+
+# ${commit_opt[@]+"${commit_opt[@]}"} is the Bash 3 set -u safe expansion of a
+# possibly-empty array. ${commit_opt:+...} would word-split the revision.
 case "${1:-}" in
-  "")               cmd_create ${force:+-f} ;;
-  "create")         shift; cmd_create ${force:+-f} "$@" ;;
-  "install")        reject_force; shift; cmd_install "$@" ;;
-  "uninstall")      reject_force; shift; cmd_uninstall "$@" ;;
-  "check")          reject_force; shift; cmd_check "$@" ;;
-  "status")         reject_force; shift; cmd_status "$@" ;;
-  "version")        reject_force; cmd_version ;;
-  "completion")     reject_force; shift; cmd_completion "$@" ;;
-  "-h" | "--help")  reject_force; cmd_help ;;
-  "--commit")
-    # An explicit commit with no command is a create
-    cmd_create ${force:+-f} "$@"
-    ;;
+  "")               cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ;;
+  "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
+  "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
+  "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
+  "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
+  "completion")     reject_force; reject_commit; shift; cmd_completion "$@" ;;
+  "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
   -*)
     # Unknown option
     cmd_help; exit 1
     ;;
   *)
     # Treat as partial signoff context(s)
-    cmd_create ${force:+-f} "$@"
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@"
     ;;
 esac

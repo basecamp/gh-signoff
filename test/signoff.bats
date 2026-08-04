@@ -889,6 +889,47 @@ complete_words() {
   [[ "$output" == *"-f is only valid for create"* ]] || return 1
 }
 
+# Leading --commit dispatcher grammar tests
+@test "leading --commit is rejected for commands that do not take it" {
+  # Both orders must give the same answer. The leading form is also the
+  # regression test against resolving the revision before the command is known.
+  for args in "install --commit nope" "--commit nope install" \
+              "uninstall --commit nope" "--commit nope uninstall" \
+              "check --commit nope" "--commit nope check"; do
+    run -1 gh-signoff $args
+    [[ "$output" == *"--commit is only valid for create and status"* ]]
+    [[ ! "$output" == *"invalid commit"* ]]
+  done
+}
+
+@test "leading --commit requires an argument" {
+  run -1 gh-signoff --commit
+  [[ "$output" == *"option --commit requires an argument"* ]]
+
+  run -1 gh-signoff --commit -f
+  [[ "$output" == *"option --commit requires an argument"* ]]
+}
+
+@test "leading --commit passes its argument through as one word" {
+  run -1 gh-signoff --commit "foo bar"
+  [[ "$output" == *"invalid commit: foo bar"* ]]
+}
+
+@test "trailing arguments are reported rather than ignored" {
+  run -1 gh-signoff version --commit nope
+  [[ "$output" == *"unexpected argument: --commit"* ]]
+
+  run -1 gh-signoff completion --contexts extra
+  [[ "$output" == *"unexpected argument: extra"* ]]
+}
+
+@test "-f after a non-create command is rejected the same as before it" {
+  for command in install uninstall check status; do
+    run -1 gh-signoff "$command" -f
+    [[ "$output" == *"-f is only valid for create"* ]]
+  done
+}
+
 @test "@{push} stays authoritative over upstream when both resolve" {
   # Triangular setup: feature tracks origin/main (which contains HEAD), but
   # push.default=current resolves @{push} to origin/feature, which lacks HEAD.
