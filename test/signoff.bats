@@ -576,7 +576,7 @@ checkout_fork_pull_request() {
   ! git remote get-url --all "$TEST_DIR/fork.git" >/dev/null 2>&1
 
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "fork pull request signoff accepts a commit contained in the fork's tip" {
@@ -591,7 +591,7 @@ checkout_fork_pull_request() {
   track_url_remote "$TEST_DIR/fork.git" refs/heads/their-branch
 
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "fork pull request signoff still catches unpushed changes" {
@@ -600,10 +600,10 @@ checkout_fork_pull_request() {
   git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
 
   run -1 gh-signoff
-  [[ "$output" == *"unpushed changes"* ]]
+  [[ "$output" == *"unpushed changes"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "fork pull request signoff refuses when the fork's tip is not in this repository" {
@@ -618,10 +618,10 @@ checkout_fork_pull_request() {
   git -C "$TEST_DIR/contributor" push -q origin HEAD:refs/heads/their-branch
 
   run -1 gh-signoff
-  [[ "$output" == *"which is not in this repository"* ]]
+  [[ "$output" == *"which is not in this repository"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "fork pull request signoff refuses when the tracked ref is absent from the fork" {
@@ -630,8 +630,8 @@ checkout_fork_pull_request() {
   git config branch.their-branch.merge refs/heads/never-pushed
 
   run -1 gh-signoff
-  [[ "$output" == *"unpushed changes"* ]]
-  [[ "$output" == *"refs/heads/never-pushed does not exist"* ]]
+  [[ "$output" == *"unpushed changes"* ]] || return 1
+  [[ "$output" == *"refs/heads/never-pushed does not exist"* ]] || return 1
 }
 
 @test "fork pull request signoff refuses when the fork cannot be reached" {
@@ -640,10 +640,10 @@ checkout_fork_pull_request() {
   track_url_remote "$TEST_DIR/no-such-fork.git" refs/heads/their-branch
 
   run -1 gh-signoff
-  [[ "$output" == *"could not be reached"* ]]
+  [[ "$output" == *"could not be reached"* ]] || return 1
 
   run -0 gh-signoff -f
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "fork pull request signoff refuses when the push destination is not that URL" {
@@ -656,36 +656,36 @@ checkout_fork_pull_request() {
   for mode in current nothing matching; do
     git config push.default "$mode"
     run -1 gh-signoff
-    [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]]
+    [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
   done
   git config push.default simple
 
   git config branch.their-branch.pushremote "$TEST_DIR/elsewhere.git"
   run -1 gh-signoff
-  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]]
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
   git config branch.their-branch.pushremote "$TEST_DIR/fork.git"
 
   git config remote.pushDefault "$TEST_DIR/elsewhere.git"
   git config --unset branch.their-branch.pushremote
   run -1 gh-signoff
-  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]]
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
   git config --unset remote.pushDefault
 
   # url.*.pushInsteadOf rewrites push URLs, and git offers no way to expand
   # the push side of an anonymous remote to compare against
   git config "url.$TEST_DIR/elsewhere.git.pushInsteadOf" "$TEST_DIR/fork.git"
   run -1 gh-signoff
-  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]]
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
   git config --remove-section "url.$TEST_DIR/elsewhere.git"
 
   git config --unset branch.their-branch.merge
   run -1 gh-signoff
-  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]]
+  [[ "$output" == *"tracks $TEST_DIR/fork.git as a URL"* ]] || return 1
   git config branch.their-branch.merge refs/heads/their-branch
 
   # With nothing rerouting the push away from the tracked URL, the proof engages
   run -0 gh-signoff
-  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
 @test "signoff fails with uncommitted changes message for dirty worktree" {
