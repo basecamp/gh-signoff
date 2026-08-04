@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -e
+
+# Directory containing this script
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$DIR")"
+DOCKER_DIR="$REPO_ROOT/test/docker"
+
+# Bash 3.2 is macOS's system bash, so it stays in the matrix long after everyone
+# else moved on. Name versions to narrow the run while iterating: bin/test 3
+VERSIONS="$*"
+[ -n "$VERSIONS" ] || VERSIONS="3 4 5"
+
+PASSED=true
+
+for version in $VERSIONS; do
+  echo -e "\n\033[1;35mBash $version\033[0m"
+
+  docker build --quiet --pull -t "gh-signoff-test:bash$version" \
+    --build-arg "BASH_VERSION=$version" \
+    -f "$DOCKER_DIR/Dockerfile" \
+    "$DOCKER_DIR" >/dev/null
+
+  if docker run --rm -v "$REPO_ROOT:/app" "gh-signoff-test:bash$version"; then
+    echo "✅ Tests passed for Bash $version"
+  else
+    echo "❌ Tests failed for Bash $version"
+    PASSED=false
+  fi
+done
+
+if $PASSED; then
+  # The per-version line above already said it when only one version ran
+  case "$VERSIONS" in
+    *" "*) echo -e "\n✅ Tests passed for Bash $VERSIONS" ;;
+  esac
+else
+  exit 1
+fi
