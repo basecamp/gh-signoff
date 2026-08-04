@@ -10,6 +10,9 @@ export STATUS_SUCCESS="✓"
 export STATUS_PENDING="⟳"
 export STATUS_FAILURE="✗"
 
+# Catches failures the script didn't anticipate. Commands report an expected
+# negative result (e.g. check on an unprotected branch) by exiting nonzero
+# themselves: returning nonzero would reach this trap and look unexpected.
 trap 'fail "Unexpected error on line $LINENO ($?)"' ERR
 
 if ! command -v git >/dev/null 2>&1; then
@@ -399,7 +402,7 @@ cmd_check() {
         echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
       fi
     done
-    return 1
+    exit 1
   }
 
   # Check each context
@@ -464,7 +467,7 @@ cmd_status() {
   local statuses
   statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" 2>/dev/null) || {
     echo "${STATUS_FAILURE} Could not get status for commit ${sha}"
-    return 1
+    exit 1
   }
 
   # Create required contexts list - always start with "signoff"

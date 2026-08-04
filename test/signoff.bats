@@ -143,6 +143,20 @@ add_bare_remote() {
   unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
+# Exact output, not substring: bats folds stderr into $output, so a leaked
+# internal diagnostic (e.g. the ERR trap firing on the command's own nonzero
+# exit) is invisible to a substring assertion.
+@test "check reports only the negative result for an unprotected branch" {
+  # Mock: no protection at all (like a 404 from the protection API)
+  export MOCK_BRANCH_PROTECTION_EXIT=1
+
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+
+  run -1 gh-signoff check windows
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on windows" ]]
+}
+
 @test "uninstall with context removes contextual protection" {
   # Expect DELETE protection call to succeed
   export MOCK_DELETE_PROTECTION_EXIT=0
@@ -274,6 +288,17 @@ add_bare_remote() {
   [[ "$output" == *"Could not get status for commit"* ]]
 
   unset MOCK_COMMIT_STATUS_EXIT
+}
+
+# Exact output, for the same reason as the check test above
+@test "status reports only the negative result when the status API fails" {
+  # Mock: Commit status API fails
+  export MOCK_COMMIT_STATUS_EXIT=1
+  local sha
+  sha=$(git rev-parse HEAD)
+
+  run -1 gh-signoff status
+  [[ "$output" == "${STATUS_FAILURE} Could not get status for commit ${sha}" ]]
 }
 
 @test "completion --contexts returns signoff contexts" {
