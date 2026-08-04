@@ -27,6 +27,14 @@ if [[ -n "${GH_MOCK_DEBUG:-}" ]]; then
   echo "----------------------" >&2
 fi
 
+# --- Extension Proxy ---
+# gh runs extensions as subcommands: proxy 'gh signoff ...' to the
+# gh-signoff under test (used by completion's context lookup)
+if [[ "${1:-}" == "signoff" ]]; then
+  shift
+  exec gh-signoff "$@"
+fi
+
 # --- Argument Parsing & Mock Logic ---
 api_method="GET" # Default method
 api_path=""

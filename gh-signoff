@@ -531,7 +531,23 @@ _gh_signoff() {
       COMPREPLY=( $(compgen -W "create install uninstall check status version -f --help $contexts" -- "$cur") )
       return 0
       ;;
-    create|install|uninstall|check)
+    -f)
+      # A leading -f may be followed by the create command or a context;
+      # elsewhere only contexts remain
+      local contexts=$(_gh_signoff_contexts)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "create $contexts" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+      fi
+      return 0
+      ;;
+    create)
+      local contexts=$(_gh_signoff_contexts)
+      COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+      return 0
+      ;;
+    install|uninstall|check)
       local contexts=$(_gh_signoff_contexts)
       COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
       return 0

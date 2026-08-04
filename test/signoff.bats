@@ -361,6 +361,52 @@ add_bare_remote() {
   [[ "$output" == *"Signed off on"* ]]
 }
 
+# Completion tests for the leading -f grammar. Loads the generated completion
+# function and invokes it directly with a simulated command line.
+complete_words() {
+  eval "$(gh-signoff completion)"
+  COMP_WORDS=("$@" "")
+  COMP_CWORD=$#
+  COMPREPLY=()
+  _gh_signoff
+}
+
+@test "completion after leading -f offers create plus contexts" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" status "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" install "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after -f create offers contexts only" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f create
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after trailing -f offers contexts without create" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff linux -f
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
 # Leading -f dispatcher grammar tests
 @test "leading -f applies to contextual signoff" {
   run -0 gh-signoff -f linux
