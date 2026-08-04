@@ -1,0 +1,27 @@
+test/signoff.bats
+  s_f6ed5a6b53fde9::t_fcaca0555d0403 65-67,69,72-74,77-79,81,84-86,88,226,228,234,237
+gh-signoff
+  s_f6ed5a6b53fde9::t_1d397a2dc71915 662,666
+  s_f6ed5a6b53fde9::t_72b4aa3f7fccdc 675,678-687
+  s_f6ed5a6b53fde9::t_86816405114433 42,44,149,159,161,163-164,179,187-188,206,210,217,219,224,226,448,460,462,464-465,484-486,491-492,586,602,606,620,626,719-720
+README.md
+  s_f6ed5a6b53fde9::t_fcaca0555d0403 30,85
+test/mocks/gh
+  s_f6ed5a6b53fde9::t_fcaca0555d0403 88-89,108-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "08d0c3d28e954c39a0f514f7177a1e5a533387e5",
+  "prompts": {},
+  "sessions": {
+    "s_f6ed5a6b53fde9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9eb4faf4-1b53-4206-b173-40057adb8dc9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
