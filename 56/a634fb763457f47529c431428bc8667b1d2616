@@ -1,0 +1,24 @@
+test/signoff.bats
+  s_53125d982c8134::t_9d5380819a4507 293-303
+  s_53125d982c8134::t_4ed2cc86c5b23f 146-159
+gh-signoff
+  s_53125d982c8134::t_9890131543db26 405
+  s_53125d982c8134::t_2a99d353a2bab9 13-15
+  s_53125d982c8134::t_0710dd4d187a0e 470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "56a634fb763457f47529c431428bc8667b1d2616",
+  "prompts": {},
+  "sessions": {
+    "s_53125d982c8134": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44e90d6a-b576-42b9-8059-6daf93adcbaf",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
