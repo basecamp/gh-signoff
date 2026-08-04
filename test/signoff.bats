@@ -927,6 +927,23 @@ complete_prefix() {
   [[ ${#COMPREPLY[@]} -eq 0 ]] || return 1
 }
 
+@test "completion offers commands at the command position after a leading --commit" {
+  # The word under the cursor is what the user is typing, not a chosen command.
+  # Treating it as one skipped the command list, so `--commit HEAD st<TAB>`
+  # never offered status even though the dispatcher accepts it there.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_prefix gh-signoff --commit HEAD st
+  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
+
+  # Nothing typed yet: both commands and contexts are reachable
+  complete_words gh-signoff --commit HEAD
+  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+}
+
 @test "completion finds the command past a leading --commit" {
   # COMP_WORDS[1] here is --commit, not the command. Reading it directly would
   # offer create's options in the middle of a status invocation.

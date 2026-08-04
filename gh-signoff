@@ -780,10 +780,13 @@ _gh_signoff_contexts() {
 }
 
 # The first word that is neither a global option nor its argument. -f and
-# --commit may precede the command, so COMP_WORDS[1] is not it.
+# --commit may precede the command, so COMP_WORDS[1] is not it. Stops short of
+# the word being completed: that one is what the user is still typing, not a
+# command they have settled on, and echoing it back would suppress the very
+# list they are typing towards. Empty means the cursor is at the command.
 _gh_signoff_command() {
   local i=1
-  while [[ $i -lt ${#COMP_WORDS[@]} ]]; do
+  while [[ $i -lt $COMP_CWORD ]]; do
     case "${COMP_WORDS[$i]}" in
       -f)       i=$((i+1)) ;;
       --commit) i=$((i+2)) ;;
@@ -850,6 +853,15 @@ _gh_signoff() {
         COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
         ;;
     esac
+    return 0
+  fi
+
+  # No command yet, so the cursor is where one goes: offer the same list as
+  # directly after `signoff`, which a leading -f or --commit would otherwise
+  # push out of reach
+  if [[ -z "$command" ]]; then
+    local contexts=$(_gh_signoff_contexts)
+    COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
     return 0
   fi
 
