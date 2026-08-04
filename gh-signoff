@@ -25,6 +25,9 @@ fi
 # Cache for default branch
 DEFAULT_BRANCH=""
 
+# Reason the working tree failed is_clean, for error reporting
+UNCLEAN_REASON=""
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -73,21 +76,62 @@ get_signoff_contexts() {
   printf "%s\n" "${contexts[@]}"
 }
 
+# @{upstream} is a sound stand-in for an unresolvable @{push} only in the
+# narrow centralized case: HEAD on a branch whose upstream lives on a real
+# remote, effective push.default simple (git's default), and nothing
+# rerouting pushes elsewhere. Every other push mode determines its
+# destination independently of the upstream — refuse rather than guess at
+# git's push-routing rules.
+upstream_fallback_is_safe() {
+  local branch remote push_default fetch_url push_url
+  branch=$(git symbolic-ref --short -q HEAD) || return 1
+
+  push_default=$(git config push.default 2>/dev/null) || push_default="simple"
+  [[ "$push_default" == "simple" ]] || return 1
+
+  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 1
+  [[ "$remote" != "." ]] || return 1
+
+  # Resolved URLs catch pushurl, pushInsteadOf rewrites, and multi-URL
+  # remotes: require exactly one fetch URL and one identical push URL
+  fetch_url=$(git remote get-url --all "$remote" 2>/dev/null) || return 1
+  push_url=$(git remote get-url --push --all "$remote" 2>/dev/null) || return 1
+  [[ "$fetch_url" == "$push_url" && "$fetch_url" != *$'\n'* ]] || return 1
+
+  ! git config "branch.${branch}.pushRemote" >/dev/null 2>&1 &&
+    ! git config remote.pushDefault >/dev/null 2>&1 &&
+    ! git config --get-all "remote.${remote}.push" >/dev/null 2>&1
+}
+
 is_clean() {
   local git_cmd=$(command -v git)
 
   if [[ -n "$($git_cmd status --porcelain)" ]]; then
     debug "found uncommitted changes"
+    UNCLEAN_REASON="repository has uncommitted changes"
     return 1
   fi
 
-  if ! $git_cmd rev-parse --abbrev-ref @{push} >/dev/null 2>&1; then
-    debug "no tracking branch found"
-    fail "current branch is not tracking a remote branch"
+  # @{push} is authoritative for "are my commits pushed?", but under
+  # push.default=simple it only resolves when local and upstream names match.
+  # Fall back to @{upstream} — HEAD contained in the upstream is a sound proxy
+  # for "this SHA is on the remote" — when that's provably safe.
+  local push_ref
+  push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) || push_ref=""
+
+  if [[ -z "$push_ref" ]] && upstream_fallback_is_safe; then
+    push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) || push_ref=""
   fi
 
-  if [[ -n "$($git_cmd log @{push}..)" ]]; then
+  if [[ -z "$push_ref" ]]; then
+    debug "@{push} does not resolve and @{upstream} is not a sound fallback"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (@{push} does not resolve; check push.default and branch tracking; -f to override)"
+    return 1
+  fi
+
+  if [[ -n "$($git_cmd log "$push_ref"..)" ]]; then
     debug "found unpushed changes"
+    UNCLEAN_REASON="repository has unpushed changes"
     return 1
   fi
 
@@ -118,7 +162,7 @@ cmd_create() {
   done
 
   if ! $force && ! is_clean; then
-    fail "repository has uncommitted or unpushed changes"
+    fail "$UNCLEAN_REASON"
   fi
 
   local user
@@ -516,7 +560,23 @@ _gh_signoff() {
       COMPREPLY=( $(compgen -W "create install uninstall check status version -f --help $contexts" -- "$cur") )
       return 0
       ;;
-    create|install|uninstall|check)
+    -f)
+      # A leading -f may be followed by the create command or a context;
+      # elsewhere only contexts remain
+      local contexts=$(_gh_signoff_contexts)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "create $contexts" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+      fi
+      return 0
+      ;;
+    create)
+      local contexts=$(_gh_signoff_contexts)
+      COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+      return 0
+      ;;
+    install|uninstall|check)
       local contexts=$(_gh_signoff_contexts)
       COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
       return 0
@@ -592,27 +652,36 @@ COMPLETION
 EOF
 }
 
+# A leading -f applies to create (explicit, implicit, or contextual)
+# and is rejected for every other command
+force=""
+if [[ "${1:-}" == "-f" ]]; then
+  force="-f"
+  shift
+fi
+
+reject_force() {
+  if [[ -n "$force" ]]; then
+    fail "-f is only valid for create"
+  fi
+}
+
 case "${1:-}" in
-  "")               cmd_create "$@" ;;
-  "create")         shift; cmd_create "$@" ;;
-  "install")        shift; cmd_install "$@" ;;
-  "uninstall")      shift; cmd_uninstall "$@" ;;
-  "check")          shift; cmd_check "$@" ;;
-  "status")         shift; cmd_status "$@" ;;
-  "version")        cmd_version ;;
-  "completion")     shift; cmd_completion "$@" ;;
-  "-h" | "--help")  cmd_help ;;
+  "")               cmd_create ${force:+-f} ;;
+  "create")         shift; cmd_create ${force:+-f} "$@" ;;
+  "install")        reject_force; shift; cmd_install "$@" ;;
+  "uninstall")      reject_force; shift; cmd_uninstall "$@" ;;
+  "check")          reject_force; shift; cmd_check "$@" ;;
+  "status")         reject_force; shift; cmd_status "$@" ;;
+  "version")        reject_force; cmd_version ;;
+  "completion")     reject_force; shift; cmd_completion "$@" ;;
+  "-h" | "--help")  reject_force; cmd_help ;;
+  -*)
+    # Unknown option
+    cmd_help; exit 1
+    ;;
   *)
-    # Handle partial signoff contexts directly
-    if [[ "$1" == "-f" ]]; then
-      # Special case - forced signoff with no context
-      cmd_create -f
-    elif [[ "$1" == -* ]]; then
-      # Unknown option
-      cmd_help; exit 1
-    else
-      # Treat as partial signoff context(s)
-      cmd_create "$@"
-    fi
+    # Treat as partial signoff context(s)
+    cmd_create ${force:+-f} "$@"
     ;;
 esac

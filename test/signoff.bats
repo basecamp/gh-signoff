@@ -28,6 +28,23 @@ teardown() {
   [ -d "$TEST_DIR" ] && rm -rf "$TEST_DIR"
 }
 
+# Create a nested clean repository and cd into it. The top-level TEST_DIR repo
+# holds the untracked gh-signoff and gh mock binaries (still on PATH), which
+# would trip is_clean's uncommitted-changes check before the paths under test.
+make_nested_repo() {
+  git init -q "$TEST_DIR/repo"
+  cd "$TEST_DIR/repo"
+  git config user.name "Test User"
+  git commit --no-gpg-sign --allow-empty -m "Initial commit" >/dev/null
+  [[ -z "$(git status --porcelain)" ]]
+}
+
+# Add a bare remote to the nested repository
+add_bare_remote() {
+  git init -q --bare "$TEST_DIR/remote.git"
+  git remote add origin "$TEST_DIR/remote.git"
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -290,4 +307,243 @@ teardown() {
   run -1 gh-signoff tests -f
   [[ "$output" == *"Failed to sign off on"*"for tests"* ]]
   unset MOCK_POST_STATUS_EXIT
+}
+
+# Cleanliness check tests (is_clean)
+@test "signoff succeeds via upstream fallback when @{push} does not resolve" {
+  # push.default=simple: @{push} fails for a branch whose name differs from
+  # its upstream's, but @{upstream} still proves HEAD is on the remote
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:some-branch
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/some-branch
+  git config push.default simple
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff via upstream fallback still catches unpushed changes" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:some-branch
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/some-branch
+  git config push.default simple
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff fails with clear message when no push destination or upstream" {
+  make_nested_repo
+
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses when pushes are rerouted to another remote" {
+  # Triangular two-remote setup: upstream origin/main contains HEAD, but
+  # remote.pushDefault sends pushes to fork, whose ci/gate is not up to date.
+  # @{push} fails to resolve (fork/ci/gate was never fetched); falling back
+  # to the upstream would approve a SHA absent from the real push destination.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git init -q --bare "$TEST_DIR/fork.git"
+  git remote add fork "$TEST_DIR/fork.git"
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+  git config push.default simple
+
+  git config remote.pushDefault fork
+  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.pushDefault
+
+  git config branch.ci/gate.pushRemote fork
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset branch.ci/gate.pushRemote
+
+  git config remote.origin.push "refs/heads/*:refs/heads/qa/*"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.origin.push
+
+  # With no rerouting config the fallback engages again
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses when fetch and push URLs differ" {
+  # remote.<name>.pushurl and url.*.pushInsteadOf send pushes to a different
+  # repository than fetches come from; multiple push URLs have no single
+  # destination. The upstream ref proves nothing about any of them.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git init -q --bare "$TEST_DIR/fork.git"
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+  git config push.default simple
+
+  git config remote.origin.pushurl "$TEST_DIR/fork.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.origin.pushurl
+
+  git config "url.$TEST_DIR/fork.git.pushInsteadOf" "$TEST_DIR/remote.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --remove-section "url.$TEST_DIR/fork.git"
+
+  git config remote.origin.pushurl "$TEST_DIR/remote.git"
+  git config --add remote.origin.pushurl "$TEST_DIR/fork.git"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset-all remote.origin.pushurl
+
+  # With fetch and push URLs identical again the fallback engages
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses unless effective push.default is simple" {
+  # current would create the not-yet-existing origin/ci/gate; nothing and
+  # matching have no single destination. In each, @{push} fails to resolve
+  # and the upstream must not stand in for it.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+
+  for mode in current nothing matching; do
+    git config push.default "$mode"
+    ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+    run -1 gh-signoff
+    [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  done
+
+  # The centralized renamed-branch case still succeeds
+  git config push.default simple
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses a purely local upstream" {
+  make_nested_repo
+  git branch -q base
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=base
+  git config push.default simple
+  [[ "$(git config branch.ci/gate.remote)" == "." ]]
+
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "signoff fails with uncommitted changes message for dirty worktree" {
+  make_nested_repo
+  touch untracked-file
+
+  run -1 gh-signoff
+  [[ "$output" == *"repository has uncommitted changes"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+# Completion tests for the leading -f grammar. Loads the generated completion
+# function and invokes it directly with a simulated command line.
+complete_words() {
+  eval "$(gh-signoff completion)"
+  COMP_WORDS=("$@" "")
+  COMP_CWORD=$#
+  COMPREPLY=()
+  _gh_signoff
+}
+
+@test "completion after leading -f offers create plus contexts" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]]
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" status "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" install "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after -f create offers contexts only" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f create
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+@test "completion after trailing -f offers contexts without create" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff linux -f
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]]
+  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]]
+
+  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
+}
+
+# Leading -f dispatcher grammar tests
+@test "leading -f applies to contextual signoff" {
+  run -0 gh-signoff -f linux
+  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"for linux"* ]]
+}
+
+@test "leading -f with explicit create signs off on default context" {
+  run -0 gh-signoff -f create
+  [[ "$output" == *"Signed off on"* ]]
+  [[ ! "$output" == *"for"* ]]
+}
+
+@test "leading -f is rejected for non-create commands" {
+  run -1 gh-signoff -f status
+  [[ "$output" == *"-f is only valid for create"* ]]
+}
+
+@test "@{push} stays authoritative over upstream when both resolve" {
+  # Triangular setup: feature tracks origin/main (which contains HEAD), but
+  # push.default=current resolves @{push} to origin/feature, which lacks HEAD.
+  # The upstream fallback must not engage.
+  make_nested_repo
+  add_bare_remote
+  git checkout -q -b feature
+  git push -q origin feature
+  git commit --no-gpg-sign --allow-empty -m "Second commit" >/dev/null
+  git push -q origin HEAD:main
+  git branch -q --set-upstream-to=origin/main
+  git config push.default current
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]]
 }
