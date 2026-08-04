@@ -607,27 +607,36 @@ COMPLETION
 EOF
 }
 
+# A leading -f applies to create (explicit, implicit, or contextual)
+# and is rejected for every other command
+force=""
+if [[ "${1:-}" == "-f" ]]; then
+  force="-f"
+  shift
+fi
+
+reject_force() {
+  if [[ -n "$force" ]]; then
+    fail "-f is only valid for create"
+  fi
+}
+
 case "${1:-}" in
-  "")               cmd_create "$@" ;;
-  "create")         shift; cmd_create "$@" ;;
-  "install")        shift; cmd_install "$@" ;;
-  "uninstall")      shift; cmd_uninstall "$@" ;;
-  "check")          shift; cmd_check "$@" ;;
-  "status")         shift; cmd_status "$@" ;;
-  "version")        cmd_version ;;
-  "completion")     shift; cmd_completion "$@" ;;
-  "-h" | "--help")  cmd_help ;;
+  "")               cmd_create ${force:+-f} ;;
+  "create")         shift; cmd_create ${force:+-f} "$@" ;;
+  "install")        reject_force; shift; cmd_install "$@" ;;
+  "uninstall")      reject_force; shift; cmd_uninstall "$@" ;;
+  "check")          reject_force; shift; cmd_check "$@" ;;
+  "status")         reject_force; shift; cmd_status "$@" ;;
+  "version")        reject_force; cmd_version ;;
+  "completion")     reject_force; shift; cmd_completion "$@" ;;
+  "-h" | "--help")  reject_force; cmd_help ;;
+  -*)
+    # Unknown option
+    cmd_help; exit 1
+    ;;
   *)
-    # Handle partial signoff contexts directly
-    if [[ "$1" == "-f" ]]; then
-      # Special case - forced signoff with no context
-      cmd_create -f
-    elif [[ "$1" == -* ]]; then
-      # Unknown option
-      cmd_help; exit 1
-    else
-      # Treat as partial signoff context(s)
-      cmd_create "$@"
-    fi
+    # Treat as partial signoff context(s)
+    cmd_create ${force:+-f} "$@"
     ;;
 esac

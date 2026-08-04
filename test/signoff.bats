@@ -361,6 +361,24 @@ add_bare_remote() {
   [[ "$output" == *"Signed off on"* ]]
 }
 
+# Leading -f dispatcher grammar tests
+@test "leading -f applies to contextual signoff" {
+  run -0 gh-signoff -f linux
+  [[ "$output" == *"Signed off on"* ]]
+  [[ "$output" == *"for linux"* ]]
+}
+
+@test "leading -f with explicit create signs off on default context" {
+  run -0 gh-signoff -f create
+  [[ "$output" == *"Signed off on"* ]]
+  [[ ! "$output" == *"for"* ]]
+}
+
+@test "leading -f is rejected for non-create commands" {
+  run -1 gh-signoff -f status
+  [[ "$output" == *"-f is only valid for create"* ]]
+}
+
 @test "@{push} stays authoritative over upstream when both resolve" {
   # Triangular setup: feature tracks origin/main (which contains HEAD), but
   # push.default=current resolves @{push} to origin/feature, which lacks HEAD.
