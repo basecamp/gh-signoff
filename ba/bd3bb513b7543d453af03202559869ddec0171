@@ -1,0 +1,33 @@
+test/mocks/gh
+  s_53125d982c8134::t_d1b1650786c0d7 4-13
+  s_53125d982c8134::t_60ef5ab70f2862 84-100,107-109,117-119,127-129
+gh-signoff
+  s_53125d982c8134::t_eee2a3440389ec 62-63
+  s_53125d982c8134::t_53218e17d4c054 470-471
+  s_53125d982c8134::t_63f4c1bbe89f34 72-76,78-80
+  s_53125d982c8134::t_23e6f18196516a 473-475,479,485-492,494-498,500-502,507-508,510,512-513
+  s_53125d982c8134::t_a112aaa50a9266 43-50,53-57
+  s_53125d982c8134::t_f3e874e1409763 420-421
+  s_53125d982c8134::t_7aba2d305d612a 409
+  s_53125d982c8134::t_17d137291138a7 396-399
+  s_53125d982c8134::t_e60757d7b076cc 6
+test/signoff.bats
+  s_53125d982c8134::t_2c2ae3b3deafaa 242-250,269-274
+  s_53125d982c8134::t_3745c2b4b25748 251-252,259-260,262-268,275-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "babd3bb513b7543d453af03202559869ddec0171",
+  "prompts": {},
+  "sessions": {
+    "s_53125d982c8134": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44e90d6a-b576-42b9-8059-6daf93adcbaf",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
