@@ -385,6 +385,44 @@ add_bare_remote() {
   [[ "$output" == *"Signed off on"* ]]
 }
 
+@test "upstream fallback refuses unless effective push.default is simple" {
+  # current would create the not-yet-existing origin/ci/gate; nothing and
+  # matching have no single destination. In each, @{push} fails to resolve
+  # and the upstream must not stand in for it.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+
+  for mode in current nothing matching; do
+    git config push.default "$mode"
+    ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+    run -1 gh-signoff
+    [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  done
+
+  # The centralized renamed-branch case still succeeds
+  git config push.default simple
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses a purely local upstream" {
+  make_nested_repo
+  git branch -q base
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=base
+  git config push.default simple
+  [[ "$(git config branch.ci/gate.remote)" == "." ]]
+
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
 @test "signoff fails with uncommitted changes message for dirty worktree" {
   make_nested_repo
   touch untracked-file

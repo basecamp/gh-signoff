@@ -76,18 +76,25 @@ get_signoff_contexts() {
   printf "%s\n" "${contexts[@]}"
 }
 
-# Push-rerouting config (pushRemote, pushDefault, push refspecs) can send
-# pushes somewhere other than the upstream remote, making @{upstream} an
-# unsound proxy for @{push}. Detect it rather than reimplement git's
-# push-routing rules.
-push_is_rerouted() {
-  local branch remote
-  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
-  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || remote=""
+# @{upstream} is a sound stand-in for an unresolvable @{push} only in the
+# narrow centralized case: HEAD on a branch whose upstream lives on a real
+# remote, effective push.default simple (git's default), and nothing
+# rerouting pushes elsewhere. Every other push mode determines its
+# destination independently of the upstream — refuse rather than guess at
+# git's push-routing rules.
+upstream_fallback_is_safe() {
+  local branch remote push_default
+  branch=$(git symbolic-ref --short -q HEAD) || return 1
 
-  git config "branch.${branch}.pushRemote" >/dev/null 2>&1 ||
-    git config remote.pushDefault >/dev/null 2>&1 ||
-    { [[ -n "$remote" ]] && git config --get-all "remote.${remote}.push" >/dev/null 2>&1; }
+  push_default=$(git config push.default 2>/dev/null) || push_default="simple"
+  [[ "$push_default" == "simple" ]] || return 1
+
+  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 1
+  [[ "$remote" != "." ]] || return 1
+
+  ! git config "branch.${branch}.pushRemote" >/dev/null 2>&1 &&
+    ! git config remote.pushDefault >/dev/null 2>&1 &&
+    ! git config --get-all "remote.${remote}.push" >/dev/null 2>&1
 }
 
 is_clean() {
@@ -102,12 +109,11 @@ is_clean() {
   # @{push} is authoritative for "are my commits pushed?", but under
   # push.default=simple it only resolves when local and upstream names match.
   # Fall back to @{upstream} — HEAD contained in the upstream is a sound proxy
-  # for "this SHA is on the remote" — but only in a centralized workflow
-  # where nothing reroutes pushes away from the upstream remote.
+  # for "this SHA is on the remote" — when that's provably safe.
   local push_ref
   push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) || push_ref=""
 
-  if [[ -z "$push_ref" ]] && ! push_is_rerouted; then
+  if [[ -z "$push_ref" ]] && upstream_fallback_is_safe; then
     push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) || push_ref=""
   fi
 
