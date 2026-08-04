@@ -239,26 +239,59 @@ add_bare_remote() {
   unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
 }
 
-@test "status handles CRLF output from jq" {
-  # Reproduce the CRLF emitted by jq on Windows while keeping the test portable.
-  local jq_path
-  jq_path="$(command -v jq)"
-  cat > "$TEST_DIR/jq" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-"$jq_path" "\$@" | sed 's/\r$//; s/\$/\r/'
-EOF
-  chmod +x "$TEST_DIR/jq"
-
+# MOCK_CRLF makes the gh mock terminate every line with \r\n, standing in for
+# the CRLF a Windows toolchain can hand back. A stray \r turns "success" into a
+# state that matches nothing and "signoff" into a second, distinct context, so
+# these assert exact output rather than substrings.
+#
+# Each ends on its assertion, with no trailing unset: bash 3.2's set -e does not
+# fire for a failing [[ ]] inside a function, so any command after the assertion
+# becomes the test's exit status and the assertion stops being enforced. Bats
+# runs each test in its own process, so the exports do not leak regardless.
+@test "status tolerates CRLF from gh on Windows" {
+  export MOCK_CRLF=1
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"},{"context":"signoff/tests","state":"success","description":"Test User signed off"}]}'
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
-  [[ "$output" == $'✓ signoff\n✓ tests' ]]
+  [[ "$output" == "${STATUS_SUCCESS} signoff"$'\n'"${STATUS_SUCCESS} tests" ]]
+}
 
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
+@test "check tolerates CRLF from gh on Windows" {
+  export MOCK_CRLF=1
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]]
+}
+
+@test "check on a named context tolerates CRLF from gh on Windows" {
+  export MOCK_CRLF=1
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff check tests
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]]
+}
+
+@test "completion contexts tolerate CRLF from gh on Windows" {
+  export MOCK_CRLF=1
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests", "signoff/lint"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff completion --contexts
+  [[ "$output" == "tests"$'\n'"lint" ]]
+}
+
+@test "completion contexts are empty when only plain signoff is required" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff completion --contexts
+  [[ -z "$output" ]]
 }
 
 @test "status shows signoffs even without branch protection" {

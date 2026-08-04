@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Windows Line Endings ---
+# Re-run ourselves and CRLF-terminate every line of stdout, standing in for a
+# toolchain that hands the shell \r-terminated output. Covers the whole mock
+# surface in one place rather than per response.
+if [[ -n "${MOCK_CRLF:-}" ]]; then
+  rc=0
+  MOCK_CRLF="" "$0" "$@" | sed $'s/$/\r/' || rc=$?
+  exit $rc
+fi
+
 # --- Default Mock Responses & Exit Codes ---
 # These can be overridden by environment variables in specific tests
 : ${MOCK_DEFAULT_BRANCH_JSON:='{"default_branch":"main"}'}
@@ -71,14 +81,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --- Response Helpers ---
+
+# Apply --jq to the response body the way gh's built-in jq does
+emit() {
+  if [[ -n "$jq_filter" ]]; then
+    echo "$1" | jq -r "$jq_filter"
+  else
+    echo "$1"
+  fi
+}
+
+# gh prints the API error body to stdout and exits nonzero, so callers have to
+# reset their capture rather than treat the body as a response
+emit_error() {
+  echo "{\"message\":\"$1\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"404\"}"
+}
+
 # --- Determine Response Based on API Call ---
 
 # Default Branch Call
 if [[ "$api_path" == "repos/:owner/:repo" && "$jq_filter" == ".default_branch" ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Default Branch" >&2
   if [[ "$MOCK_DEFAULT_BRANCH_EXIT" -eq 0 ]]; then
-    # Extract just the default_branch value using jq, not the entire JSON
-    echo "$MOCK_DEFAULT_BRANCH_JSON" | jq -r '.default_branch'
+    emit "$MOCK_DEFAULT_BRANCH_JSON"
+  else
+    emit_error "Not Found"
   fi
   exit "$MOCK_DEFAULT_BRANCH_EXIT"
 
@@ -86,7 +114,9 @@ if [[ "$api_path" == "repos/:owner/:repo" && "$jq_filter" == ".default_branch" ]
 elif [[ "$api_method" == "GET" && "$api_path" == *"commits/"*"/status"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Commit Status" >&2
   if [[ "$MOCK_COMMIT_STATUS_EXIT" -eq 0 ]]; then
-    echo "$MOCK_COMMIT_STATUS_JSON"
+    emit "$MOCK_COMMIT_STATUS_JSON"
+  else
+    emit_error "Not Found"
   fi
   exit "$MOCK_COMMIT_STATUS_EXIT"
 
@@ -94,7 +124,9 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"commits/"*"/status"* ]]; then
 elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Branch Protection" >&2
   if [[ "$MOCK_BRANCH_PROTECTION_EXIT" -eq 0 ]]; then
-    echo "$MOCK_BRANCH_PROTECTION_JSON"
+    emit "$MOCK_BRANCH_PROTECTION_JSON"
+  else
+    emit_error "Branch not protected"
   fi
   exit "$MOCK_BRANCH_PROTECTION_EXIT"
 
