@@ -1,0 +1,19 @@
+test/signoff.bats
+  s_f6ed5a6b53fde9::t_3378b4f69e887b 27-45,47-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "a6817eecff1175fe251dd59ff93389f6938ecd81",
+  "prompts": {},
+  "sessions": {
+    "s_f6ed5a6b53fde9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9eb4faf4-1b53-4206-b173-40057adb8dc9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
