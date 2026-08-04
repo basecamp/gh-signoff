@@ -388,8 +388,6 @@ make_pushed_repo() {
 
   run -0 gh-signoff status --commit HEAD~1
   [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
-
-  unset MOCK_EXPECT_COMMIT MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT MOCK_COMMIT_STATUS_JSON MOCK_COMMIT_STATUS_EXIT
 }
 
 @test "status shows missing default signoff" {
@@ -877,8 +875,6 @@ complete_prefix() {
 
   complete_words gh-signoff -f
   [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
 @test "completion after create offers -f and --commit" {
@@ -889,8 +885,6 @@ complete_prefix() {
   [[ " ${COMPREPLY[*]-} " == *" -f "* ]] || return 1
   [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
   [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
 @test "completion after --commit suggests nothing" {
@@ -899,8 +893,6 @@ complete_prefix() {
 
   complete_words gh-signoff --commit
   [[ ${#COMPREPLY[@]} -eq 0 ]] || return 1
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
 @test "completion finds the command past a leading --commit" {
@@ -924,8 +916,6 @@ complete_prefix() {
   # The completion function shells out to this on every tab
   run -0 gh-signoff completion --contexts
   [[ "$output" == *"tests"* ]] || return 1
-
-  unset MOCK_BRANCH_PROTECTION_JSON MOCK_BRANCH_PROTECTION_EXIT
 }
 
 @test "completion after trailing -f offers contexts without create" {
