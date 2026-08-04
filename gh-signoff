@@ -885,13 +885,14 @@ FLAGS
 
 OPTIONS
   --branch <branch>  Branch to operate on (for install, uninstall, check, status)
-  --commit <sha>     Commit to operate on (for create, status)
+  --commit <sha>     Commit to sign off on (for create, status). Any revision
+                     git resolves; must be on a remote unless forced with -f
 
 EXAMPLES
   gh signoff                           # Sign off on current commit
   gh signoff --commit abc1234          # Sign off on a specific commit
+  gh signoff --commit HEAD~1 tests     # Partial signoff on a specific commit
   gh signoff create -f                 # Force signoff
-  gh signoff create --commit abc1234   # Sign off on a specific commit
   gh signoff install                   # Require signoff on default branch
   gh signoff install --branch other    # Require signoff on a specific branch
   gh signoff check                     # Check if signoff is required
