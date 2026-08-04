@@ -27,7 +27,7 @@ gh extension install basecamp/gh-signoff
 gh signoff
 ```
 
-Without `-f`, signoff requires HEAD to be contained in `@{push}`, or in `@{upstream}` when no push destination resolves. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`.
+Without `-f`, signoff requires HEAD to be contained in `@{push}` — or in `@{upstream}` when no push destination resolves and no configuration (`branch.<name>.pushRemote`, `remote.pushDefault`, or push refspecs) reroutes pushes away from the upstream remote. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`.
 
 ### To require signoff for PR merges
 

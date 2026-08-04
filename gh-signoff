@@ -76,6 +76,20 @@ get_signoff_contexts() {
   printf "%s\n" "${contexts[@]}"
 }
 
+# Push-rerouting config (pushRemote, pushDefault, push refspecs) can send
+# pushes somewhere other than the upstream remote, making @{upstream} an
+# unsound proxy for @{push}. Detect it rather than reimplement git's
+# push-routing rules.
+push_is_rerouted() {
+  local branch remote
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || remote=""
+
+  git config "branch.${branch}.pushRemote" >/dev/null 2>&1 ||
+    git config remote.pushDefault >/dev/null 2>&1 ||
+    { [[ -n "$remote" ]] && git config --get-all "remote.${remote}.push" >/dev/null 2>&1; }
+}
+
 is_clean() {
   local git_cmd=$(command -v git)
 
@@ -87,16 +101,19 @@ is_clean() {
 
   # @{push} is authoritative for "are my commits pushed?", but under
   # push.default=simple it only resolves when local and upstream names match.
-  # Fall back to @{upstream}: HEAD contained in the upstream is a sound proxy
-  # for "this SHA is on the remote".
+  # Fall back to @{upstream} — HEAD contained in the upstream is a sound proxy
+  # for "this SHA is on the remote" — but only in a centralized workflow
+  # where nothing reroutes pushes away from the upstream remote.
   local push_ref
-  push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) ||
-    push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) ||
-    true
+  push_ref=$($git_cmd rev-parse --abbrev-ref @{push} 2>/dev/null) || push_ref=""
+
+  if [[ -z "$push_ref" ]] && ! push_is_rerouted; then
+    push_ref=$($git_cmd rev-parse --abbrev-ref @{upstream} 2>/dev/null) || push_ref=""
+  fi
 
   if [[ -z "$push_ref" ]]; then
-    debug "neither @{push} nor @{upstream} resolves"
-    UNCLEAN_REASON="current branch has no push destination or upstream (check push.default and branch tracking; -f to override)"
+    debug "@{push} does not resolve and @{upstream} is not a sound fallback"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (@{push} does not resolve; check push.default and branch tracking; -f to override)"
     return 1
   fi
 

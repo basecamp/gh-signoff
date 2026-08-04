@@ -344,9 +344,44 @@ add_bare_remote() {
   make_nested_repo
 
   run -1 gh-signoff
-  [[ "$output" == *"no push destination or upstream"* ]]
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
 
   run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]]
+}
+
+@test "upstream fallback refuses when pushes are rerouted to another remote" {
+  # Triangular two-remote setup: upstream origin/main contains HEAD, but
+  # remote.pushDefault sends pushes to fork, whose ci/gate is not up to date.
+  # @{push} fails to resolve (fork/ci/gate was never fetched); falling back
+  # to the upstream would approve a SHA absent from the real push destination.
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git init -q --bare "$TEST_DIR/fork.git"
+  git remote add fork "$TEST_DIR/fork.git"
+  git checkout -q -b ci/gate
+  git branch -q --set-upstream-to=origin/main
+  git config push.default simple
+
+  git config remote.pushDefault fork
+  ! git rev-parse --abbrev-ref "@{push}" >/dev/null 2>&1
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.pushDefault
+
+  git config branch.ci/gate.pushRemote fork
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset branch.ci/gate.pushRemote
+
+  git config remote.origin.push "refs/heads/*:refs/heads/qa/*"
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]]
+  git config --unset remote.origin.push
+
+  # With no rerouting config the fallback engages again
+  run -0 gh-signoff
   [[ "$output" == *"Signed off on"* ]]
 }
 
