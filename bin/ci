@@ -5,6 +5,10 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$DIR")"
 
+# gh-signoff reads the repository from the current directory, not from its own
+# path, so signing off has to happen from the root however bin/ci was invoked
+cd "$REPO_ROOT"
+
 BASH_VERSIONS="3 4 5"
 
 # Tests first. bin/test has no side effects, so a red matrix stops here without
