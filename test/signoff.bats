@@ -972,6 +972,15 @@ complete_prefix() {
   [[ "$output" == *"unexpected argument: extra"* ]]
 }
 
+@test "--branch with no argument reports the missing argument" {
+  # $2 was read unguarded, so set -u killed the script before the check ran
+  for command in install uninstall check status; do
+    run -1 gh-signoff "$command" --branch
+    [[ "$output" == *"option --branch requires an argument"* ]]
+    [[ ! "$output" == *"unbound variable"* ]]
+  done
+}
+
 @test "-f after a non-create command is rejected the same as before it" {
   for command in install uninstall check status; do
     run -1 gh-signoff "$command" -f

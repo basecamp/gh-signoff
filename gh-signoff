@@ -422,7 +422,7 @@ cmd_install() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
@@ -503,7 +503,7 @@ cmd_uninstall() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
@@ -567,7 +567,7 @@ cmd_check() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
@@ -649,7 +649,7 @@ cmd_status() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
