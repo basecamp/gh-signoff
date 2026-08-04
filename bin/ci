@@ -4,31 +4,25 @@ set -e
 # Directory containing this script
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$DIR")"
-DOCKER_DIR="$REPO_ROOT/test/docker"
 
-PASSED=true
+# gh-signoff reads the repository from the current directory, not from its own
+# path, so signing off has to happen from the root however bin/ci was invoked
+cd "$REPO_ROOT"
 
-for version in 3 4 5; do
-  echo -e "\n\033[1;35mBash $version\033[0m"
+BASH_VERSIONS="3 4 5"
 
-  docker build --quiet --pull -t "gh-signoff-test:bash$version" \
-    --build-arg "BASH_VERSION=$version" \
-    -f "$DOCKER_DIR/Dockerfile" \
-    "$DOCKER_DIR" >/dev/null
+# Tests first. bin/test has no side effects, so a red matrix stops here without
+# touching the commit's statuses.
+"$DIR/test" $BASH_VERSIONS
 
-  if docker run --rm -v "$REPO_ROOT:/app" "gh-signoff-test:bash$version"; then
-    echo "✅ Tests passed for Bash $version"
-    ./gh-signoff "bash-$version" || true
-  else
-    echo "❌ Tests failed for Bash $version"
-    PASSED=false
-  fi
+# Then sign off, per Bash version and overall. No `|| true`: a swallowed signoff
+# failure leaves the commit with no statuses, which is indistinguishable from CI
+# never having run — and the usual cause, an unpushed commit, is exactly what
+# signoff exists to catch. Push, then run bin/ci.
+CONTEXTS=""
+for version in $BASH_VERSIONS; do
+  CONTEXTS="$CONTEXTS bash-$version"
 done
 
-if $PASSED; then
-  echo -e "\n✅ Tests passed for all Bash versions"
-  ./gh-signoff
-  exit 0
-else
-  exit 1
-fi
+"$REPO_ROOT/gh-signoff" $CONTEXTS
+"$REPO_ROOT/gh-signoff"
