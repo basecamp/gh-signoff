@@ -1,0 +1,19 @@
+bin/ci
+  s_7b4e32568c41d4::t_eb82b817fc9297 8-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "ac0068a95dc6c8d2ef45a760d18a30bac69eb0df",
+  "prompts": {},
+  "sessions": {
+    "s_7b4e32568c41d4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "68816506-f7e9-4ae9-b4aa-a53b31fcd5a2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremydaer@gmail.com>"
+    }
+  }
+}
