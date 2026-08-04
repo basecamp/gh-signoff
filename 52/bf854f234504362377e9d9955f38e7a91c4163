@@ -1,0 +1,21 @@
+test/signoff.bats
+  s_f6ed5a6b53fde9::t_83b45f047ef096 975-983
+gh-signoff
+  s_f6ed5a6b53fde9::t_f8ac6bcce1f7f8 425,506,570,652
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "52bf854f234504362377e9d9955f38e7a91c4163",
+  "prompts": {},
+  "sessions": {
+    "s_f6ed5a6b53fde9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9eb4faf4-1b53-4206-b173-40057adb8dc9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}

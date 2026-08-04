@@ -1,0 +1,19 @@
+test/signoff.bats
+  s_f6ed5a6b53fde9::t_b60c9b660dd2a2 148,157,166,175,184,189,194,207,215,219,228,232,242,246,390,879,889-891,901,910-911,916-917,926,966-967,973,976,981,986,989,996-997,1004
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "5c31ec2070dca9adcadd90eb8b37956258be4945",
+  "prompts": {},
+  "sessions": {
+    "s_f6ed5a6b53fde9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9eb4faf4-1b53-4206-b173-40057adb8dc9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
