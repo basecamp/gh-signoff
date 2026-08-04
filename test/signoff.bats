@@ -219,6 +219,38 @@ make_pushed_repo() {
   [[ "$output" == *"Signed off on $unfetched"* ]] || return 1
 }
 
+@test "--commit accepts a commit published to a URL-tracked remote" {
+  # A branch checked out from a fork pull request has no remote-tracking refs,
+  # so `git branch -r --contains` finds nothing. Plain signoff proves the
+  # commit is on the fork over ls-remote; --commit must reach the same answer
+  # rather than demanding -f for naming the very commit it just accepted.
+  make_nested_repo
+  checkout_fork_pull_request
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r --contains "$sha")" ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  run -0 gh-signoff status --commit "$sha"
+  [[ "$output" == *"signoff"* ]] || return 1
+}
+
+@test "--commit still refuses an unpushed commit on a URL-tracked remote" {
+  make_nested_repo
+  checkout_fork_pull_request
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  sha=$(git rev-parse HEAD)
+
+  run -1 gh-signoff --commit "$sha"
+  [[ "$output" == *"is not on any remote"* ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff -f --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
 @test "--commit refuses a commit that is on no remote" {
   make_pushed_repo
   git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null

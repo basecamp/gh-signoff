@@ -87,7 +87,18 @@ resolve_commit() {
 # Is the commit on a remote we know about? Remote-tracking refs are only as
 # fresh as the last fetch, so this is a local proxy; -f overrides.
 commit_is_on_a_remote() {
-  [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
+  if [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]; then
+    return 0
+  fi
+
+  # A branch checked out from a fork pull request tracks a bare URL, which has
+  # no remote-tracking refs for `git branch -r` to search at all. Ask that
+  # remote for its tip the way is_clean does, and reuse the same inference: a
+  # commit contained in the tip is on that remote too. Without this,
+  # `gh signoff --commit HEAD` would refuse the very commit plain
+  # `gh signoff` just proved was published.
+  url_remote_tip || return 1
+  git merge-base --is-ancestor "$1" "$URL_REMOTE_TIP" 2>/dev/null
 }
 
 # Get default branch with caching
