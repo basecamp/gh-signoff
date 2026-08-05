@@ -29,6 +29,18 @@ gh signoff
 
 Without `-f`, signoff requires HEAD to be contained in `@{push}`. When `@{push}` doesn't resolve, signoff falls back to `@{upstream}` only in the narrow centralized case — `push.default` simple (or unset), an upstream on a real remote whose single push URL matches its fetch URL, and no `pushRemote`/`pushDefault`/push-refspec rerouting — and otherwise refuses. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`.
 
+### Signing off on a specific commit
+
+`gh signoff` targets `HEAD`. To sign off on a different commit — handy with stacked or virtual branches (e.g. GitButler), where the commit under test isn't what's checked out:
+
+```bash
+gh signoff --commit abc1234
+gh signoff --commit HEAD~1 tests
+gh signoff status --commit abc1234
+```
+
+`--commit` takes anything `git rev-parse` resolves. The commit still has to be on a remote — a commit you haven't fetched can't be checked, so it needs `-f`, same as any other override.
+
 A branch checked out from a cross-repository pull request (`gh pr checkout` on a fork PR) tracks a bare URL rather than a named remote, so it has no tracking ref for either `@{push}` or `@{upstream}` to resolve. Signoff asks that repository directly instead — one `git ls-remote` for the tracked ref — and accepts HEAD when it's contained in the advertised tip. If that tip isn't already in your repository, or a push wouldn't provably land on the same URL, it refuses rather than guess.
 
 ### To require signoff for PR merges
@@ -75,6 +87,13 @@ Check whether you've signed off on the current commit:
 
 ```bash
 gh signoff status
+✓ signoff
+```
+
+Check a specific commit:
+
+```bash
+gh signoff status --commit abc1234
 ✓ signoff
 ```
 

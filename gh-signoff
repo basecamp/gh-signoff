@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.2.2"
+readonly VERSION="0.3.0"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -34,6 +34,10 @@ UNCLEAN_REASON=""
 # Tip SHA url_remote_tip proved, for is_clean to check HEAD against
 URL_REMOTE_TIP=""
 
+# Results of the last resolve_commit call
+RESOLVED_COMMIT=""
+RESOLVED_COMMIT_IS_LOCAL=true
+
 debug() {
   if [[ -n "$DEBUG" ]]; then
     echo "Debug: $*" >&2
@@ -43,6 +47,58 @@ debug() {
 fail() {
   echo "Error: $*" >&2
   exit 1
+}
+
+reject_extra_args() {
+  if [[ $# -gt 0 ]]; then
+    fail "unexpected argument: $1"
+  fi
+}
+
+# Expand a revision — a short sha, a tag, a branch, HEAD~1 — to the full sha
+# of the commit it names. Reports via RESOLVED_COMMIT and, since a sha we
+# have no object for can't be checked against a remote, RESOLVED_COMMIT_IS_LOCAL.
+resolve_commit() {
+  local rev="$1"
+
+  if [[ -z "$rev" || "$rev" == -* ]]; then
+    fail "option --commit requires an argument"
+  fi
+
+  RESOLVED_COMMIT=$(git rev-parse --verify --quiet "${rev}^{commit}" 2>/dev/null) || RESOLVED_COMMIT=""
+
+  if [[ -n "$RESOLVED_COMMIT" ]]; then
+    RESOLVED_COMMIT_IS_LOCAL=true
+    return
+  fi
+
+  # We have the object but it doesn't peel to a commit: a tree or a blob
+  if git cat-file -e "$rev" 2>/dev/null; then
+    fail "not a commit: $rev"
+  fi
+
+  # Unknown to git. A full sha may still name a commit we haven't fetched;
+  # anything shorter or non-hex is a typo, not a revision.
+  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $rev"
+  RESOLVED_COMMIT="$rev"
+  RESOLVED_COMMIT_IS_LOCAL=false
+}
+
+# Is the commit on a remote we know about? Remote-tracking refs are only as
+# fresh as the last fetch, so this is a local proxy; -f overrides.
+commit_is_on_a_remote() {
+  if [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]; then
+    return 0
+  fi
+
+  # A branch checked out from a fork pull request tracks a bare URL, which has
+  # no remote-tracking refs for `git branch -r` to search at all. Ask that
+  # remote for its tip the way is_clean does, and reuse the same inference: a
+  # commit contained in the tip is on that remote too. Without this,
+  # `gh signoff --commit HEAD` would refuse the very commit plain
+  # `gh signoff` just proved was published.
+  url_remote_tip || return 1
+  git merge-base --is-ancestor "$1" "$URL_REMOTE_TIP" 2>/dev/null
 }
 
 # Get default branch with caching
@@ -272,6 +328,7 @@ is_clean() {
 
 cmd_create() {
   local force=false
+  local commit="" commit_is_local=true
   local contexts=()
 
   # Process arguments
@@ -280,6 +337,12 @@ cmd_create() {
       -f)
         force=true
         shift
+        ;;
+      --commit)
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
+        commit_is_local=$RESOLVED_COMMIT_IS_LOCAL
+        shift 2
         ;;
 
       -*)
@@ -293,16 +356,25 @@ cmd_create() {
     esac
   done
 
-  if ! $force && ! is_clean; then
-    fail "$UNCLEAN_REASON"
+  # Signing off on a named commit says nothing about the worktree, but the
+  # commit itself still has to have made it to a remote
+  if ! $force; then
+    if [[ -z "$commit" ]]; then
+      is_clean || fail "$UNCLEAN_REASON"
+    elif ! $commit_is_local; then
+      fail "cannot verify ${commit} is on a remote (not a local object; -f to override)"
+    elif ! commit_is_on_a_remote "$commit"; then
+      fail "commit ${commit} is not on any remote (-f to override)"
+    fi
   fi
 
   local user
   user=$(git config user.name) || fail "failed to get git user name"
   [[ -z "$user" ]] && fail "git user.name is not set"
 
-  local sha
-  sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
+  fi
 
   # If no contexts specified, use default
   if [ ${#contexts[@]} -eq 0 ]; then
@@ -319,27 +391,27 @@ cmd_create() {
       context_name="signoff/${context}"
     fi
 
-    debug "creating status for commit ${sha} by ${user} with context ${context_name}"
+    debug "creating status for commit ${commit} by ${user} with context ${context_name}"
 
     if gh api \
       --method POST \
-      "repos/:owner/:repo/statuses/${sha}" \
+      "repos/:owner/:repo/statuses/${commit}" \
       -f state=success \
       -f context="${context_name}" \
       -f "description=${user} signed off" >/dev/null; then
 
       # Build success message
       if [[ -z "$context" ]]; then
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit}")
       else
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${sha} for ${context}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for ${context}")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} Failed to sign off on ${sha}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
       else
-        echo "${STATUS_FAILURE} Failed to sign off on ${sha} for ${context}" >&2
+        echo "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
       fi
     fi
   done
@@ -361,11 +433,17 @@ cmd_install() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
         shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
         ;;
       -*)
         fail "unknown option: $1"
@@ -436,11 +514,17 @@ cmd_uninstall() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
         shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
         ;;
       -*)
         fail "unknown option: $1"
@@ -494,11 +578,17 @@ cmd_check() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
         shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create and status"
         ;;
       -*)
         fail "unknown option: $1"
@@ -564,17 +654,25 @@ cmd_check() {
 
 cmd_status() {
   local branch=""
-  local sha=""
+  local commit=""
 
   # Process arguments with option handling
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
-        if [[ -z "$2" || "$2" == -* ]]; then
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
           fail "option --branch requires an argument"
         fi
         branch="$2"
         shift 2
+        ;;
+      --commit)
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
+        shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
         ;;
       -*)
         fail "unknown option: $1"
@@ -592,16 +690,18 @@ cmd_status() {
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
-  # Get current SHA
-  sha=$(git rev-parse HEAD) || fail "failed to get current commit"
+  # Default to the current commit
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
+  fi
 
   # Get the signoff statuses on this commit as context/state pairs. A filter
   # error surfaces here rather than silently rendering every context as failed.
   local statuses
-  statuses=$(gh api "repos/:owner/:repo/commits/${sha}/status" \
+  statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
     --jq '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' \
     2>/dev/null) || {
-    echo "${STATUS_FAILURE} Could not get status for commit ${sha}"
+    echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
   }
   statuses=${statuses//$'\r'/}
@@ -663,9 +763,12 @@ cmd_status() {
 cmd_completion() {
   # Check if --contexts flag is passed
   if [[ "${1:-}" == "--contexts" ]]; then
+    shift
+    reject_extra_args "$@"
     get_signoff_contexts
     return
   fi
+  reject_extra_args "$@"
 
   cat <<'EOF'
 # bash completion for gh signoff
@@ -676,8 +779,24 @@ _gh_signoff_contexts() {
   echo "$contexts"
 }
 
+# The first word that is neither a global option nor its argument. -f and
+# --commit may precede the command, so COMP_WORDS[1] is not it. Stops short of
+# the word being completed: that one is what the user is still typing, not a
+# command they have settled on, and echoing it back would suppress the very
+# list they are typing towards. Empty means the cursor is at the command.
+_gh_signoff_command() {
+  local i=1
+  while [[ $i -lt $COMP_CWORD ]]; do
+    case "${COMP_WORDS[$i]}" in
+      -f)       i=$((i+1)) ;;
+      --commit) i=$((i+2)) ;;
+      *)        echo "${COMP_WORDS[$i]}"; return ;;
+    esac
+  done
+}
+
 _gh_signoff() {
-  local cur prev
+  local cur prev command
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
@@ -685,15 +804,19 @@ _gh_signoff() {
     signoff)
       # Include dynamic contexts in top-level completion
       local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --help $contexts" -- "$cur") )
+      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
+      return 0
+      ;;
+    --commit)
+      # A revision. Nothing worth guessing at.
       return 0
       ;;
     -f)
-      # A leading -f may be followed by the create command or a context;
-      # elsewhere only contexts remain
+      # A leading -f may be followed by the create command, --commit or a
+      # context; elsewhere only contexts remain
       local contexts=$(_gh_signoff_contexts)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "create $contexts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "create --commit $contexts" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
       fi
@@ -701,7 +824,11 @@ _gh_signoff() {
       ;;
     create)
       local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+      COMPREPLY=( $(compgen -W "-f --commit $contexts" -- "$cur") )
+      return 0
+      ;;
+    status)
+      COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
       return 0
       ;;
     install|uninstall|check)
@@ -709,24 +836,41 @@ _gh_signoff() {
       COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
       return 0
       ;;
-    status)
-      COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
-      return 0
-      ;;
   esac
+
+  command=$(_gh_signoff_command)
 
   # If we are halfway through typing an option
   if [[ $cur == --* ]]; then
-    COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
+    case "$command" in
+      install|uninstall|check)
+        COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
+        ;;
+      status)
+        COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
+        ;;
+      *)
+        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
+        ;;
+    esac
+    return 0
+  fi
+
+  # No command yet, so the cursor is where one goes: offer the same list as
+  # directly after `signoff`, which a leading -f or --commit would otherwise
+  # push out of reach
+  if [[ -z "$command" ]]; then
+    local contexts=$(_gh_signoff_contexts)
+    COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
     return 0
   fi
 
   # For partial signoffs, suggest context names
-  if [[ $COMP_CWORD -gt 1 && "${COMP_WORDS[1]}" != "install" &&
-        "${COMP_WORDS[1]}" != "uninstall" && "${COMP_WORDS[1]}" != "check" &&
-        "${COMP_WORDS[1]}" != "status" && "${COMP_WORDS[1]}" != "version" &&
-        "${COMP_WORDS[1]}" != "completion" && "${COMP_WORDS[1]}" != "--help" &&
-        "${COMP_WORDS[1]}" != "-h" ]]; then
+  if [[ $COMP_CWORD -gt 1 && "$command" != "install" &&
+        "$command" != "uninstall" && "$command" != "check" &&
+        "$command" != "status" && "$command" != "version" &&
+        "$command" != "completion" && "$command" != "--help" &&
+        "$command" != "-h" ]]; then
     local contexts=$(_gh_signoff_contexts)
     COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
     return 0
@@ -751,11 +895,11 @@ USAGE
   gh signoff [flags] [command] [options]
 
 COMMANDS
-  create (default) Sign off on the current commit
+  create (default) Sign off on the current commit or a specific commit
   install          Install signoff requirement
   uninstall        Uninstall signoff requirement
   check            Check if signoff is required
-  status           Show signoff status for the current commit
+  status           Show signoff status for the current commit or a specific commit
   version          Show gh-signoff version
   completion       Output shell completion code
 
@@ -763,16 +907,21 @@ FLAGS
   -f  Force sign off (ignore uncommitted/unpushed changes)
 
 OPTIONS
-  --branch <branch>  Branch to operate on (for install, uninstall, check)
+  --branch <branch>  Branch to operate on (for install, uninstall, check, status)
+  --commit <sha>     Commit to sign off on (for create, status). Any revision
+                     git resolves; must be on a remote unless forced with -f
 
 EXAMPLES
-  gh signoff                         # Sign off on current commit
-  gh signoff create -f               # Force signoff
-  gh signoff install                 # Require signoff on default branch
-  gh signoff install --branch other  # Require signoff on a specific branch
-  gh signoff check                   # Check if signoff is required
-  gh signoff check --branch other    # Check if signoff is required on branch
-  gh signoff status                  # Show completed/pending signoff status
+  gh signoff                           # Sign off on current commit
+  gh signoff --commit abc1234          # Sign off on a specific commit
+  gh signoff --commit HEAD~1 tests     # Partial signoff on a specific commit
+  gh signoff create -f                 # Force signoff
+  gh signoff install                   # Require signoff on default branch
+  gh signoff install --branch other    # Require signoff on a specific branch
+  gh signoff check                     # Check if signoff is required
+  gh signoff check --branch other      # Check if signoff is required on branch
+  gh signoff status                    # Show completed/pending signoff status
+  gh signoff status --commit abc1234   # Show status for a specific commit
 
 COMPLETION
   # Add to ~/.bashrc:
@@ -780,13 +929,30 @@ COMPLETION
 EOF
 }
 
-# A leading -f applies to create (explicit, implicit, or contextual)
-# and is rejected for every other command
+# A leading -f applies to create (explicit, implicit, or contextual); a leading
+# --commit to create and status. Both are rejected for every other command.
+#
+# The revision stays raw here: resolving it before the command is known would
+# report `gh signoff --commit nope install` as a bad revision, when what's
+# actually wrong is that install takes no --commit at all.
 force=""
-if [[ "${1:-}" == "-f" ]]; then
-  force="-f"
-  shift
-fi
+commit_opt=()
+while :; do
+  case "${1:-}" in
+    -f)
+      force="-f"
+      shift
+      ;;
+    --commit)
+      [[ -n "${2:-}" && "$2" != -* ]] || fail "option --commit requires an argument"
+      commit_opt=(--commit "$2")
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 reject_force() {
   if [[ -n "$force" ]]; then
@@ -794,22 +960,30 @@ reject_force() {
   fi
 }
 
+reject_commit() {
+  if [[ ${#commit_opt[@]} -gt 0 ]]; then
+    fail "--commit is only valid for create and status"
+  fi
+}
+
+# ${commit_opt[@]+"${commit_opt[@]}"} is the Bash 3 set -u safe expansion of a
+# possibly-empty array. ${commit_opt:+...} would word-split the revision.
 case "${1:-}" in
-  "")               cmd_create ${force:+-f} ;;
-  "create")         shift; cmd_create ${force:+-f} "$@" ;;
-  "install")        reject_force; shift; cmd_install "$@" ;;
-  "uninstall")      reject_force; shift; cmd_uninstall "$@" ;;
-  "check")          reject_force; shift; cmd_check "$@" ;;
-  "status")         reject_force; shift; cmd_status "$@" ;;
-  "version")        reject_force; cmd_version ;;
-  "completion")     reject_force; shift; cmd_completion "$@" ;;
-  "-h" | "--help")  reject_force; cmd_help ;;
+  "")               cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ;;
+  "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
+  "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
+  "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
+  "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
+  "completion")     reject_force; reject_commit; shift; cmd_completion "$@" ;;
+  "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
   -*)
     # Unknown option
     cmd_help; exit 1
     ;;
   *)
     # Treat as partial signoff context(s)
-    cmd_create ${force:+-f} "$@"
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@"
     ;;
 esac

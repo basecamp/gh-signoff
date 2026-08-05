@@ -112,6 +112,16 @@ checkout_fork_pull_request() {
   track_url_remote "$TEST_DIR/fork.git" refs/heads/their-branch
 }
 
+# A nested repository with two commits, both on origin, so that HEAD and HEAD~1
+# each satisfy the --commit remote check
+make_pushed_repo() {
+  make_nested_repo
+  add_bare_remote
+  git commit --no-gpg-sign --allow-empty -m "Second commit" >/dev/null
+  git push -q origin HEAD:main
+  git branch -q --set-upstream-to=origin/main
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -127,6 +137,145 @@ checkout_fork_pull_request() {
 @test "create signs off on current commit" {
   run -0 gh-signoff create -f
   [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "create signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff create --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "direct signoff signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "direct partial signoff signs off on the commit named by --commit" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha" linux
+  [[ "$output" == *"Signed off on $sha for linux"* ]] || return 1
+}
+
+@test "--commit takes any revision git resolves" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD~1)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit HEAD~1
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "--commit expands a short sha to the full 40 hex" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "${sha:0:8}"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "--commit rejects a revision git cannot resolve" {
+  run -1 gh-signoff create --commit 'abc/status'
+  [[ "$output" == *"invalid commit: abc/status"* ]] || return 1
+}
+
+@test "--commit rejects a missing argument" {
+  run -1 gh-signoff create --commit
+  [[ "$output" == *"option --commit requires an argument"* ]] || return 1
+}
+
+@test "--commit rejects an object that is not a commit" {
+  # A blob's sha is 40 hex and the object is right here, but it does not peel
+  # to a commit. Without the local-object check it would pass for unfetched.
+  make_pushed_repo
+  echo contents > file
+  git add file
+  git commit --no-gpg-sign -q -m "Add file"
+  blob=$(git rev-parse HEAD:file)
+
+  run -1 gh-signoff --commit "$blob"
+  [[ "$output" == *"not a commit: $blob"* ]] || return 1
+}
+
+@test "--commit refuses a sha with no local object to check" {
+  make_pushed_repo
+  unfetched=0123456789012345678901234567890123456789
+
+  run -1 gh-signoff --commit "$unfetched"
+  [[ "$output" == *"cannot verify ${unfetched} is on a remote"* ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$unfetched"
+  run -0 gh-signoff -f --commit "$unfetched"
+  [[ "$output" == *"Signed off on $unfetched"* ]] || return 1
+}
+
+@test "--commit accepts a commit published to a URL-tracked remote" {
+  # A branch checked out from a fork pull request has no remote-tracking refs,
+  # so `git branch -r --contains` finds nothing. Plain signoff proves the
+  # commit is on the fork over ls-remote; --commit must reach the same answer
+  # rather than demanding -f for naming the very commit it just accepted.
+  make_nested_repo
+  checkout_fork_pull_request
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r --contains "$sha")" ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  run -0 gh-signoff status --commit "$sha"
+  [[ "$output" == *"signoff"* ]] || return 1
+}
+
+@test "--commit still refuses an unpushed commit on a URL-tracked remote" {
+  make_nested_repo
+  checkout_fork_pull_request
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  sha=$(git rev-parse HEAD)
+
+  run -1 gh-signoff --commit "$sha"
+  [[ "$output" == *"is not on any remote"* ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff -f --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "--commit refuses a commit that is on no remote" {
+  make_pushed_repo
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  sha=$(git rev-parse HEAD)
+
+  run -1 gh-signoff --commit "$sha"
+  [[ "$output" == *"commit ${sha} is not on any remote"* ]] || return 1
+
+  export MOCK_EXPECT_COMMIT="$sha"
+  run -0 gh-signoff -f --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+@test "--commit checks the named commit, not the worktree" {
+  make_pushed_repo
+  sha=$(git rev-parse HEAD)
+  touch untracked-file
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff --commit "$sha"
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  unset MOCK_EXPECT_COMMIT
+  run -1 gh-signoff
+  [[ "$output" == *"repository has uncommitted changes"* ]] || return 1
 }
 
 @test "check shows status for protected branch" {
@@ -257,6 +406,19 @@ checkout_fork_pull_request() {
   export MOCK_COMMIT_STATUS_EXIT=0
 
   run -0 gh-signoff status
+  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
+}
+
+@test "status checks the commit named by --commit" {
+  # Mock: Protection requires 'signoff', Commit status has successful 'signoff'
+  make_pushed_repo
+  export MOCK_EXPECT_COMMIT=$(git rev-parse HEAD~1)
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"}]}'
+  export MOCK_COMMIT_STATUS_EXIT=0
+
+  run -0 gh-signoff status --commit HEAD~1
   [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
 }
 
@@ -709,6 +871,15 @@ complete_words() {
   _gh_signoff
 }
 
+# As complete_words, but the last argument is a partially typed word
+complete_prefix() {
+  eval "$(gh-signoff completion)"
+  COMP_WORDS=("$@")
+  COMP_CWORD=$(($# - 1))
+  COMPREPLY=()
+  _gh_signoff
+}
+
 @test "completion after leading -f offers create plus contexts" {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
@@ -728,6 +899,72 @@ complete_words() {
   [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
+}
+
+@test "completion after leading -f offers --commit" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff -f
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
+}
+
+@test "completion after create offers -f and --commit" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff create
+  [[ " ${COMPREPLY[*]-} " == *" -f "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+}
+
+@test "completion after --commit suggests nothing" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_words gh-signoff --commit
+  [[ ${#COMPREPLY[@]} -eq 0 ]] || return 1
+}
+
+@test "completion offers commands at the command position after a leading --commit" {
+  # The word under the cursor is what the user is typing, not a chosen command.
+  # Treating it as one skipped the command list, so `--commit HEAD st<TAB>`
+  # never offered status even though the dispatcher accepts it there.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  complete_prefix gh-signoff --commit HEAD st
+  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
+
+  # Nothing typed yet: both commands and contexts are reachable
+  complete_words gh-signoff --commit HEAD
+  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+}
+
+@test "completion finds the command past a leading --commit" {
+  # COMP_WORDS[1] here is --commit, not the command. Reading it directly would
+  # offer create's options in the middle of a status invocation.
+  complete_prefix gh-signoff --commit HEAD status --
+  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
+
+  # Same, past the command's own option, so the option-fallback branch is the
+  # one doing the lookup rather than the previous-word case
+  complete_prefix gh-signoff --commit HEAD status --branch main --
+  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
+}
+
+@test "completion --contexts survives the trailing-argument guard" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  # The completion function shells out to this on every tab
+  run -0 gh-signoff completion --contexts
+  [[ "$output" == *"tests"* ]] || return 1
 }
 
 @test "completion after trailing -f offers contexts without create" {
@@ -755,6 +992,56 @@ complete_words() {
 @test "leading -f is rejected for non-create commands" {
   run -1 gh-signoff -f status
   [[ "$output" == *"-f is only valid for create"* ]] || return 1
+}
+
+# Leading --commit dispatcher grammar tests
+@test "leading --commit is rejected for commands that do not take it" {
+  # Both orders must give the same answer. The leading form is also the
+  # regression test against resolving the revision before the command is known.
+  for args in "install --commit nope" "--commit nope install" \
+              "uninstall --commit nope" "--commit nope uninstall" \
+              "check --commit nope" "--commit nope check"; do
+    run -1 gh-signoff $args
+    [[ "$output" == *"--commit is only valid for create and status"* ]] || return 1
+    [[ ! "$output" == *"invalid commit"* ]] || return 1
+  done
+}
+
+@test "leading --commit requires an argument" {
+  run -1 gh-signoff --commit
+  [[ "$output" == *"option --commit requires an argument"* ]] || return 1
+
+  run -1 gh-signoff --commit -f
+  [[ "$output" == *"option --commit requires an argument"* ]] || return 1
+}
+
+@test "leading --commit passes its argument through as one word" {
+  run -1 gh-signoff --commit "foo bar"
+  [[ "$output" == *"invalid commit: foo bar"* ]] || return 1
+}
+
+@test "trailing arguments are reported rather than ignored" {
+  run -1 gh-signoff version --commit nope
+  [[ "$output" == *"unexpected argument: --commit"* ]] || return 1
+
+  run -1 gh-signoff completion --contexts extra
+  [[ "$output" == *"unexpected argument: extra"* ]] || return 1
+}
+
+@test "--branch with no argument reports the missing argument" {
+  # $2 was read unguarded, so set -u killed the script before the check ran
+  for command in install uninstall check status; do
+    run -1 gh-signoff "$command" --branch
+    [[ "$output" == *"option --branch requires an argument"* ]] || return 1
+    [[ ! "$output" == *"unbound variable"* ]] || return 1
+  done
+}
+
+@test "-f after a non-create command is rejected the same as before it" {
+  for command in install uninstall check status; do
+    run -1 gh-signoff "$command" -f
+    [[ "$output" == *"-f is only valid for create"* ]] || return 1
+  done
 }
 
 @test "@{push} stays authoritative over upstream when both resolve" {
