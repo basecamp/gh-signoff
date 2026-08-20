@@ -293,9 +293,10 @@ make_pushed_repo() {
   [[ "$output" == *"now requires signoff"* ]] || return 1
 }
 
-@test "uninstall removes protection" {
-  # Expect DELETE protection call to succeed
-  export MOCK_DELETE_PROTECTION_EXIT=0
+@test "uninstall removes the signoff ruleset" {
+  # Our ruleset exists; expect its DELETE to succeed
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_DELETE_RULESET_EXIT=0
   run -0 gh-signoff uninstall
   [[ "$output" == *"no longer requires signoff"* ]] || return 1
 }
@@ -363,9 +364,11 @@ make_pushed_repo() {
   [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on windows" ]] || return 1
 }
 
-@test "uninstall with context removes contextual protection" {
-  # Expect DELETE protection call to succeed
-  export MOCK_DELETE_PROTECTION_EXIT=0
+@test "uninstall with context removes contextual requirement" {
+  # The ruleset requires only signoff/macos, so removing it deletes the ruleset
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/macos"}]}}]}'
+  export MOCK_DELETE_RULESET_EXIT=0
   run -0 gh-signoff uninstall macos
   [[ "$output" == *"no longer requires signoff on macos"* ]] || return 1
 }

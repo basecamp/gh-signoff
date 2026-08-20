@@ -370,6 +370,24 @@ delete_legacy_protection() {
     echo "Warning: could not remove legacy branch protection on ${branch}; remove it in repo settings" >&2
 }
 
+# After a ruleset write or delete, retire what legacy protection required:
+# signoff-shaped protection is wholly ours and goes away; anything else is
+# someone's deliberate configuration and only gets its stray signoff
+# contexts flagged.
+cleanup_legacy_protection() {
+  local branch="$1"
+  case "$LEGACY_PROTECTION" in
+    signoff)
+      delete_legacy_protection "$branch"
+      ;;
+    other)
+      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+        echo "Warning: branch protection on ${branch} still requires signoff contexts alongside other settings; remove them in repo settings" >&2
+      fi
+      ;;
+  esac
+}
+
 # Get required signoff contexts, stripping the 'signoff/' prefix. The bare
 # 'signoff' context has no display name, so it is dropped. Feeds compgen: no
 # upgrade hint here.
@@ -766,19 +784,11 @@ cmd_install() {
   fi
 
   # The ruleset now carries every legacy signoff context, so signoff-shaped
-  # protection is redundant: delete it. Anything else is someone's deliberate
-  # configuration — leave it, but flag the duplicate signoff requirement.
-  case "$LEGACY_PROTECTION" in
-    signoff)
-      delete_legacy_protection "$branch"
-      echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
-      ;;
-    other)
-      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
-        echo "Warning: branch protection on ${branch} also requires signoff contexts alongside other settings; remove them in repo settings" >&2
-      fi
-      ;;
-  esac
+  # protection is redundant and gets retired
+  cleanup_legacy_protection "$branch"
+  if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+    echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+  fi
 }
 
 cmd_uninstall() {
@@ -818,17 +828,74 @@ cmd_uninstall() {
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
-  # TODO: Implement context-specific uninstall that preserves other contexts
-  # For now we just remove all branch protection which is the current behavior
-  debug "removing protection from branch: ${branch}"
-
-  gh api \
-    --method DELETE \
-    "repos/:owner/:repo/branches/${branch}/protection" >/dev/null || fail "failed to remove branch protection"
-
-  # Default to standard signoff if no contexts specified
+  # Bare uninstall removes the whole requirement; contextual subtracts
+  local bare=false
   if [ ${#contexts[@]} -eq 0 ]; then
+    bare=true
     contexts=("")
+  fi
+
+  # As in install: acting on a listing that failed could orphan or duplicate
+  # the ruleset, so bail instead
+  find_signoff_ruleset_id "$branch" || fail "failed to list rulesets"
+  legacy_protection_disposition "$branch"
+
+  local migrated=false
+
+  if $bare; then
+    local removed=false
+    if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: ${branch}"
+      delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
+      removed=true
+    fi
+    if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+      removed=true
+    fi
+    cleanup_legacy_protection "$branch"
+    $removed || fail "no signoff requirement installed on ${branch}"
+  else
+    # Everything currently required, from our ruleset and legacy protection
+    local existing=""
+    if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+      existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+    fi
+    merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS"
+    local available="$MERGED_CONTEXTS"
+
+    if [[ -z "$available" ]]; then
+      fail "no signoff requirement installed on ${branch}"
+    fi
+
+    local requested="" remaining="" context line
+    for context in "${contexts[@]}"; do
+      requested="${requested:+$requested$'\n'}signoff/${context}"
+    done
+
+    while read -r line; do
+      if [[ $'\n'"$requested"$'\n' != *$'\n'"${line}"$'\n'* ]]; then
+        remaining="${remaining:+$remaining$'\n'}$line"
+      fi
+    done <<<"$available"
+
+    if [[ -n "$remaining" ]]; then
+      # Write the remainder — creating the ruleset when the contexts lived
+      # only in legacy protection, so contextual uninstall migrates too
+      local keep=()
+      while read -r line; do
+        keep+=("$line")
+      done <<<"$remaining"
+      debug "keeping ${#keep[@]} signoff contexts on branch: ${branch}"
+      write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${keep[@]}"
+      if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+        migrated=true
+      fi
+    elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+      # The last context is going away: no empty ruleset left behind
+      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: ${branch}"
+      delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
+    fi
+    cleanup_legacy_protection "$branch"
   fi
 
   # Output success messages
@@ -842,6 +909,10 @@ cmd_uninstall() {
         echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
       fi
     done
+  fi
+
+  if $migrated; then
+    echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
   fi
 }
 
