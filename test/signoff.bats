@@ -556,6 +556,31 @@ make_pushed_repo() {
   [[ "$output" == *"failed to list rulesets"* ]] || return 1
 }
 
+@test "install fails rather than drop contexts it could not read" {
+  # The union must be computed from the ruleset's real contents; an unreadable
+  # ruleset must not be treated as an empty one
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_EXIT=1
+
+  run -1 gh-signoff install lint
+  [[ "$output" == *"failed to read signoff ruleset"* ]] || return 1
+}
+
+@test "contextual uninstall fails rather than subtract from contexts it could not read" {
+  # An unreadable ruleset read as empty would make the remainder empty and
+  # delete a ruleset that still holds other contexts
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_EXIT=1
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff uninstall tests
+  [[ "$output" == *"failed to read signoff ruleset"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+  [[ "$calls" != *"PUT "* ]] || return 1
+}
+
 @test "install rejects contexts unsafe for JSON" {
   run -1 gh-signoff install 'bad"context'
   [[ "$output" == *"unsafe for JSON"* ]] || return 1

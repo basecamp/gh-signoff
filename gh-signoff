@@ -192,13 +192,15 @@ find_signoff_ruleset_id() {
   done <<<"$rows"
 }
 
-# The contexts a ruleset requires, one per line on stdout. An API failure
-# reads as empty, same as a ruleset with no status-check rule.
+# The contexts a ruleset requires, one per line on stdout. Nonzero on API
+# failure: readers may shrug that off as empty, but writers must treat it as
+# fatal — computing a union or remainder from contexts that merely failed to
+# load would silently drop requirements.
 signoff_ruleset_contexts() {
   local id="$1" contexts
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
     --jq '.rules[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' \
-    2>/dev/null) || contexts=""
+    2>/dev/null) || return 1
   echo "${contexts//$'\r'/}"
 }
 
@@ -240,7 +242,7 @@ fetch_required_signoff_contexts() {
 
   ruleset_contexts=""
   if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") || ruleset_contexts=""
   fi
 
   legacy=$(legacy_signoff_contexts "$branch")
@@ -750,7 +752,8 @@ cmd_install() {
 
   local existing=""
   if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-    existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+    existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+      fail "failed to read signoff ruleset"
   fi
 
   legacy_protection_disposition "$branch"
@@ -858,7 +861,8 @@ cmd_uninstall() {
     # Everything currently required, from our ruleset and legacy protection
     local existing=""
     if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-      existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+      existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+        fail "failed to read signoff ruleset"
     fi
     merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS"
     local available="$MERGED_CONTEXTS"
