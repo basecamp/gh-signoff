@@ -26,6 +26,16 @@ fi
 : ${MOCK_PUT_PROTECTION_EXIT:=0}
 : ${MOCK_DELETE_PROTECTION_EXIT:=0}
 
+: ${MOCK_RULESETS_LIST_JSON:='[]'} # The API answers 200 [] when no rulesets exist
+: ${MOCK_RULESETS_LIST_EXIT:=0}
+
+: ${MOCK_RULESET_JSON:='{}'} # A single ruleset fetched by id
+: ${MOCK_RULESET_EXIT:=0}
+
+: ${MOCK_POST_RULESET_EXIT:=0}
+: ${MOCK_PUT_RULESET_EXIT:=0}
+: ${MOCK_DELETE_RULESET_EXIT:=0}
+
 # --- Debugging ---
 if [[ -n "${GH_MOCK_DEBUG:-}" ]]; then
   echo "--- gh mock called ---" >&2
@@ -180,6 +190,50 @@ elif [[ "$api_method" == "PUT" && "$api_path" == *"branches/"*"/protection"* ]];
 elif [[ "$api_method" == "DELETE" && "$api_path" == *"branches/"*"/protection"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Branch Protection" >&2
   exit "$MOCK_DELETE_PROTECTION_EXIT"
+
+# Single Ruleset Call (GET by id) — before the bare /rulesets list glob
+elif [[ "$api_method" == "GET" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Ruleset" >&2
+  if [[ "$MOCK_RULESET_EXIT" -eq 0 ]]; then
+    emit "$MOCK_RULESET_JSON"
+  else
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_RULESET_EXIT"
+
+# Rulesets List Call (GET)
+elif [[ "$api_method" == "GET" && "$api_path" == *"/rulesets" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Rulesets List" >&2
+  if [[ "$MOCK_RULESETS_LIST_EXIT" -eq 0 ]]; then
+    emit "$MOCK_RULESETS_LIST_JSON"
+  else
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_RULESETS_LIST_EXIT"
+
+# Create Ruleset Call (POST)
+elif [[ "$api_method" == "POST" && "$api_path" == *"/rulesets" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched POST Ruleset" >&2
+  if [[ "$MOCK_POST_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Validation Failed"
+  fi
+  exit "$MOCK_POST_RULESET_EXIT"
+
+# Update Ruleset Call (PUT)
+elif [[ "$api_method" == "PUT" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Ruleset" >&2
+  if [[ "$MOCK_PUT_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Validation Failed"
+  fi
+  exit "$MOCK_PUT_RULESET_EXIT"
+
+# Delete Ruleset Call (DELETE)
+elif [[ "$api_method" == "DELETE" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Ruleset" >&2
+  if [[ "$MOCK_DELETE_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_DELETE_RULESET_EXIT"
 
 # Fallback for unhandled calls. Strict: a silently-succeeding unstubbed call
 # would let a test pass without exercising the request it meant to assert.
