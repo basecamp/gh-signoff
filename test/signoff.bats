@@ -464,8 +464,8 @@ make_pushed_repo() {
 # these assert exact output rather than substrings.
 @test "status tolerates CRLF from gh on Windows" {
   export MOCK_CRLF=1
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
   export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"},{"context":"signoff/tests","state":"success","description":"Test User signed off"}]}'
   export MOCK_COMMIT_STATUS_EXIT=0
 
@@ -475,8 +475,8 @@ make_pushed_repo() {
 
 @test "check tolerates CRLF from gh on Windows" {
   export MOCK_CRLF=1
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
 
   run -0 gh-signoff check
   [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
@@ -484,8 +484,8 @@ make_pushed_repo() {
 
 @test "check on a named context tolerates CRLF from gh on Windows" {
   export MOCK_CRLF=1
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
 
   run -0 gh-signoff check tests
   [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1

@@ -370,25 +370,24 @@ delete_legacy_protection() {
     echo "Warning: could not remove legacy branch protection on ${branch}; remove it in repo settings" >&2
 }
 
-# Get signoff contexts from branch protection, stripping the 'signoff/' prefix.
-# select() drops the bare 'signoff' context, which has no display name.
+# Get required signoff contexts, stripping the 'signoff/' prefix. The bare
+# 'signoff' context has no display name, so it is dropped. Feeds compgen: no
+# upgrade hint here.
 get_signoff_contexts() {
-  local branch="${1:-}"
+  local branch="${1:-}" ctx
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
     branch=$(default_branch) || return 0
   fi
 
-  local contexts
-  contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(startswith("signoff/")) | ltrimstr("signoff/")' \
-    2>/dev/null) || return 0
-  contexts=${contexts//$'\r'/}
+  fetch_required_signoff_contexts "$branch"
 
-  if [[ -n "$contexts" ]]; then
-    echo "$contexts"
-  fi
+  while read -r ctx; do
+    if [[ "$ctx" == signoff/* ]]; then
+      echo "${ctx#signoff/}"
+    fi
+  done <<<"$SIGNOFF_CONTEXTS"
 }
 
 # @{upstream} is a sound stand-in for an unresolvable @{push} only in the
@@ -861,9 +860,9 @@ cmd_check() {
   fi
 
   # Fetch the required contexts once, one per line
-  local protection_contexts
-  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]?' 2>/dev/null) || {
+  fetch_required_signoff_contexts "$branch"
+
+  if [[ -z "$SIGNOFF_CONTEXTS" ]]; then
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
         echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
@@ -872,8 +871,11 @@ cmd_check() {
       fi
     done
     exit 1
-  }
-  protection_contexts=${protection_contexts//$'\r'/}
+  fi
+
+  if $SIGNOFF_LEGACY_PRESENT; then
+    legacy_upgrade_hint
+  fi
 
   # Check each context
   for context in "${contexts[@]}"; do
@@ -885,7 +887,7 @@ cmd_check() {
     debug "checking protection for branch: ${branch} with context: ${context_name}"
 
     # Whole-line match, so 'signoff' isn't satisfied by 'signoff/tests'
-    if [[ $'\n'"$protection_contexts"$'\n' == *$'\n'"${context_name}"$'\n'* ]]; then
+    if [[ $'\n'"$SIGNOFF_CONTEXTS"$'\n' == *$'\n'"${context_name}"$'\n'* ]]; then
       if [[ -z "$context" ]]; then
         echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
       else
@@ -958,21 +960,18 @@ cmd_status() {
   # Create required contexts list - always start with "signoff"
   local required=("signoff")
 
-  # Add any additional contexts from branch protection
-  local protection_contexts
-  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(startswith("signoff"))' \
-    2>/dev/null) || {
-    debug "No branch protection found"
-    protection_contexts=""
-  }
-  protection_contexts=${protection_contexts//$'\r'/}
+  # Add any additional required contexts from our ruleset and legacy protection
+  fetch_required_signoff_contexts "$branch"
+
+  if $SIGNOFF_LEGACY_PRESENT; then
+    legacy_upgrade_hint
+  fi
 
   local ctx
   while read -r ctx; do
     [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
     required+=("$ctx")
-  done <<< "$protection_contexts"
+  done <<< "$SIGNOFF_CONTEXTS"
 
   # Map contexts to states as "context1=state1;context2=state2;..."
   # A lightweight stand-in for associative arrays, which Bash 3 lacks
