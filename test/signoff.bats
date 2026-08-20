@@ -689,14 +689,19 @@ make_pushed_repo() {
   [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
 }
 
-@test "install and uninstall reject context names with control characters" {
-  # A context named on the command line is turned into a JSON token by
-  # quoting alone, so it has to be a name that needs no escaping
+@test "install and uninstall refuse context names outside the charset" {
+  # A context named on the command line is a name we would be creating, so
+  # it has to be one we can show back: printable ASCII, no quote, no
+  # backslash
   run -1 gh-signoff install $'tests\nlint'
-  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
 
   run -1 gh-signoff uninstall $'tests\nsignoff/lint'
-  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+
+  # Non-ASCII is refused on the same terms, however innocent
+  run -1 gh-signoff install $'caf\xc3\xa9'
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
 }
 
 @test "reads do not claim foreign signoff-prefixed contexts" {
@@ -810,9 +815,12 @@ make_pushed_repo() {
   [[ "$calls" != *"PUT "* ]] || return 1
 }
 
-@test "install rejects contexts unsafe for JSON" {
+@test "install rejects contexts holding a quote or a backslash" {
   run -1 gh-signoff install 'bad"context'
-  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
+
+  run -1 gh-signoff install 'back\slash'
+  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
 }
 
 # A ruleset we adopt by name holds whatever a repo admin put there, and the
@@ -862,12 +870,12 @@ make_pushed_repo() {
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo"},{"context":"signoff/bar"}]}}]}'
 
   run -1 gh-signoff check $'foo"\t"signoff/foo"\n"signoff/bar'
-  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
   [[ "$output" != *"requires signoff"* ]] || return 1
 
   # A plain quote is refused too, rather than quietly matching nothing
   run -1 gh-signoff check 'bad"context'
-  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
 }
 
 @test "an empty ruleset context round-trips rather than vanishing" {
@@ -933,19 +941,125 @@ make_pushed_repo() {
 # in an adopted context name would reorder the line it prints on — an
 # adopted requirement made to read as a different one. The display field
 # replaces those; the token, and so the payload, keeps them.
-@test "status replaces control and format characters rather than printing them" {
+@test "status shows an out-of-charset name as question marks" {
+  # Display is the name with everything outside printable ASCII shown as ?.
+  # Lossy on purpose: the alternative is a Unicode escaping engine written in
+  # bash, to tell apart names this tool refuses to create.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/ev\u202eil"},{"context":"signoff/c1\u009bhere"}]}}]}'
 
   run -0 gh-signoff status
-  # Something is visibly there ...
-  [[ "$output" == *$'\xef\xbf\xbd'* ]] || return 1
-  # ... but neither the override nor the C1 control reaches the terminal
+  # The override and the C1 control never reach the terminal
   [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
   [[ "$output" != *$'\xc2\x9b'* ]] || return 1
-  # and the rest of the name is intact, prefix stripped as usual
-  [[ "$output" == *"${STATUS_FAILURE} ev"* ]] || return 1
-  [[ "$output" == *"il"* ]] || return 1
+  # Shown as a question mark instead — one per character, since jq counts
+  # characters where the bash scrubber counts bytes — name otherwise intact
+  [[ "$output" == *"${STATUS_FAILURE} ev?il"* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} c1?here"* ]] || return 1
+}
+
+@test "a rejected argument cannot repaint the terminal" {
+  # The value we refuse still gets echoed back, so it is scrubbed on the way
+  # out: an ESC here would clear the screen and take the error with it
+  run -1 gh-signoff install $'bad\x1b[2Jclear'
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  [[ "$output" != *$'\x1b'* ]] || return 1
+  [[ "$output" == *"bad?[2Jclear"* ]] || return 1
+}
+
+@test "install refuses a bidi override in a context argument" {
+  # A name we would be creating has to be one we can show back. Refused
+  # before any request, and the refusal itself carries no raw override.
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff install $'ev\xe2\x80\xaeil'
+  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+
+  [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
+}
+
+@test "debug shows an adopted name scrubbed while the payload keeps it" {
+  # SIGNOFF_DEBUG prints the request JSON, which carries adopted names raw.
+  # The debug line is scrubbed whole; what goes on the wire is not.
+  export SIGNOFF_DEBUG=1
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/ev\u202eil"},{"context":"signoff/c1\u009bhere"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"writing signoff ruleset"* ]] || return 1
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$output" != *$'\xc2\x9b'* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$body" == *$'\xc2\x9b'* ]] || return 1
+}
+
+@test "a hostile default branch name prints inert" {
+  # The branch comes from the API, so it is scrubbed wherever it is shown
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"ma\u001bin"}'
+
+  run -1 gh-signoff check
+  [[ "$output" != *$'\x1b'* ]] || return 1
+  [[ "$output" == "${STATUS_FAILURE} GitHub ma?in branch does not require signoff" ]] || return 1
+}
+
+@test "a branch name outside the charset still reaches the payload faithfully" {
+  # Branches are named by the repository, not by us: they are held to the
+  # JSON rule only, so this one is written as spelled while the message
+  # showing it is scrubbed
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install --branch $'ev\xe2\x80\xaeil'
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$output" == *"GitHub ev???il branch now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xae'* ]] || return 1
+}
+
+@test "Unicode line separators in an adopted context are shown as question marks" {
+  # U+2028 and U+2029 are mandatory line breaks; outside the charset like
+  # anything else, so they neither print nor complete
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo\u2028bar"},{"context":"signoff/baz\u2029qux"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff status
+  [[ "$output" != *$'\xe2\x80\xa8'* ]] || return 1
+  [[ "$output" != *$'\xe2\x80\xa9'* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} foo?bar"* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} baz?qux"* ]] || return 1
+
+  run -0 gh-signoff completion --contexts
+  [[ -z "$output" ]] || return 1
+
+  run -0 gh-signoff install lint
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xa8'* ]] || return 1
+  [[ "$body" == *$'\xe2\x80\xa9'* ]] || return 1
+}
+
+@test "display is lossy: two out-of-charset names can read alike" {
+  # The documented cost of a dumb charset. These two names differ, are
+  # enforced separately and are written back distinctly — but on screen they
+  # both read a?b, and telling them apart would mean a Unicode escaping
+  # engine written in bash, for names this tool refuses to create.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/a\u202eb"},{"context":"signoff/a\ufffdb"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff status
+  rows=$(printf '%s\n' "$output" | grep -c 'a?b') || rows=0
+  [[ "$rows" -eq 2 ]] || return 1
+
+  # Enforcement is not lossy: both names ride through the union intact
+  run -0 gh-signoff install lint
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$body" == *$'\xef\xbf\xbd'* ]] || return 1
 }
 
 @test "sanitizing for display never reaches the payload" {

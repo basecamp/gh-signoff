@@ -54,7 +54,15 @@ gh signoff install
 
 Those ruleset names are reserved: gh-signoff treats a repository branch ruleset named `signoff` or `signoff (<branch>)` as its own, so install will normalize its shape and uninstall will delete it.
 
-Contexts already in that ruleset are carried along untouched, whatever they are named. Names are written back exactly as GitHub spells them, but when one is *shown* to you, control and format characters in it are replaced with `�` — a context name is not allowed to reorder or repaint the line it appears on. Completion only offers names you could type back as an argument, so a context whose name needs escaping, or that starts with a dash, is left out of the suggestions.
+### Context names
+
+gh-signoff's supported charset for names you give it is **printable ASCII** — `0x20` to `0x7E`, minus `"` and `\`. That's a deliberate boundary, and it cuts three ways:
+
+- **Enforcement is faithful.** Contexts already in an adopted ruleset are carried along untouched, whatever they are named, and written back exactly as GitHub spells them. gh-signoff does not edit a requirement it merely adopted.
+- **Input is refused.** `gh signoff install café` won't create that context. A name gh-signoff creates is one it can show you.
+- **Display is lossy.** Anything outside the charset is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different out-of-charset names can display identically. Their enforcement stays entirely distinct — only the rendering collides. Distinguishing them on screen would mean a Unicode escaping engine written in bash, to tell apart names the tool refuses to create in the first place.
+
+Completion only offers names you could type back as an argument, so a context whose name needs escaping, falls outside the charset, or starts with a dash is left out of the suggestions.
 
 Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
 

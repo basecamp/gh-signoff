@@ -51,7 +51,7 @@ fail() {
 
 reject_extra_args() {
   if [[ $# -gt 0 ]]; then
-    fail "unexpected argument: $1"
+    fail "unexpected argument: $(scrub "$1")"
   fi
 }
 
@@ -74,12 +74,12 @@ resolve_commit() {
 
   # We have the object but it doesn't peel to a commit: a tree or a blob
   if git cat-file -e "$rev" 2>/dev/null; then
-    fail "not a commit: $rev"
+    fail "not a commit: $(scrub "$rev")"
   fi
 
   # Unknown to git. A full sha may still name a commit we haven't fetched;
   # anything shorter or non-hex is a typo, not a revision.
-  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $rev"
+  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $(scrub "$rev")"
   RESOLVED_COMMIT="$rev"
   RESOLVED_COMMIT_IS_LOCAL=false
 }
@@ -158,31 +158,63 @@ require_default_branch() {
 # everywhere at once, while the token keeps the original spelling for anything
 # sent back.
 #
-# display is the raw name with every control and format character — Unicode
-# categories Cc and Cf — replaced by U+FFFD (the � below). This is the only
-# field that reaches a terminal. tojson escapes what JSON requires and no
-# more, so a token still carries C1 controls and format characters verbatim,
-# and U+202E RIGHT-TO-LEFT OVERRIDE in an adopted context name would reorder
-# the line it is printed on: an adopted requirement could be made to read as
-# a different one. Replacing them shows that something is there without
-# letting it act. Tab and newline are Cc too, so the display field is
-# incapable of forging a record either, and an ordinary name is simply
-# itself.
+# display is the name with every character outside printable ASCII shown as
+# a question mark, and it is the only field that ever reaches a terminal.
+#
+# --- The supported charset ---
+#
+# gh-signoff's supported name charset is printable ASCII, 0x20 to 0x7E. That
+# is a product boundary, not an implementation limit, and it cuts three ways:
+#
+#   Enforcement is faithful. Whatever a repo admin put in our ruleset is
+#   carried and written back byte for byte, in or out of the charset. We do
+#   not edit a requirement we merely adopted.
+#
+#   Input is refused. A context named on the command line must be in the
+#   charset (see require_supported_name), because that is a name we would be
+#   creating, and this tool declines to create names it cannot show you.
+#
+#   Display is lossy, and deliberately NOT injective. Two different
+#   out-of-charset names can display identically — a name holding U+202E and
+#   one holding U+FFFD both show as ?, and status will show two rows that
+#   read the same. Their keys, tokens and enforcement stay entirely
+#   distinct; only the rendering collides. Telling them apart on screen would
+#   take a Unicode escaping engine written in bash, to distinguish names this
+#   tool refuses to create in the first place. The lossy spelling is the
+#   honest one: it says "something here is outside what I can show you".
+#
+# What this buys is that no name can act on the terminal it prints to. tojson
+# escapes what JSON requires and nothing more, so a token still carries C1
+# controls and format characters verbatim, and U+202E RIGHT-TO-LEFT OVERRIDE
+# in an adopted name would reorder the line it printed on — an adopted
+# requirement made to read as a different one. Tab and newline are outside
+# the charset too, so the display field cannot forge a record either.
 #
 # Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
 #
 # Bash composes records in exactly one place — contexts named on the command
-# line — and require_json_safe has already refused the characters JSON would
-# have to escape, so wrapping the name in quotes is all the serialization it
-# needs. It folds with tr, because Bash 3 has no ${var,,}. Its display field
-# is the argument as typed: require_json_safe does not refuse C1 or format
-# characters, but this path only ever echoes the user's own argument back to
-# them in the same terminal they typed it into. What a repo admin put in a
-# ruleset is the untrusted input, and that always arrives through jq.
+# line — where require_supported_name has already established that the name
+# is printable ASCII with no quote or backslash. So wrapping it in quotes is
+# all the serialization it needs, and it is its own display form. Bash folds
+# with tr, because Bash 3 has no ${var,,}, and it never unescapes a token:
+# nothing downstream wants the raw bytes back, and a half-written unescaper
+# would hand this class of bug straight back.
+CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[^\\x20-\\x7e]"; "?"))"'
+
+# The same charset rule for everything else this script prints that it did
+# not author: a branch name from the API, a rejected argument, the request
+# JSON in a debug line. Records get their display field from jq; these have
+# no jq to reach, so they get a scrubber instead, and it is deliberately the
+# duller of the two — one pass of tr, no parsing.
 #
-# Bash never unescapes a token: nothing downstream wants the raw bytes back,
-# and a half-written unescaper would hand this class of bug straight back.
-CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[\\p{Cc}\\p{Cf}]"; "�"))"'
+# LC_ALL=C makes ' -~' mean exactly bytes 0x20 to 0x7E, so a UTF-8 character
+# scrubs to one ? per byte where jq's would give one ? per character. The two
+# spellings do not have to agree: neither is reversible, and both say the
+# same thing, which is that something unprintable was there. Values here are
+# single-line by nature; a newline would scrub to ? like anything else.
+scrub() {
+  printf '%s' "$1" | LC_ALL=C tr -c ' -~' '?'
+}
 
 # LC_ALL=C so the fold is exactly A-Z, matching jq's ascii_downcase. Left to
 # the ambient locale, tr's [:upper:] can take in a single-byte locale's
@@ -393,16 +425,41 @@ legacy_upgrade_hint() {
   echo "Note: signoff is enforced via legacy branch protection; run 'gh signoff install' to migrate it to a ruleset" >&2
 }
 
-# The ruleset payload is assembled as a JSON string. Context names arrive
-# pre-serialized as tokens, but a branch name is spliced in raw, and a context
-# named on the command line is turned into a token by quoting alone: rather
-# than escape arbitrary input, refuse the characters that would break out of a
-# JSON string literal — none are plausible in a branch or context name.
+# The ruleset payload is assembled as a JSON string and a branch name is
+# spliced into it raw, so refuse the characters that would break out of a
+# string literal rather than escape arbitrary input. Branches are held to
+# this and no more: git allows more than printable ASCII in a ref name, that
+# is git's business, and a branch is named by the repository rather than by
+# us. Its display is scrubbed instead.
 require_json_safe() {
   local what="$1" value="$2"
   case "$value" in
     *[\"\\]* | *[[:cntrl:]]*)
-      fail "${what} contains characters unsafe for JSON: ${value}"
+      fail "${what} contains characters unsafe for JSON: $(scrub "$value")"
+      ;;
+  esac
+}
+
+# A context named on the command line is a name we would be creating, so it
+# has to be one we can show back: printable ASCII, and not the two characters
+# JSON would need escapes for. See the supported charset above.
+#
+# The test is the scrubber's own: a supported name is exactly one that
+# survives scrubbing unchanged. That reuses a single definition of the
+# charset instead of restating it as a bash pattern, and sidesteps the
+# question of what a bracket range means under the ambient locale — tr is
+# pinned to C, and the comparison is a plain string equality.
+require_supported_name() {
+  local what="$1" value="$2" clean
+  clean=$(scrub "$value")
+
+  if [[ "$clean" != "$value" ]]; then
+    fail "${what} must be printable ASCII: ${clean}"
+  fi
+
+  case "$value" in
+    *[\"\\]*)
+      fail "${what} cannot contain a quote or a backslash: ${value}"
       ;;
   esac
 }
@@ -444,7 +501,7 @@ write_signoff_ruleset() {
   local json response
 
   json=$(build_signoff_ruleset_json "$branch" "$@")
-  debug "writing signoff ruleset for ${branch}: ${json}"
+  debug "writing signoff ruleset for $(scrub "$branch"): $(scrub "$json")"
 
   if [[ -n "$id" ]]; then
     response=$(printf '%s' "$json" | gh api "repos/:owner/:repo/rulesets/${id}" \
@@ -584,14 +641,13 @@ retire_legacy_signoff() {
 #
 # A candidate is only worth offering if it could be typed back as an
 # argument, and one comparison settles that: the display field equals the
-# token without its quotes exactly when tojson escaped nothing (no quote,
-# backslash or C0 control) and the sanitizer replaced nothing (no C1 control
-# or format character). Any other name is one create and install would refuse
-# — completing it would hand the user an argument that cannot work. A name
-# holding a literal U+FFFD compares equal and is offered, which is right: it
-# is a perfectly typeable name. Leading dashes are refused separately, since
-# every command reads those as options. Names with spaces are offered as they
-# are; the completion function keeps them whole.
+# token without its quotes exactly when tojson escaped nothing — no quote or
+# backslash — and nothing fell outside the supported charset. Which is to
+# say, exactly when require_supported_name would accept the name back.
+# Anything else would hand the user an argument this tool refuses. Leading
+# dashes are refused on top, since every command reads those as options.
+# Names with spaces are offered as they are; the completion function keeps
+# them whole.
 get_signoff_contexts() {
   local branch="${1:-}" key token display typed
 
@@ -717,14 +773,14 @@ url_remote_tip() {
 
   if [[ -z "$merge_ref" || "$push_default" != "simple" || "$push_remote" != "$remote" ]] ||
     git config --get-regexp '^url\..*\.pushinsteadof$' >/dev/null 2>&1; then
-    debug "branch ${branch} tracks the URL ${remote} but its push destination is not provably that URL"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and its push destination is not provably that URL; add a named remote for it, or -f to override)"
+    debug "branch $(scrub "$branch") tracks the URL $(scrub "$remote") but its push destination is not provably that URL"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch $(scrub "$branch") tracks $(scrub "$remote") as a URL, so there is no tracking ref, and its push destination is not provably that URL; add a named remote for it, or -f to override)"
     return 1
   fi
 
   advertised=$(git ls-remote "$remote" "$merge_ref" 2>/dev/null) || {
-    debug "could not reach ${remote} to look up ${merge_ref}"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and that remote could not be reached; -f to override)"
+    debug "could not reach $(scrub "$remote") to look up $(scrub "$merge_ref")"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch $(scrub "$branch") tracks $(scrub "$remote") as a URL, so there is no tracking ref, and that remote could not be reached; -f to override)"
     return 1
   }
 
@@ -737,14 +793,14 @@ url_remote_tip() {
   done <<<"$advertised"
 
   if [[ -z "$URL_REMOTE_TIP" ]]; then
-    debug "${merge_ref} is not advertised by ${remote}"
-    UNCLEAN_REASON="repository has unpushed changes (${merge_ref} does not exist on ${remote})"
+    debug "$(scrub "$merge_ref") is not advertised by $(scrub "$remote")"
+    UNCLEAN_REASON="repository has unpushed changes ($(scrub "$merge_ref") does not exist on $(scrub "$remote"))"
     return 1
   fi
 
   if ! git cat-file -e "${URL_REMOTE_TIP}^{commit}" 2>/dev/null; then
-    debug "${remote} advertises ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (${remote} has ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository; git fetch ${remote} ${merge_ref}, or -f to override)"
+    debug "$(scrub "$remote") advertises $(scrub "$merge_ref") at $(scrub "$URL_REMOTE_TIP"), which is not in this repository"
+    UNCLEAN_REASON="cannot verify the current branch is pushed ($(scrub "$remote") has $(scrub "$merge_ref") at $(scrub "$URL_REMOTE_TIP"), which is not in this repository; git fetch $(scrub "$remote") $(scrub "$merge_ref"), or -f to override)"
     return 1
   fi
 
@@ -817,7 +873,7 @@ cmd_create() {
         ;;
 
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # Non-option argument is treated as context
@@ -862,7 +918,7 @@ cmd_create() {
       context_name="signoff/${context}"
     fi
 
-    debug "creating status for commit ${commit} by ${user} with context ${context_name}"
+    debug "creating status for commit ${commit} by $(scrub "$user") with context $(scrub "$context_name")"
 
     if gh api \
       --method POST \
@@ -875,14 +931,14 @@ cmd_create() {
       if [[ -z "$context" ]]; then
         success_messages+=("${STATUS_SUCCESS} Signed off on ${commit}")
       else
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for ${context}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for $(scrub "$context")")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
       else
-        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
+        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit} for $(scrub "$context")" >&2
       fi
     fi
   done
@@ -917,14 +973,14 @@ cmd_install() {
         fail "--commit is only valid for create and status"
         ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # All positional arguments are contexts. This is the one place bash
         # composes a token itself, by quoting, so refuse the characters JSON
         # would have to escape before anything touches the API — this tool
         # would never write such a name anyway.
-        require_json_safe "context name" "$1"
+        require_supported_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -939,6 +995,12 @@ cmd_install() {
     branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
 
   # Default to standard signoff if no contexts specified
   if [ ${#contexts[@]} -eq 0 ]; then
@@ -980,19 +1042,19 @@ cmd_install() {
     fi
   done <<<"$MERGED_CONTEXTS"
 
-  debug "installing signoff ruleset on branch: ${branch} with ${#union[@]} contexts"
+  debug "installing signoff ruleset on branch: $(scrub "$branch") with ${#union[@]} contexts"
 
   write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${union[@]}"
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff on ${context}"
       fi
     done
   fi
@@ -1007,7 +1069,7 @@ cmd_install() {
       echo "${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
     fi
   else
-    printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
+    printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch_shown}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
   fi
 }
 
@@ -1033,7 +1095,7 @@ cmd_uninstall() {
         fail "--commit is only valid for create and status"
         ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # All positional arguments are contexts. An empty one would slip past
@@ -1042,7 +1104,7 @@ cmd_uninstall() {
         # for the same reason install refuses them, since the subtraction key
         # is composed here by quoting.
         [[ -n "$1" ]] || fail "context name cannot be empty"
-        require_json_safe "context name" "$1"
+        require_supported_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1056,6 +1118,12 @@ cmd_uninstall() {
     branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
 
   # Bare uninstall removes the whole requirement; contextual subtracts
   local bare=false
@@ -1077,7 +1145,7 @@ cmd_uninstall() {
   if $bare; then
     local removed=false
     if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: ${branch}"
+      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: $(scrub "$branch")"
       delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
       removed=true
     fi
@@ -1088,8 +1156,8 @@ cmd_uninstall() {
     # requirement removed while legacy protection still enforces it would be
     # a lie, and rerunning uninstall retries idempotently
     retire_legacy_signoff "$branch" ||
-      fail "failed to remove signoff from legacy branch protection on ${branch}"
-    $removed || fail "no signoff requirement installed on ${branch}"
+      fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
+    $removed || fail "no signoff requirement installed on ${branch_shown}"
   else
     # Everything currently required, from our ruleset and legacy protection
     local existing=""
@@ -1101,7 +1169,7 @@ cmd_uninstall() {
     local available="$MERGED_CONTEXTS"
 
     if [[ -z "$available" ]]; then
-      fail "no signoff requirement installed on ${branch}"
+      fail "no signoff requirement installed on ${branch_shown}"
     fi
 
     # Subtract by folded key: signoff/Tests is the tests requirement as far
@@ -1125,7 +1193,7 @@ cmd_uninstall() {
       while IFS=$'\t' read -r key token display; do
         keep+=("$token")
       done <<<"$remaining"
-      debug "keeping ${#keep[@]} signoff contexts on branch: ${branch}"
+      debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
       write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${keep[@]}"
       if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
         migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
@@ -1134,24 +1202,24 @@ cmd_uninstall() {
       fi
     elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
       # The last context is going away: no empty ruleset left behind
-      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: ${branch}"
+      debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: $(scrub "$branch")"
       delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
     fi
     # Fatal, as in the bare case: the contexts just uninstalled may live in
     # legacy protection too, and a failed removal there keeps enforcing them
     retire_legacy_signoff "$branch" ||
-      fail "failed to remove signoff from legacy branch protection on ${branch}"
+      fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
   fi
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff on ${context}"
       fi
     done
   fi
@@ -1183,7 +1251,7 @@ cmd_check() {
         fail "--commit is only valid for create and status"
         ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # All positional arguments are contexts, refused on the same terms as
@@ -1191,7 +1259,7 @@ cmd_check() {
         # too, so an argument carrying a quote and a tab could spell a key
         # that spans two fetched records and report a context as required
         # that nobody ever required.
-        require_json_safe "context name" "$1"
+        require_supported_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1202,6 +1270,12 @@ cmd_check() {
     branch=$(default_branch) || fail "failed to get default branch"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
 
   # Default to standard signoff if no contexts specified
   if [ ${#contexts[@]} -eq 0 ]; then
@@ -1214,9 +1288,9 @@ cmd_check() {
   if [[ -z "$SIGNOFF_CONTEXTS" ]]; then
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on ${context}"
       fi
     done
     exit 1
@@ -1233,21 +1307,21 @@ cmd_check() {
       context_name="signoff/${context}"
     fi
 
-    debug "checking protection for branch: ${branch} with context: ${context_name}"
+    debug "checking protection for branch: $(scrub "$branch") with context: ${context_name}"
 
     # Whole-key match — the key runs to the record's tab — so 'signoff' isn't
     # satisfied by 'signoff/tests', while 'signoff/Tests' does satisfy it
     if [[ $'\n'"$SIGNOFF_CONTEXTS" == *$'\n'"$(context_key "$context_name")"$'\t'* ]]; then
       if [[ -z "$context" ]]; then
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff on ${context}"
       fi
     else
       if [[ -z "$context" ]]; then
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on ${context}"
       fi
     fi
   done
@@ -1276,11 +1350,11 @@ cmd_status() {
         fail "-f is only valid for create"
         ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # For now we don't support filtering by context
-        fail "unexpected argument: $1"
+        fail "unexpected argument: $(scrub "$1")"
         ;;
     esac
   done
