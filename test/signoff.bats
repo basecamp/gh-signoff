@@ -1864,13 +1864,57 @@ complete_prefix() {
   _gh_signoff
 }
 
-@test "completion after leading -f offers create plus contexts" {
+@test "a context named like a command never completes at the command position" {
+  # The attack: a ruleset holds a context literally named `uninstall`. If the
+  # command position offered dynamic contexts, `gh signoff un<TAB><Enter>`
+  # would complete to bare `gh signoff uninstall` — which DELETES the ruleset
+  # rather than signing off. Even `signoff/uninstall/foo` leaves the shorter
+  # `uninstall` ready to run. Contexts are structurally barred from every
+  # position a command could occupy, so no context reaches this list.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/uninstall"},{"context":"signoff/uninstall/foo"},{"context":"signoff/tests"}]}}]}'
+
+  complete_words gh-signoff
+  # The static commands are all present ...
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" uninstall "* ]] || return 1
+  # ... but no context is, proven by the non-colliding `tests`: if it is
+  # absent, the colliding `uninstall`-as-context is gone too
+  [[ " ${COMPREPLY[*]-} " != *" tests "* ]] || return 1
+
+  # Same at the -f command position, the other spot a command can start
+  complete_words gh-signoff -f
+  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *" tests "* ]] || return 1
+
+  # And where contexts ARE unambiguous they still appear: after `create`,
+  # as install/check/uninstall arguments, and after a first context
+  complete_words gh-signoff create
+  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
+
+  complete_words gh-signoff install
+  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
+
+  complete_words gh-signoff check
+  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
+
+  complete_words gh-signoff uninstall
+  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
+
+  complete_words gh-signoff tests
+  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
+}
+
+@test "completion after leading -f offers create but no context" {
+  # Right after a leading -f the next word could be the create command, so
+  # this position is as ambiguous as the bare command position: a context
+  # here could collide with a command name. create and --commit only.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
 
   complete_words gh-signoff -f
   [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" install "* ]] || return 1
 }
@@ -1921,11 +1965,12 @@ complete_prefix() {
   complete_prefix gh-signoff --commit HEAD st
   [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
 
-  # Nothing typed yet: both commands and contexts are reachable
+  # Nothing typed yet: this is still the command position, so commands are
+  # reachable but contexts are not — a context here could collide with one
   complete_words gh-signoff --commit HEAD
   [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
   [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
+  [[ ! " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
 }
 
 @test "completion finds the command past a leading --commit" {
@@ -2001,10 +2046,12 @@ complete_prefix() {
   [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
   [[ "${COMPREPLY[1]}" == "Lint" ]] || return 1
 
-  # And the same at the top level, where contexts share the list with commands
+  # At the top level no context is offered at all: it is a command position,
+  # and a context must never be a candidate where Enter would run a command
   complete_words gh-signoff
-  [[ " ${COMPREPLY[*]-} " == *" Lint "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *" Lint "* ]] || return 1
   [[ " ${COMPREPLY[*]-} " != *" -danger "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" uninstall "* ]] || return 1
 }
 
 @test "completion filters contexts by the typed prefix" {
@@ -2018,6 +2065,44 @@ complete_prefix() {
 
 
 # Leading -f dispatcher grammar tests
+@test "an explicitly empty context is rejected, however it is spelled" {
+  # `gh signoff -f '' good` once took the bare-default path — matching on the
+  # first arg's VALUE conflated "no argument" with "an empty first argument",
+  # so it silently dropped both `''` and `good` and signed off bare. An empty
+  # positional is an invalid context, not an absent one, whichever entry point
+  # reaches cmd_create.
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff -f '' good
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+  run -1 gh-signoff '' good
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+  run -1 gh-signoff create -f '' good
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+  run -1 gh-signoff -f ''
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+  # None of those reached the status API
+  [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
+}
+
+@test "bare signoff with no context still defaults" {
+  # The other side of the fix: a genuinely empty argument list is the bare
+  # default signoff and must keep working. `gh signoff -f` is exactly the
+  # $# -eq 0 branch the fix added; a clean-tree plain `gh signoff` is covered
+  # elsewhere, so -f and explicit create carry the defaulting here.
+  run -0 gh-signoff -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! "$output" == *"for"* ]] || return 1
+
+  run -0 gh-signoff create -f
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! "$output" == *"for"* ]] || return 1
+}
+
 @test "leading -f applies to contextual signoff" {
   run -0 gh-signoff -f linux
   [[ "$output" == *"Signed off on"* ]] || return 1

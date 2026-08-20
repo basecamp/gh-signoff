@@ -60,6 +60,8 @@ A context name you give gh-signoff — the part after `signoff/` — must be an 
 
 The grammar is narrow on purpose. Shell completion suggests these names back to you, and a suggestion is only safe to accept if the shell reads it as a plain word — a context named `$(...)` or `foo;rm -rf ~` would otherwise arrive on your command line as an instruction. So the rule is a single invariant: **gh-signoff suggests a context if and only if it would accept it as input.** The same grammar governs `install`, `check`, `uninstall` and `gh signoff <context>` alike.
 
+Completion is also careful about *where* it suggests contexts. It never offers them at a position where a command could go — the bare `gh signoff <TAB>` spot, or right after a leading `-f` — because a context named like a command (say `uninstall`) would otherwise sit there beside the real command and complete to it. The tradeoff: `gh signoff te<TAB>` won't complete the shorthand context `tests` at the bare position. Reach contexts through `gh signoff create <TAB>`, as `install`/`check`/`uninstall` arguments, or after you've typed the first one.
+
 Two other rules sit alongside it, and they are deliberately different:
 
 - **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them, identifier or not. gh-signoff does not edit a requirement it merely adopted — it just won't suggest the odd ones back to you.

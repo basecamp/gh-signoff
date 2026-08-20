@@ -195,9 +195,9 @@ require_default_branch() {
 #
 # Display is lossy, and deliberately NOT injective. Two different names
 # outside the display alphabet can show identically — one holding U+202E and
-# one holding U+FFFD both read as ?, and status will show two rows that read
-# the same. Their keys, tokens and enforcement stay entirely distinct; only
-# the rendering collides. Telling them apart on screen would take a Unicode
+# one holding a C1 control both read as ?, and status will show two rows that
+# read the same. Their keys, tokens and enforcement stay entirely distinct;
+# only the rendering collides. Telling them apart on screen would take a Unicode
 # escaping engine written in bash, to distinguish names this tool refuses to
 # create in the first place. The lossy spelling is the honest one: it says
 # "something here is outside what I can show you".
@@ -363,7 +363,7 @@ signoff_ruleset_contexts() {
 # was really standing in for the injection it enabled, and the record
 # protocol has since made that structural: such a name is one record, is
 # spliced back as one token, and is removed by exactly the name it has.
-# Recognizing it costs nothing now. require_json_safe still refuses to create
+# Recognizing it costs nothing now. require_identifier still refuses to create
 # one, which is a rule about what we write, not about what we recognize.
 #
 # Reads from `checks` (the modern view carrying app identity), normalizing
@@ -655,8 +655,8 @@ retire_legacy_signoff() {
 }
 
 # Get required signoff contexts, stripping the 'signoff/' prefix. The bare
-# 'signoff' context has no display name, so it is dropped. Feeds compgen: no
-# upgrade hint here.
+# 'signoff' context has no display name, so it is dropped. Feeds shell
+# completion: no upgrade hint here.
 #
 # The folded key answers whether the context is in the signoff/ namespace,
 # whatever case it was spelled in. The key and the display field both begin
@@ -1454,9 +1454,9 @@ cmd_status() {
   done <<< "$statuses"
 
   # Generate status output for all contexts (required + actual). What prints
-  # is the record's display field: the name with control and format
-  # characters replaced by U+FFFD, so an adopted context cannot reorder or
-  # repaint the line it appears on.
+  # is the record's display field: the name in the display alphabet, with
+  # everything outside printable ASCII shown as a question mark, so an adopted
+  # context cannot reorder or repaint the line it appears on.
   local all_results=() display_name
   for req in "${required[@]}"; do
     key="${req%%$'\t'*}"
@@ -1501,15 +1501,16 @@ _gh_signoff_words() {
 }
 
 # Append the required contexts to COMPREPLY, one candidate per line of
-# `gh signoff completion --contexts`.
+# `gh signoff completion --contexts`. Every candidate is a grammar identifier
+# by the time it arrives — get_signoff_contexts only emits names it would
+# accept as input — so each is a single inert word with nothing to split or
+# escape.
 #
-# Deliberately not compgen: it reparses its word list as shell input, so a
-# context containing a space would become two candidates and one containing a
-# backslash would come back with the backslash eaten. Candidates that reach
-# COMPREPLY as whole array elements are inserted verbatim, with readline
-# quoting whatever needs it. The prefix test is a quoted case pattern, so a
-# context containing a glob character matches literally rather than matching
-# everything.
+# Even so, deliberately not compgen: it reparses its word list as shell input,
+# and reading whole lines into COMPREPLY keeps the guarantee that a candidate
+# lands verbatim rather than relying on the grammar to make compgen's word
+# splitting a no-op. The prefix test is a quoted case pattern, matching the
+# typed prefix literally.
 _gh_signoff_contexts() {
   local cur="$1" contexts line
   contexts=$(gh signoff completion --contexts 2>/dev/null)
@@ -1546,9 +1547,15 @@ _gh_signoff() {
 
   case "$prev" in
     signoff)
-      # Include dynamic contexts in top-level completion
-      _gh_signoff_words "$cur" create install uninstall check status version -f --commit --help
-      _gh_signoff_contexts "$cur"
+      # The command position, and it is shared with the direct-signoff
+      # shorthand — so a dynamic context named `uninstall` would sit here
+      # beside the real uninstall command, and `gh signoff un<TAB><Enter>`
+      # would complete to bare `gh signoff uninstall`, deleting the ruleset
+      # instead of signing off. Contexts are never offered where a command
+      # could go. The cost: `gh signoff te<TAB>` no longer completes the
+      # shorthand context `tests` at the bare position — reach contexts
+      # through `create`, or after the first context is typed.
+      _gh_signoff_words "$cur" create install uninstall check status version completion -f --commit --help
       return 0
       ;;
     --commit)
@@ -1556,15 +1563,17 @@ _gh_signoff() {
       return 0
       ;;
     -f)
-      # A leading -f may be followed by the create command, --commit or a
-      # context; elsewhere only contexts remain
+      # Right after a leading -f the next word could still be the create
+      # command, so this position is ambiguous the same way the bare command
+      # position is: offer only the unambiguous static words, never a context
+      # that might collide with a command name. Past this position, fall
+      # through to the command-aware logic below, which offers contexts once a
+      # command or a context has actually been chosen (e.g. `gh signoff linux
+      # -f <TAB>`).
       if [[ $COMP_CWORD -eq 2 ]]; then
         _gh_signoff_words "$cur" create --commit
-      else
-        COMPREPLY=()
+        return 0
       fi
-      _gh_signoff_contexts "$cur"
-      return 0
       ;;
     create)
       _gh_signoff_words "$cur" -f --commit
@@ -1600,12 +1609,13 @@ _gh_signoff() {
     return 0
   fi
 
-  # No command yet, so the cursor is where one goes: offer the same list as
-  # directly after `signoff`, which a leading -f or --commit would otherwise
-  # push out of reach
+  # No command yet, so the cursor is where one goes: offer the same static
+  # list as directly after `signoff`, which a leading -f or --commit would
+  # otherwise push out of reach. No contexts here either — this is a command
+  # position, and a context colliding with a command name must never be a
+  # candidate where Enter would run the command.
   if [[ -z "$command" ]]; then
-    _gh_signoff_words "$cur" create install uninstall check status version -f --commit --help
-    _gh_signoff_contexts "$cur"
+    _gh_signoff_words "$cur" create install uninstall check status version completion -f --commit --help
     return 0
   fi
 
@@ -1715,10 +1725,20 @@ reject_commit() {
   fi
 }
 
+# No positional at all is the bare default signoff; an explicitly-passed
+# first positional, even an empty string, is a context to validate. Matching
+# on "${1:-}" alone conflated the two, so `gh signoff -f '' good` took the
+# bare-default path and silently dropped both arguments. Split on $# instead:
+# only a truly empty argument list defaults, and everything else — the empty
+# string included — reaches cmd_create, whose grammar check rejects it.
+if [[ $# -eq 0 ]]; then
+  cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"}
+  exit 0
+fi
+
 # ${commit_opt[@]+"${commit_opt[@]}"} is the Bash 3 set -u safe expansion of a
 # possibly-empty array. ${commit_opt:+...} would word-split the revision.
-case "${1:-}" in
-  "")               cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ;;
+case "$1" in
   "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
   "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
