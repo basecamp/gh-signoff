@@ -121,6 +121,255 @@ default_branch() {
   echo "$DEFAULT_BRANCH"
 }
 
+# --- Rulesets ---
+#
+# Signoff requirements live in a repository ruleset that this extension owns
+# outright: exactly one per branch, named deterministically from the branch,
+# created by install, tweaked only by install/uninstall, deleted by a bare
+# uninstall. Other rulesets — the repo's, the org's — layer alongside and are
+# none of our business in either direction. The only reason to list rulesets
+# at all is to find our own id by name, because the API has no upsert.
+#
+# Repos protected by an older gh-signoff carry legacy branch protection
+# instead. Reads merge its signoff contexts in so they keep working, and
+# install migrates it: the union of both worlds lands in the ruleset, then
+# the legacy protection is deleted when it holds nothing but what old
+# gh-signoff installs wrote.
+
+# Results of the last find_signoff_ruleset_id call (empty = no ruleset)
+SIGNOFF_RULESET_ID=""
+
+# Results of the last fetch_required_signoff_contexts call
+SIGNOFF_CONTEXTS=""
+SIGNOFF_LEGACY_PRESENT=false
+
+# Results of the last legacy_protection_disposition call
+LEGACY_PROTECTION="none"
+LEGACY_SIGNOFF_CONTEXTS=""
+
+# Results of the last merge_contexts call
+MERGED_CONTEXTS=""
+
+# The default branch's ruleset is named plain 'signoff' and targets
+# ~DEFAULT_BRANCH, so it survives a default-branch rename. Any other branch
+# gets its name in the ruleset name and an explicit ref.
+signoff_ruleset_name() {
+  local branch="$1"
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    echo "signoff"
+  else
+    echo "signoff (${branch})"
+  fi
+}
+
+signoff_ruleset_ref() {
+  local branch="$1"
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    echo "~DEFAULT_BRANCH"
+  else
+    echo "refs/heads/${branch}"
+  fi
+}
+
+# Find our ruleset by its deterministic name, reporting via SIGNOFF_RULESET_ID
+# (empty = none). The list endpoint answers 200 [] when no rulesets exist, so
+# "none" is an empty id, not an error; nonzero means the API call itself
+# failed, which writers treat as fatal and readers as "none". If two rulesets
+# somehow share our name, first match wins and only that one is ever touched.
+find_signoff_ruleset_id() {
+  local branch="$1" name rows id rname
+  SIGNOFF_RULESET_ID=""
+
+  name=$(signoff_ruleset_name "$branch")
+  rows=$(gh api "repos/:owner/:repo/rulesets" --paginate \
+    --jq '.[] | [.id, .name] | @tsv' 2>/dev/null) || return 1
+  rows=${rows//$'\r'/}
+
+  while IFS=$'\t' read -r id rname; do
+    if [[ "$rname" == "$name" && -z "$SIGNOFF_RULESET_ID" ]]; then
+      SIGNOFF_RULESET_ID="$id"
+    fi
+  done <<<"$rows"
+}
+
+# The contexts a ruleset requires, one per line on stdout. An API failure
+# reads as empty, same as a ruleset with no status-check rule.
+signoff_ruleset_contexts() {
+  local id="$1" contexts
+  contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
+    --jq '.rules[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' \
+    2>/dev/null) || contexts=""
+  echo "${contexts//$'\r'/}"
+}
+
+# The branch's legacy signoff contexts, one per line on stdout. A 404 (no
+# protection) reads as empty, matching the old unprotected signal.
+legacy_signoff_contexts() {
+  local branch="$1" contexts
+  contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
+    --jq '.required_status_checks.contexts[]? | select(startswith("signoff"))' \
+    2>/dev/null) || contexts=""
+  echo "${contexts//$'\r'/}"
+}
+
+# Merge newline-separated context lists, preserving order and dropping blanks
+# and duplicates. Reports via MERGED_CONTEXTS. Membership is the whole-line
+# substring check used throughout; Bash 3 has no associative arrays.
+merge_contexts() {
+  local list line
+  MERGED_CONTEXTS=""
+  for list in "$@"; do
+    while read -r line; do
+      [[ -n "$line" ]] || continue
+      if [[ $'\n'"$MERGED_CONTEXTS"$'\n' != *$'\n'"${line}"$'\n'* ]]; then
+        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}$line"
+      fi
+    done <<<"$list"
+  done
+}
+
+# Every signoff context the branch requires: our ruleset's, merged with any
+# legacy branch protection still in place. Reports via SIGNOFF_CONTEXTS (one
+# per line) and SIGNOFF_LEGACY_PRESENT rather than stdout — a $(...) capture
+# would strand the flag in a subshell (the RESOLVED_COMMIT pattern). API
+# failures read as "none", matching the old 404 handling.
+fetch_required_signoff_contexts() {
+  local branch="$1" ruleset_contexts legacy ctx
+  SIGNOFF_CONTEXTS=""
+  SIGNOFF_LEGACY_PRESENT=false
+
+  ruleset_contexts=""
+  if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+  fi
+
+  legacy=$(legacy_signoff_contexts "$branch")
+  if [[ -n "$legacy" ]]; then
+    SIGNOFF_LEGACY_PRESENT=true
+  fi
+
+  merge_contexts "$ruleset_contexts" "$legacy"
+  SIGNOFF_CONTEXTS="$MERGED_CONTEXTS"
+}
+
+# One-line nudge for repos still carrying legacy signoff branch protection
+legacy_upgrade_hint() {
+  echo "Note: signoff is enforced via legacy branch protection; run 'gh signoff install' to migrate it to a ruleset" >&2
+}
+
+# The ruleset payload is assembled as a JSON string. Rather than escape
+# arbitrary input, refuse the few characters that would break out of a JSON
+# string literal — none are plausible in a branch or context name.
+require_json_safe() {
+  local what="$1" value="$2"
+  case "$value" in
+    *[\"\\]* | *$'\n'* | *$'\t'*)
+      fail "${what} contains characters unsafe for JSON: ${value}"
+      ;;
+  esac
+}
+
+# bypass_actors grants repository admins an always-on bypass, preserving the
+# legacy enforce_admins=null semantics: actor_id 5 is the Admin repository
+# role, per GitHub's own UI-exported rulesets.
+build_signoff_ruleset_json() {
+  local branch="$1"
+  shift
+  local name ref checks="" context
+
+  require_json_safe "branch name" "$branch"
+  name=$(signoff_ruleset_name "$branch")
+  ref=$(signoff_ruleset_ref "$branch")
+
+  for context in "$@"; do
+    require_json_safe "context name" "$context"
+    checks="${checks:+$checks,}{\"context\":\"${context}\"}"
+  done
+
+  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
+}
+
+# Create (no id) or update (id) our ruleset to require exactly the given
+# contexts. gh prints the API error body to stdout; forward it to stderr on
+# failure so a plan-tier or permission error is diagnosable.
+write_signoff_ruleset() {
+  local branch="$1" id="$2"
+  shift 2
+  local json response
+
+  json=$(build_signoff_ruleset_json "$branch" "$@")
+  debug "writing signoff ruleset for ${branch}: ${json}"
+
+  if [[ -n "$id" ]]; then
+    response=$(printf '%s' "$json" | gh api "repos/:owner/:repo/rulesets/${id}" \
+      --method PUT \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      --input - 2>/dev/null) || {
+      if [[ -n "$response" ]]; then echo "$response" >&2; fi
+      fail "failed to update signoff ruleset"
+    }
+  else
+    response=$(printf '%s' "$json" | gh api "repos/:owner/:repo/rulesets" \
+      --method POST \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      --input - 2>/dev/null) || {
+      if [[ -n "$response" ]]; then echo "$response" >&2; fi
+      fail "failed to create signoff ruleset"
+    }
+  fi
+}
+
+delete_signoff_ruleset() {
+  local id="$1" response
+  response=$(gh api --method DELETE "repos/:owner/:repo/rulesets/${id}" 2>/dev/null) || {
+    if [[ -n "$response" ]]; then echo "$response" >&2; fi
+    fail "failed to remove signoff ruleset"
+  }
+}
+
+# Classify the branch's legacy branch protection via LEGACY_PROTECTION:
+#   none    — no protection (the API 404s)
+#   signoff — exactly what old gh-signoff install wrote (only signoff*
+#             contexts, strict false, admins unenforced, no reviews, no
+#             restrictions), safe to delete wholesale
+#   other   — someone else's configuration, left intact
+# LEGACY_SIGNOFF_CONTEXTS collects the signoff* contexts either way. One API
+# call: the first line summarizes the shape, the rest are the contexts.
+legacy_protection_disposition() {
+  local branch="$1" response summary non_signoff strict admins reviews restrictions
+  LEGACY_PROTECTION="none"
+  LEGACY_SIGNOFF_CONTEXTS=""
+
+  response=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
+    --jq '([([.required_status_checks.contexts[]? | select(startswith("signoff") | not)] | length), (.required_status_checks.strict // false), (.enforce_admins.enabled // false), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (.required_status_checks.contexts[]? | select(startswith("signoff")))' \
+    2>/dev/null) || return 0
+  response=${response//$'\r'/}
+
+  summary="${response%%$'\n'*}"
+  if [[ "$response" == *$'\n'* ]]; then
+    LEGACY_SIGNOFF_CONTEXTS="${response#*$'\n'}"
+  fi
+
+  IFS=$'\t' read -r non_signoff strict admins reviews restrictions <<<"$summary"
+  if [[ "$non_signoff" == "0" && "$strict" == "false" && "$admins" == "false" &&
+    "$reviews" == "false" && "$restrictions" == "false" ]]; then
+    LEGACY_PROTECTION="signoff"
+  else
+    LEGACY_PROTECTION="other"
+  fi
+}
+
+# Remove legacy branch protection. Warn rather than fail: the ruleset is
+# already in place, so a failed cleanup leaves a harmless duplicate
+# requirement, not a gap.
+delete_legacy_protection() {
+  local branch="$1"
+  gh api --method DELETE "repos/:owner/:repo/branches/${branch}/protection" >/dev/null 2>&1 ||
+    echo "Warning: could not remove legacy branch protection on ${branch}; remove it in repo settings" >&2
+}
+
 # Get signoff contexts from branch protection, stripping the 'signoff/' prefix.
 # select() drops the bare 'signoff' context, which has no display name.
 get_signoff_contexts() {
