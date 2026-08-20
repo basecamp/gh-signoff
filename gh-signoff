@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.3.0"
+readonly VERSION="0.4.0"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -1243,8 +1243,11 @@ USAGE
 
 COMMANDS
   create (default) Sign off on the current commit or a specific commit
-  install          Install signoff requirement
-  uninstall        Uninstall signoff requirement
+  install          Require signoff via a repository ruleset. Adds the given
+                   contexts to whatever is already required, and migrates any
+                   legacy signoff branch protection into the ruleset
+  uninstall        Remove the signoff requirement — or, given contexts, remove
+                   just those and keep the rest
   check            Check if signoff is required
   status           Show signoff status for the current commit or a specific commit
   version          Show gh-signoff version
@@ -1265,6 +1268,8 @@ EXAMPLES
   gh signoff create -f                 # Force signoff
   gh signoff install                   # Require signoff on default branch
   gh signoff install --branch other    # Require signoff on a specific branch
+  gh signoff install tests lint        # Also require signoff on tests and lint
+  gh signoff uninstall tests           # Stop requiring signoff on tests only
   gh signoff check                     # Check if signoff is required
   gh signoff check --branch other      # Check if signoff is required on branch
   gh signoff status                    # Show completed/pending signoff status

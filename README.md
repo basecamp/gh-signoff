@@ -50,6 +50,26 @@ A branch checked out from a cross-repository pull request (`gh pr checkout` on a
 gh signoff install
 ```
 
+`install` creates a repository ruleset named `signoff` (or `signoff (<branch>)` for a non-default branch) that requires the signoff commit status. Repository admins can bypass it, matching how signoff has always behaved. The ruleset layers alongside any other rulesets your repo or org defines; gh-signoff only ever touches its own.
+
+Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
+
+```bash
+gh signoff uninstall tests   # stop requiring signoff on tests, keep the rest
+gh signoff uninstall         # remove the signoff requirement entirely
+```
+
+### Upgrading from branch protection
+
+Versions before 0.4.0 enforced signoff with legacy branch protection. Everything keeps working on those repos — `check` and `status` read both — but to move onto a ruleset, run once per protected branch:
+
+```bash
+gh signoff install
+gh signoff install --branch other
+```
+
+Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted; if you've layered other settings onto it (required reviews, other status checks, admin enforcement), it's left intact with a note to remove the now-duplicate signoff contexts yourself in repo settings.
+
 ## Advanced usage: Partial signoff
 
 A single signoff is all you need for most projects. If you're feeling extra fancy, picky, or organized, you can use *partial* signoff to reflect each CI step, each build platform (e.g. linux, macos, windows), each signoff role (e.g. qa, dev, ops), etc.
@@ -79,6 +99,9 @@ gh signoff install --branch main tests lint security
 # Check if partial signoff is required
 gh signoff check tests
 gh signoff check --branch main tests lint security
+
+# Stop requiring a context without touching the others
+gh signoff uninstall lint
 ```
 
 ### Checking signoff status
