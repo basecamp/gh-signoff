@@ -689,19 +689,47 @@ make_pushed_repo() {
   [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
 }
 
-@test "install and uninstall refuse context names outside the charset" {
-  # A context named on the command line is a name we would be creating, so
-  # it has to be one we can show back: printable ASCII, no quote, no
-  # backslash
-  run -1 gh-signoff install $'tests\nlint'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+@test "every command holds a typed context to the identifier grammar" {
+  # The grammar exists because completion feeds these names back onto a
+  # Readline line, where $(...), a backtick, a semicolon or a space is an
+  # instruction rather than text. install, check, uninstall and create all
+  # take a context the user typed, so all four hold it to the same rule.
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  run -1 gh-signoff uninstall $'tests\nsignoff/lint'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  for bad in '$(printf PWNED)' 'foo;touch /tmp/pwned' '`id`' 'foo bar' \
+             '.hidden' 'has"quote' 'back\slash' 'a|b' 'a&b' \
+             'star*' '~home' $'nl\nhere' $'esc\x1bhere' $'caf\xc3\xa9'; do
+    run -1 gh-signoff install "$bad"
+    [[ "$output" == *"may contain letters, digits"* ]] || return 1
 
-  # Non-ASCII is refused on the same terms, however innocent
-  run -1 gh-signoff install $'caf\xc3\xa9'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+    run -1 gh-signoff check "$bad"
+    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+    run -1 gh-signoff uninstall "$bad"
+    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+
+    run -1 gh-signoff create "$bad"
+    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  done
+
+  # A leading dash never reaches the grammar: every command reads it as an
+  # option first. Refused all the same, which is the point.
+  for cmd in install check uninstall create; do
+    run -1 gh-signoff "$cmd" -danger
+    [[ "$output" == *"unknown option: -danger"* ]] || return 1
+  done
+
+  # Refused before anything is asked of the API
+  [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
+}
+
+@test "the identifier grammar accepts the names people actually use" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+
+  for good in foo foo-bar foo.bar foo/bar foo_bar Lint bash-3 9lives; do
+    run -0 gh-signoff install "$good"
+    [[ "$output" == *"now requires signoff on ${good}"* ]] || return 1
+  done
 }
 
 @test "reads do not claim foreign signoff-prefixed contexts" {
@@ -776,6 +804,18 @@ make_pushed_repo() {
   [[ "$body" == *'"include":["refs/heads/other"]'* ]] || return 1
 }
 
+@test "an API error body cannot repaint the terminal" {
+  # gh prints the API error body to stdout and we forward it to stderr, so a
+  # hostile message in a response is one more thing that reaches a terminal
+  export MOCK_POST_RULESET_EXIT=1
+  export MOCK_ERROR_MESSAGE=$'Validation ev\xe2\x80\xaeil failed'
+
+  run -1 gh-signoff install
+  [[ "$output" == *"failed to create signoff ruleset"* ]] || return 1
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$output" == *"ev???il"* ]] || return 1
+}
+
 @test "install reports a failed ruleset create" {
   export MOCK_POST_RULESET_EXIT=1
 
@@ -815,13 +855,6 @@ make_pushed_repo() {
   [[ "$calls" != *"PUT "* ]] || return 1
 }
 
-@test "install rejects contexts holding a quote or a backslash" {
-  run -1 gh-signoff install 'bad"context'
-  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
-
-  run -1 gh-signoff install 'back\slash'
-  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
-}
 
 # A ruleset we adopt by name holds whatever a repo admin put there, and the
 # rules API does not exclude control characters from a context name.
@@ -870,12 +903,12 @@ make_pushed_repo() {
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo"},{"context":"signoff/bar"}]}}]}'
 
   run -1 gh-signoff check $'foo"\t"signoff/foo"\n"signoff/bar'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
   [[ "$output" != *"requires signoff"* ]] || return 1
 
   # A plain quote is refused too, rather than quietly matching nothing
   run -1 gh-signoff check 'bad"context'
-  [[ "$output" == *"cannot contain a quote or a backslash"* ]] || return 1
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
 }
 
 @test "an empty ruleset context round-trips rather than vanishing" {
@@ -924,16 +957,15 @@ make_pushed_repo() {
   [[ "$output" == "${STATUS_FAILURE} signoff"$'\n'"${STATUS_FAILURE} tests" ]] || return 1
 }
 
-@test "completion omits contexts that could not be typed back" {
-  # Offer a candidate only if it could be typed back as an argument: an
-  # escaped name (we\nird), a name holding a format character, and one
-  # starting with a dash are all names create and install would refuse.
-  # One line each for the rest, spelling intact.
+@test "completion offers only names the grammar would accept back" {
+  # One invariant: suggest a context if and only if we would accept it as
+  # input. Everything else here is a name install and check refuse, so
+  # offering it would be useless as well as unsafe.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/foo bar"},{"context":"signoff/$(printf PWNED)"},{"context":"signoff/semi;colon"},{"context":"signoff/.hidden"},{"context":"signoff/ok.name"},{"context":"signoff/ok-name"},{"context":"signoff/ok_name"},{"context":"signoff/ok/name"},{"context":"signoff/Lint"}]}}]}'
 
   run -0 gh-signoff completion --contexts
-  [[ "$output" == "foo bar"$'\n'"Lint" ]] || return 1
+  [[ "$output" == "ok.name"$'\n'"ok-name"$'\n'"ok_name"$'\n'"ok/name"$'\n'"Lint" ]] || return 1
 }
 
 # tojson escapes what JSON requires and nothing else, so a token still holds
@@ -962,7 +994,7 @@ make_pushed_repo() {
   # The value we refuse still gets echoed back, so it is scrubbed on the way
   # out: an ESC here would clear the screen and take the error with it
   run -1 gh-signoff install $'bad\x1b[2Jclear'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
   [[ "$output" != *$'\x1b'* ]] || return 1
   [[ "$output" == *"bad?[2Jclear"* ]] || return 1
 }
@@ -973,7 +1005,7 @@ make_pushed_repo() {
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -1 gh-signoff install $'ev\xe2\x80\xaeil'
-  [[ "$output" == *"must be printable ASCII"* ]] || return 1
+  [[ "$output" == *"may contain letters, digits"* ]] || return 1
   [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
 
   [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
@@ -1928,18 +1960,32 @@ complete_prefix() {
   [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
 }
 
-# Candidates reach COMPREPLY as whole array elements. compgen -W would reparse
-# them as shell input first: a context with a space would arrive as two
-# candidates, and one with a backslash would arrive with the backslash eaten.
-@test "completion keeps a context with a space as one candidate" {
+
+# The gap that hid a HIGH for four rounds: these tests inspected COMPREPLY
+# but never asked what the shell would do with a candidate once it landed on
+# the command line. Readline inserts the candidate and Enter runs the line.
+@test "no completion candidate is shell-active on the command line" {
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo bar"},{"context":"signoff/we\nird"},{"context":"signoff/Lint"}]}}]}'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/$(printf PWNED >&2)"},{"context":"signoff/foo;touch pwned"},{"context":"signoff/`id`"},{"context":"signoff/ok-name"},{"context":"signoff/Lint"}]}}]}'
 
   complete_words gh-signoff check
-  [[ "${#COMPREPLY[@]}" -eq 3 ]] || return 1
-  [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
-  [[ "${COMPREPLY[1]}" == "foo bar" ]] || return 1
-  [[ "${COMPREPLY[2]}" == "Lint" ]] || return 1
+
+  # None of the shell-active names are offered
+  [[ " ${COMPREPLY[*]-} " != *'$('* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *';'* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *'`'* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *"PWNED"* ]] || return 1
+
+  # The real check, and an independent one: printf %q quotes anything the
+  # shell would act on, so a candidate that comes back unchanged is a single
+  # literal word on a command line. Proven without running any of them.
+  for candidate in "${COMPREPLY[@]-}"; do
+    [[ "$(printf '%q' "$candidate")" == "$candidate" ]] || return 1
+  done
+
+  # Not vacuous: the usable names did survive
+  [[ " ${COMPREPLY[*]-} " == *" ok-name "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " == *" Lint "* ]] || return 1
 }
 
 @test "completion offers no candidate that would be read as an option" {
@@ -1970,17 +2016,6 @@ complete_prefix() {
   [[ "${COMPREPLY[0]}" == "Lint" ]] || return 1
 }
 
-@test "completion matches a context with a glob character literally" {
-  # The prefix test is a quoted case pattern: a candidate holding * matches
-  # only what it spells, and a typed * offers only candidates that start
-  # with one
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/*star"},{"context":"signoff/Lint"}]}}]}'
-
-  complete_prefix gh-signoff check '*'
-  [[ "${#COMPREPLY[@]}" -eq 1 ]] || return 1
-  [[ "${COMPREPLY[0]}" == '*star' ]] || return 1
-}
 
 # Leading -f dispatcher grammar tests
 @test "leading -f applies to contextual signoff" {

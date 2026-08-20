@@ -56,13 +56,16 @@ Those ruleset names are reserved: gh-signoff treats a repository branch ruleset 
 
 ### Context names
 
-gh-signoff's supported charset for names you give it is **printable ASCII** — `0x20` to `0x7E`, minus `"` and `\`. That's a deliberate boundary, and it cuts three ways:
+A context name you give gh-signoff — the part after `signoff/` — must be an **identifier**: letters, digits, `.` `_` `/` `-`, starting with a letter or a digit. `tests`, `bash-3`, `build/linux` and `Lint` are all fine; `foo bar`, `-danger` and `café` are not.
 
-- **Enforcement is faithful.** Contexts already in an adopted ruleset are carried along untouched, whatever they are named, and written back exactly as GitHub spells them. gh-signoff does not edit a requirement it merely adopted.
-- **Input is refused.** `gh signoff install café` won't create that context. A name gh-signoff creates is one it can show you.
-- **Display is lossy.** Anything outside the charset is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different out-of-charset names can display identically. Their enforcement stays entirely distinct — only the rendering collides. Distinguishing them on screen would mean a Unicode escaping engine written in bash, to tell apart names the tool refuses to create in the first place.
+The grammar is narrow on purpose. Shell completion suggests these names back to you, and a suggestion is only safe to accept if the shell reads it as a plain word — a context named `$(...)` or `foo;rm -rf ~` would otherwise arrive on your command line as an instruction. So the rule is a single invariant: **gh-signoff suggests a context if and only if it would accept it as input.** The same grammar governs `install`, `check`, `uninstall` and `gh signoff <context>` alike.
 
-Completion only offers names you could type back as an argument, so a context whose name needs escaping, falls outside the charset, or starts with a dash is left out of the suggestions.
+Two other rules sit alongside it, and they are deliberately different:
+
+- **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them, identifier or not. gh-signoff does not edit a requirement it merely adopted — it just won't suggest the odd ones back to you.
+- **Display is lossy.** Anything outside printable ASCII is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different names can display identically while staying entirely distinct in what they enforce. Distinguishing them on screen would mean a Unicode escaping engine written in bash, for names the tool refuses to create in the first place.
+
+Branch names are held to neither — `feature/x` and worse are legitimate refs, and a branch is named by your repository rather than by gh-signoff. They are only checked for what would break a request body, and shown through the same `?` display.
 
 Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
 

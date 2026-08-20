@@ -34,6 +34,10 @@ fi
 : ${MOCK_RULESET_JSON:='{}'} # A single ruleset fetched by id
 : ${MOCK_RULESET_EXIT:=0}
 
+# Lets a test inject a hostile API error body, e.g. one carrying a bidi
+# override, to prove the script scrubs what it forwards to stderr
+: ${MOCK_ERROR_MESSAGE:=}
+
 : ${MOCK_POST_RULESET_EXIT:=0}
 : ${MOCK_PUT_RULESET_EXIT:=0}
 : ${MOCK_DELETE_RULESET_EXIT:=0}
@@ -150,7 +154,7 @@ require_ruleset_body() {
 # second argument sets the HTTP status the body reports (default 404), for
 # callers that distinguish a confirmed 404 from other failures.
 emit_error() {
-  echo "{\"message\":\"$1\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"${2:-404}\"}"
+  echo "{\"message\":\"${MOCK_ERROR_MESSAGE:-$1}\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"${2:-404}\"}"
 }
 
 # --- Determine Response Based on API Call ---

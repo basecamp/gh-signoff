@@ -161,44 +161,63 @@ require_default_branch() {
 # display is the name with every character outside printable ASCII shown as
 # a question mark, and it is the only field that ever reaches a terminal.
 #
-# --- The supported charset ---
+# --- Three rules, for three different jobs ---
 #
-# gh-signoff's supported name charset is printable ASCII, 0x20 to 0x7E. That
-# is a product boundary, not an implementation limit, and it cuts three ways:
+# Names are held to three separate standards, and conflating them is what
+# produced two rounds of findings. Each answers a different question.
 #
-#   Enforcement is faithful. Whatever a repo admin put in our ruleset is
-#   carried and written back byte for byte, in or out of the charset. We do
-#   not edit a requirement we merely adopted.
+#   The identifier grammar (require_identifier) answers "may we create this,
+#   and may we suggest it?" It is the narrowest: letters, digits, . _ / - and
+#   a leading letter or digit. It governs context names the user types, and
+#   it governs which adopted names completion offers back, because those are
+#   the same question — a suggestion is only safe if we would accept it as
+#   input, and a name outside this grammar can carry shell syntax onto a
+#   Readline line.
 #
-#   Input is refused. A context named on the command line must be in the
-#   charset (see require_supported_name), because that is a name we would be
-#   creating, and this tool declines to create names it cannot show you.
+#   The display alphabet (scrub, and the display field below) answers "how do
+#   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else
+#   as a question mark. It applies to every name we did not author, however
+#   it is spelled, because anything can be shown even when nothing may be
+#   created from it.
 #
-#   Display is lossy, and deliberately NOT injective. Two different
-#   out-of-charset names can display identically — a name holding U+202E and
-#   one holding U+FFFD both show as ?, and status will show two rows that
-#   read the same. Their keys, tokens and enforcement stay entirely
-#   distinct; only the rendering collides. Telling them apart on screen would
-#   take a Unicode escaping engine written in bash, to distinguish names this
-#   tool refuses to create in the first place. The lossy spelling is the
-#   honest one: it says "something here is outside what I can show you".
+#   JSON safety (require_json_safe) answers "may this be spliced into a
+#   payload?" It rejects only the quote, the backslash and control
+#   characters. It governs branch names, which are named by the repository
+#   rather than by us: feature/x, release-1.2 and worse are legitimate refs,
+#   so a branch is not held to the identifier grammar — only to what keeps
+#   the request body well-formed. It is shown through the display alphabet
+#   like anything else.
+#
+# Enforcement sits outside all three. Whatever a repo admin put in our
+# ruleset is carried and written back byte for byte, whatever it is named. We
+# do not edit a requirement we merely adopted, and no display or input rule
+# ever reaches a payload.
+#
+# Display is lossy, and deliberately NOT injective. Two different names
+# outside the display alphabet can show identically — one holding U+202E and
+# one holding U+FFFD both read as ?, and status will show two rows that read
+# the same. Their keys, tokens and enforcement stay entirely distinct; only
+# the rendering collides. Telling them apart on screen would take a Unicode
+# escaping engine written in bash, to distinguish names this tool refuses to
+# create in the first place. The lossy spelling is the honest one: it says
+# "something here is outside what I can show you".
 #
 # What this buys is that no name can act on the terminal it prints to. tojson
 # escapes what JSON requires and nothing more, so a token still carries C1
 # controls and format characters verbatim, and U+202E RIGHT-TO-LEFT OVERRIDE
 # in an adopted name would reorder the line it printed on — an adopted
 # requirement made to read as a different one. Tab and newline are outside
-# the charset too, so the display field cannot forge a record either.
+# the alphabet too, so the display field cannot forge a record either.
 #
 # Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
 #
 # Bash composes records in exactly one place — contexts named on the command
-# line — where require_supported_name has already established that the name
-# is printable ASCII with no quote or backslash. So wrapping it in quotes is
-# all the serialization it needs, and it is its own display form. Bash folds
-# with tr, because Bash 3 has no ${var,,}, and it never unescapes a token:
-# nothing downstream wants the raw bytes back, and a half-written unescaper
-# would hand this class of bug straight back.
+# line — where require_identifier has already established that the name is an
+# identifier. So wrapping it in quotes is all the serialization it needs, and
+# it is its own display form. Bash folds with tr, because Bash 3 has no
+# ${var,,}, and it never unescapes a token: nothing downstream wants the raw
+# bytes back, and a half-written unescaper would hand this class of bug
+# straight back.
 CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[^\\x20-\\x7e]"; "?"))"'
 
 # The same charset rule for everything else this script prints that it did
@@ -440,28 +459,33 @@ require_json_safe() {
   esac
 }
 
-# A context named on the command line is a name we would be creating, so it
-# has to be one we can show back: printable ASCII, and not the two characters
-# JSON would need escapes for. See the supported charset above.
+# The identifier grammar: letters, digits, dot, underscore, slash and dash,
+# starting with a letter or a digit. It is the rule for a context name the
+# user types — the part after signoff/, which this tool then prefixes.
 #
-# The test is the scrubber's own: a supported name is exactly one that
-# survives scrubbing unchanged. That reuses a single definition of the
-# charset instead of restating it as a bash pattern, and sidesteps the
-# question of what a bracket range means under the ambient locale — tr is
-# pinned to C, and the comparison is a plain string equality.
-require_supported_name() {
-  local what="$1" value="$2" clean
-  clean=$(scrub "$value")
+# Printable ASCII was too generous. Completion feeds these names back onto a
+# Readline command line, where $(...), a backtick, a semicolon, a space or a
+# glob character is not text but an instruction: an adopted context named
+# signoff/$(printf PWNED) would arrive as a suggestion, and accepting it runs
+# the substitution. The grammar admits nothing that means anything to a
+# shell, which is what makes a suggestion safe to accept blind. A leading
+# dash would be read as an option and a leading dot hides the name, so both
+# are excluded from the first character.
+#
+# LC_ALL=C keeps the ranges byte ranges, and the pattern lives in a variable
+# because Bash 3.2 treats a quoted =~ operand as a literal string.
+CONTEXT_IDENTIFIER_RE='^[A-Za-z0-9][A-Za-z0-9._/-]*$'
 
-  if [[ "$clean" != "$value" ]]; then
-    fail "${what} must be printable ASCII: ${clean}"
+is_identifier() {
+  local LC_ALL=C
+  [[ $1 =~ $CONTEXT_IDENTIFIER_RE ]]
+}
+
+require_identifier() {
+  local what="$1" value="$2"
+  if ! is_identifier "$value"; then
+    fail "${what} may contain letters, digits, and . _ / - and must start with a letter or digit: $(scrub "$value")"
   fi
-
-  case "$value" in
-    *[\"\\]*)
-      fail "${what} cannot contain a quote or a backslash: ${value}"
-      ;;
-  esac
 }
 
 # bypass_actors grants repository admins an always-on bypass, preserving the
@@ -509,7 +533,7 @@ write_signoff_ruleset() {
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       --input - 2>/dev/null) || {
-      if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
+      if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
       fail "failed to update signoff ruleset"
     }
   else
@@ -518,7 +542,7 @@ write_signoff_ruleset() {
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       --input - 2>/dev/null) || {
-      if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
+      if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
       fail "failed to create signoff ruleset"
     }
   fi
@@ -527,7 +551,7 @@ write_signoff_ruleset() {
 delete_signoff_ruleset() {
   local id="$1" response
   response=$(gh api --method DELETE "repos/:owner/:repo/rulesets/${id}" 2>/dev/null) || {
-    if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
     fail "failed to remove signoff ruleset"
   }
 }
@@ -606,7 +630,7 @@ remove_legacy_signoff_contexts() {
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     --input - 2>/dev/null) || {
-    if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
     return 1
   }
 }
@@ -639,17 +663,20 @@ retire_legacy_signoff() {
 # with the same eight prefix characters, so the name to offer is what follows
 # them, in its original spelling.
 #
-# A candidate is only worth offering if it could be typed back as an
-# argument, and one comparison settles that: the display field equals the
-# token without its quotes exactly when tojson escaped nothing — no quote or
-# backslash — and nothing fell outside the supported charset. Which is to
-# say, exactly when require_supported_name would accept the name back.
-# Anything else would hand the user an argument this tool refuses. Leading
-# dashes are refused on top, since every command reads those as options.
-# Names with spaces are offered as they are; the completion function keeps
-# them whole.
+# One invariant governs what is offered: we suggest a context if and only if
+# we would accept it as input. Completion puts its candidate on a Readline
+# line that the user accepts with a keystroke, often without reading it, so
+# anything suggested has to be inert there — and the identifier grammar
+# already admits nothing a shell would act on. A name outside it is one this
+# tool would refuse anyway, which makes suggesting it useless as well as
+# unsafe.
+#
+# The grammar is applied to the display field rather than the raw name, which
+# costs nothing and settles the question: a name carrying anything outside
+# the display alphabet has a question mark in its display form, and a
+# question mark is not in the grammar.
 get_signoff_contexts() {
-  local branch="${1:-}" key token display typed
+  local branch="${1:-}" key token display name
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
@@ -660,10 +687,9 @@ get_signoff_contexts() {
 
   while IFS=$'\t' read -r key token display; do
     if [[ "$key" == '"signoff/'* ]]; then
-      typed=${token#\"}
-      typed=${typed%\"}
-      if [[ "$display" == "$typed" && "${display:8}" != -* ]]; then
-        printf '%s\n' "${display:8}"
+      name="${display:8}"
+      if is_identifier "$name"; then
+        printf '%s\n' "$name"
       fi
     fi
   done <<<"$SIGNOFF_CONTEXTS"
@@ -876,7 +902,10 @@ cmd_create() {
         fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # Non-option argument is treated as context
+        # Non-option argument is treated as context. Held to the same grammar
+        # as install and check: a context created as one thing and installable
+        # as another would be a namespace nobody can use.
+        require_identifier "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -980,7 +1009,7 @@ cmd_install() {
         # composes a token itself, by quoting, so refuse the characters JSON
         # would have to escape before anything touches the API — this tool
         # would never write such a name anyway.
-        require_supported_name "context name" "$1"
+        require_identifier "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1104,7 +1133,7 @@ cmd_uninstall() {
         # for the same reason install refuses them, since the subtraction key
         # is composed here by quoting.
         [[ -n "$1" ]] || fail "context name cannot be empty"
-        require_supported_name "context name" "$1"
+        require_identifier "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1259,7 +1288,7 @@ cmd_check() {
         # too, so an argument carrying a quote and a tab could spell a key
         # that spans two fetched records and report a context as required
         # that nobody ever required.
-        require_supported_name "context name" "$1"
+        require_identifier "context name" "$1"
         contexts+=("$1")
         shift
         ;;
