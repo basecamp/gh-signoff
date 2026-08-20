@@ -166,13 +166,11 @@ require_default_branch() {
 # Names are held to three separate standards, and conflating them is what
 # produced two rounds of findings. Each answers a different question.
 #
-#   The identifier grammar (require_identifier) answers "may we create this,
-#   and may we suggest it?" It is the narrowest: letters, digits, . _ / - and
-#   a leading letter or digit. It governs context names the user types, and
-#   it governs which adopted names completion offers back, because those are
-#   the same question — a suggestion is only safe if we would accept it as
-#   input, and a name outside this grammar can carry shell syntax onto a
-#   Readline line.
+#   The identifier grammar (require_identifier) answers "may we create this?"
+#   It is the narrowest: letters, digits, . _ / - and a leading letter or
+#   digit. It governs context names the user types, so that a context this
+#   tool creates is one it can also install, check and uninstall by name and
+#   turn into a record and a payload by quoting alone.
 #
 #   The display alphabet (scrub, and the display field below) answers "how do
 #   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else
@@ -463,12 +461,11 @@ require_json_safe() {
 # starting with a letter or a digit. It is the rule for a context name the
 # user types — the part after signoff/, which this tool then prefixes.
 #
-# Printable ASCII was too generous. Completion feeds these names back onto a
-# Readline command line, where $(...), a backtick, a semicolon, a space or a
-# glob character is not text but an instruction: an adopted context named
-# signoff/$(printf PWNED) would arrive as a suggestion, and accepting it runs
-# the substitution. The grammar admits nothing that means anything to a
-# shell, which is what makes a suggestion safe to accept blind. A leading
+# It keeps the signoff namespace coherent: a context this tool creates is one
+# it can also install, check and uninstall by name, and one whose record and
+# JSON payload are built by quoting alone with nothing to escape. Printable
+# ASCII was too generous for that — it admitted spaces, quotes and shell
+# metacharacters that have no business in a status-check context. A leading
 # dash would be read as an option and a leading dot hides the name, so both
 # are excluded from the first character.
 #
@@ -652,47 +649,6 @@ retire_legacy_signoff() {
       remove_legacy_signoff_contexts "$branch"
       ;;
   esac
-}
-
-# Get required signoff contexts, stripping the 'signoff/' prefix. The bare
-# 'signoff' context has no display name, so it is dropped. Feeds shell
-# completion: no upgrade hint here.
-#
-# The folded key answers whether the context is in the signoff/ namespace,
-# whatever case it was spelled in. The key and the display field both begin
-# with the same eight prefix characters, so the name to offer is what follows
-# them, in its original spelling.
-#
-# One invariant governs what is offered: we suggest a context if and only if
-# we would accept it as input. Completion puts its candidate on a Readline
-# line that the user accepts with a keystroke, often without reading it, so
-# anything suggested has to be inert there — and the identifier grammar
-# already admits nothing a shell would act on. A name outside it is one this
-# tool would refuse anyway, which makes suggesting it useless as well as
-# unsafe.
-#
-# The grammar is applied to the display field rather than the raw name, which
-# costs nothing and settles the question: a name carrying anything outside
-# the display alphabet has a question mark in its display form, and a
-# question mark is not in the grammar.
-get_signoff_contexts() {
-  local branch="${1:-}" key token display name
-
-  # If branch not specified, use default branch
-  if [[ -z "$branch" ]]; then
-    branch=$(default_branch) || return 0
-  fi
-
-  fetch_required_signoff_contexts "$branch"
-
-  while IFS=$'\t' read -r key token display; do
-    if [[ "$key" == '"signoff/'* ]]; then
-      name="${display:8}"
-      if is_identifier "$name"; then
-        printf '%s\n' "$name"
-      fi
-    fi
-  done <<<"$SIGNOFF_CONTEXTS"
 }
 
 # @{upstream} is a sound stand-in for an unresolvable @{push} only in the
@@ -1476,167 +1432,6 @@ cmd_status() {
   printf "%s\n" "${all_results[@]}"
 }
 
-cmd_completion() {
-  # Check if --contexts flag is passed
-  if [[ "${1:-}" == "--contexts" ]]; then
-    shift
-    reject_extra_args "$@"
-    get_signoff_contexts
-    return
-  fi
-  reject_extra_args "$@"
-
-  cat <<'EOF'
-# bash completion for gh signoff
-
-# Replace COMPREPLY with the static words matching the typed prefix. These are
-# this tool's own commands and flags, so compgen's word splitting is exactly
-# right for them. compgen exits nonzero when nothing matches, which is an
-# answer rather than a failure — and an unguarded one aborts a caller running
-# under set -e.
-_gh_signoff_words() {
-  local cur="$1"
-  shift
-  COMPREPLY=( $(compgen -W "$*" -- "$cur") ) || COMPREPLY=()
-}
-
-# Append the required contexts to COMPREPLY, one candidate per line of
-# `gh signoff completion --contexts`. Every candidate is a grammar identifier
-# by the time it arrives — get_signoff_contexts only emits names it would
-# accept as input — so each is a single inert word with nothing to split or
-# escape.
-#
-# Even so, deliberately not compgen: it reparses its word list as shell input,
-# and reading whole lines into COMPREPLY keeps the guarantee that a candidate
-# lands verbatim rather than relying on the grammar to make compgen's word
-# splitting a no-op. The prefix test is a quoted case pattern, matching the
-# typed prefix literally.
-_gh_signoff_contexts() {
-  local cur="$1" contexts line
-  contexts=$(gh signoff completion --contexts 2>/dev/null)
-
-  while IFS= read -r line; do
-    if [[ -n "$line" ]]; then
-      case "$line" in
-        "$cur"*) COMPREPLY[${#COMPREPLY[@]}]="$line" ;;
-      esac
-    fi
-  done <<<"$contexts"
-}
-
-# The first word that is neither a global option nor its argument. -f and
-# --commit may precede the command, so COMP_WORDS[1] is not it. Stops short of
-# the word being completed: that one is what the user is still typing, not a
-# command they have settled on, and echoing it back would suppress the very
-# list they are typing towards. Empty means the cursor is at the command.
-_gh_signoff_command() {
-  local i=1
-  while [[ $i -lt $COMP_CWORD ]]; do
-    case "${COMP_WORDS[$i]}" in
-      -f)       i=$((i+1)) ;;
-      --commit) i=$((i+2)) ;;
-      *)        printf '%s\n' "${COMP_WORDS[$i]}"; return ;;
-    esac
-  done
-}
-
-_gh_signoff() {
-  local cur prev command
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-  case "$prev" in
-    signoff)
-      # The command position, and it is shared with the direct-signoff
-      # shorthand — so a dynamic context named `uninstall` would sit here
-      # beside the real uninstall command, and `gh signoff un<TAB><Enter>`
-      # would complete to bare `gh signoff uninstall`, deleting the ruleset
-      # instead of signing off. Contexts are never offered where a command
-      # could go. The cost: `gh signoff te<TAB>` no longer completes the
-      # shorthand context `tests` at the bare position — reach contexts
-      # through `create`, or after the first context is typed.
-      _gh_signoff_words "$cur" create install uninstall check status version completion -f --commit --help
-      return 0
-      ;;
-    --commit)
-      # A revision. Nothing worth guessing at.
-      return 0
-      ;;
-    -f)
-      # Right after a leading -f the next word could still be the create
-      # command, so this position is ambiguous the same way the bare command
-      # position is: offer only the unambiguous static words, never a context
-      # that might collide with a command name. Past this position, fall
-      # through to the command-aware logic below, which offers contexts once a
-      # command or a context has actually been chosen (e.g. `gh signoff linux
-      # -f <TAB>`).
-      if [[ $COMP_CWORD -eq 2 ]]; then
-        _gh_signoff_words "$cur" create --commit
-        return 0
-      fi
-      ;;
-    create)
-      _gh_signoff_words "$cur" -f --commit
-      _gh_signoff_contexts "$cur"
-      return 0
-      ;;
-    status)
-      _gh_signoff_words "$cur" --branch --commit
-      return 0
-      ;;
-    install|uninstall|check)
-      _gh_signoff_words "$cur" --branch
-      _gh_signoff_contexts "$cur"
-      return 0
-      ;;
-  esac
-
-  command=$(_gh_signoff_command)
-
-  # If we are halfway through typing an option
-  if [[ $cur == --* ]]; then
-    case "$command" in
-      install|uninstall|check)
-        _gh_signoff_words "$cur" --branch
-        ;;
-      status)
-        _gh_signoff_words "$cur" --branch --commit
-        ;;
-      *)
-        _gh_signoff_words "$cur" --commit
-        ;;
-    esac
-    return 0
-  fi
-
-  # No command yet, so the cursor is where one goes: offer the same static
-  # list as directly after `signoff`, which a leading -f or --commit would
-  # otherwise push out of reach. No contexts here either — this is a command
-  # position, and a context colliding with a command name must never be a
-  # candidate where Enter would run the command.
-  if [[ -z "$command" ]]; then
-    _gh_signoff_words "$cur" create install uninstall check status version completion -f --commit --help
-    return 0
-  fi
-
-  # For partial signoffs, suggest context names
-  if [[ $COMP_CWORD -gt 1 && "$command" != "install" &&
-        "$command" != "uninstall" && "$command" != "check" &&
-        "$command" != "status" && "$command" != "version" &&
-        "$command" != "completion" && "$command" != "--help" &&
-        "$command" != "-h" ]]; then
-    COMPREPLY=()
-    _gh_signoff_contexts "$cur"
-    return 0
-  fi
-
-  return 0
-}
-
-complete -F _gh_signoff gh-signoff
-EOF
-}
-
 cmd_version() {
   echo "gh-signoff ${VERSION}"
 }
@@ -1658,7 +1453,6 @@ COMMANDS
   check            Check if signoff is required
   status           Show signoff status for the current commit or a specific commit
   version          Show gh-signoff version
-  completion       Output shell completion code
 
 FLAGS
   -f  Force sign off (ignore uncommitted/unpushed changes)
@@ -1681,10 +1475,6 @@ EXAMPLES
   gh signoff check --branch other      # Check if signoff is required on branch
   gh signoff status                    # Show completed/pending signoff status
   gh signoff status --commit abc1234   # Show status for a specific commit
-
-COMPLETION
-  # Add to ~/.bashrc:
-  eval "$(gh signoff completion)"
 EOF
 }
 
@@ -1745,7 +1535,6 @@ case "$1" in
   "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
   "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
-  "completion")     reject_force; reject_commit; shift; cmd_completion "$@" ;;
   "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
   -*)
     # Unknown option

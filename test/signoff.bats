@@ -403,14 +403,6 @@ make_pushed_repo() {
   [[ "$output" == "${STATUS_SUCCESS} signoff"$'\n'"${STATUS_FAILURE} tests" ]] || return 1
 }
 
-@test "completion contexts come from our ruleset" {
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"},{"context":"signoff/lint"}]}}]}'
-
-  run -0 gh-signoff completion --contexts
-  [[ "$output" == "tests"$'\n'"lint" ]] || return 1
-}
-
 @test "rulesets that are not ours are never read" {
   # Exact name match: neither someone else's ruleset nor our ruleset for a
   # different branch counts for main
@@ -690,10 +682,11 @@ make_pushed_repo() {
 }
 
 @test "every command holds a typed context to the identifier grammar" {
-  # The grammar exists because completion feeds these names back onto a
-  # Readline line, where $(...), a backtick, a semicolon or a space is an
-  # instruction rather than text. install, check, uninstall and create all
-  # take a context the user typed, so all four hold it to the same rule.
+  # The grammar keeps the signoff namespace coherent: a context this tool
+  # creates is one it can install, check and uninstall by name, and one whose
+  # record and payload are built by quoting alone. install, check, uninstall
+  # and create all take a context the user typed, so all four hold it to the
+  # same rule.
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   for bad in '$(printf PWNED)' 'foo;touch /tmp/pwned' '`id`' 'foo bar' \
@@ -957,17 +950,6 @@ make_pushed_repo() {
   [[ "$output" == "${STATUS_FAILURE} signoff"$'\n'"${STATUS_FAILURE} tests" ]] || return 1
 }
 
-@test "completion offers only names the grammar would accept back" {
-  # One invariant: suggest a context if and only if we would accept it as
-  # input. Everything else here is a name install and check refuse, so
-  # offering it would be useless as well as unsafe.
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/foo bar"},{"context":"signoff/$(printf PWNED)"},{"context":"signoff/semi;colon"},{"context":"signoff/.hidden"},{"context":"signoff/ok.name"},{"context":"signoff/ok-name"},{"context":"signoff/ok_name"},{"context":"signoff/ok/name"},{"context":"signoff/Lint"}]}}]}'
-
-  run -0 gh-signoff completion --contexts
-  [[ "$output" == "ok.name"$'\n'"ok-name"$'\n'"ok_name"$'\n'"ok/name"$'\n'"Lint" ]] || return 1
-}
-
 # tojson escapes what JSON requires and nothing else, so a token still holds
 # C1 controls and format characters verbatim. U+202E RIGHT-TO-LEFT OVERRIDE
 # in an adopted context name would reorder the line it prints on — an
@@ -1054,7 +1036,7 @@ make_pushed_repo() {
 
 @test "Unicode line separators in an adopted context are shown as question marks" {
   # U+2028 and U+2029 are mandatory line breaks; outside the charset like
-  # anything else, so they neither print nor complete
+  # anything else, so they do not print
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo\u2028bar"},{"context":"signoff/baz\u2029qux"}]}}]}'
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
@@ -1064,9 +1046,6 @@ make_pushed_repo() {
   [[ "$output" != *$'\xe2\x80\xa9'* ]] || return 1
   [[ "$output" == *"${STATUS_FAILURE} foo?bar"* ]] || return 1
   [[ "$output" == *"${STATUS_FAILURE} baz?qux"* ]] || return 1
-
-  run -0 gh-signoff completion --contexts
-  [[ -z "$output" ]] || return 1
 
   run -0 gh-signoff install lint
   body=$(cat "$MOCK_BODY_LOG")
@@ -1452,23 +1431,6 @@ make_pushed_repo() {
   [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1
 }
 
-@test "completion contexts tolerate CRLF from gh on Windows" {
-  export MOCK_CRLF=1
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests", "signoff/lint"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  run -0 gh-signoff completion --contexts
-  [[ "$output" == "tests"$'\n'"lint" ]] || return 1
-}
-
-@test "completion contexts are empty when only plain signoff is required" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  run -0 gh-signoff completion --contexts
-  [[ -z "$output" ]] || return 1
-}
-
 @test "status matches signoff states by exact record, not substring" {
   # 'signoff/foosignoff/tests' succeeded, but that must not satisfy the
   # required 'signoff/tests'; likewise 'signoff/foo-signoff' must not
@@ -1532,16 +1494,6 @@ make_pushed_repo() {
 
   run -1 gh-signoff status
   [[ "$output" == "${STATUS_FAILURE} Could not get status for commit ${sha}" ]] || return 1
-}
-
-@test "completion --contexts returns signoff contexts" {
-  # Mock: Branch protection has signoff contexts
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests", "signoff/lint"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  run -0 gh-signoff completion --contexts
-  [[ "$output" == *"tests"* ]] || return 1
-  [[ "$output" == *"lint"* ]] || return 1
 }
 
 @test "direct signoff with unknown option shows help" {
@@ -1845,223 +1797,6 @@ make_pushed_repo() {
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
-# Completion tests for the leading -f grammar. Loads the generated completion
-# function and invokes it directly with a simulated command line.
-complete_words() {
-  eval "$(gh-signoff completion)"
-  COMP_WORDS=("$@" "")
-  COMP_CWORD=$#
-  COMPREPLY=()
-  _gh_signoff
-}
-
-# As complete_words, but the last argument is a partially typed word
-complete_prefix() {
-  eval "$(gh-signoff completion)"
-  COMP_WORDS=("$@")
-  COMP_CWORD=$(($# - 1))
-  COMPREPLY=()
-  _gh_signoff
-}
-
-@test "a context named like a command never completes at the command position" {
-  # The attack: a ruleset holds a context literally named `uninstall`. If the
-  # command position offered dynamic contexts, `gh signoff un<TAB><Enter>`
-  # would complete to bare `gh signoff uninstall` — which DELETES the ruleset
-  # rather than signing off. Even `signoff/uninstall/foo` leaves the shorter
-  # `uninstall` ready to run. Contexts are structurally barred from every
-  # position a command could occupy, so no context reaches this list.
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/uninstall"},{"context":"signoff/uninstall/foo"},{"context":"signoff/tests"}]}}]}'
-
-  complete_words gh-signoff
-  # The static commands are all present ...
-  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" uninstall "* ]] || return 1
-  # ... but no context is, proven by the non-colliding `tests`: if it is
-  # absent, the colliding `uninstall`-as-context is gone too
-  [[ " ${COMPREPLY[*]-} " != *" tests "* ]] || return 1
-
-  # Same at the -f command position, the other spot a command can start
-  complete_words gh-signoff -f
-  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " != *" tests "* ]] || return 1
-
-  # And where contexts ARE unambiguous they still appear: after `create`,
-  # as install/check/uninstall arguments, and after a first context
-  complete_words gh-signoff create
-  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
-
-  complete_words gh-signoff install
-  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
-
-  complete_words gh-signoff check
-  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
-
-  complete_words gh-signoff uninstall
-  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
-
-  complete_words gh-signoff tests
-  [[ " ${COMPREPLY[*]-} " == *" tests "* ]] || return 1
-}
-
-@test "completion after leading -f offers create but no context" {
-  # Right after a leading -f the next word could be the create command, so
-  # this position is as ambiguous as the bare command position: a context
-  # here could collide with a command name. create and --commit only.
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff -f
-  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" install "* ]] || return 1
-}
-
-@test "completion after -f create offers contexts only" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff -f create
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
-}
-
-@test "completion after leading -f offers --commit" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff -f
-  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
-}
-
-@test "completion after create offers -f and --commit" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff create
-  [[ " ${COMPREPLY[*]-} " == *" -f "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-}
-
-@test "completion after --commit suggests nothing" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff --commit
-  [[ ${#COMPREPLY[@]} -eq 0 ]] || return 1
-}
-
-@test "completion offers commands at the command position after a leading --commit" {
-  # The word under the cursor is what the user is typing, not a chosen command.
-  # Treating it as one skipped the command list, so `--commit HEAD st<TAB>`
-  # never offered status even though the dispatcher accepts it there.
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_prefix gh-signoff --commit HEAD st
-  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
-
-  # Nothing typed yet: this is still the command position, so commands are
-  # reachable but contexts are not — a context here could collide with one
-  complete_words gh-signoff --commit HEAD
-  [[ " ${COMPREPLY[*]-} " == *" status "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-}
-
-@test "completion finds the command past a leading --commit" {
-  # COMP_WORDS[1] here is --commit, not the command. Reading it directly would
-  # offer create's options in the middle of a status invocation.
-  complete_prefix gh-signoff --commit HEAD status --
-  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
-
-  # Same, past the command's own option, so the option-fallback branch is the
-  # one doing the lookup rather than the previous-word case
-  complete_prefix gh-signoff --commit HEAD status --branch main --
-  [[ " ${COMPREPLY[*]-} " == *" --branch "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" --commit "* ]] || return 1
-}
-
-@test "completion --contexts survives the trailing-argument guard" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff", "signoff/tests"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  # The completion function shells out to this on every tab
-  run -0 gh-signoff completion --contexts
-  [[ "$output" == *"tests"* ]] || return 1
-}
-
-@test "completion after trailing -f offers contexts without create" {
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
-  export MOCK_BRANCH_PROTECTION_EXIT=0
-
-  complete_words gh-signoff linux -f
-  [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
-  [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
-}
-
-
-# The gap that hid a HIGH for four rounds: these tests inspected COMPREPLY
-# but never asked what the shell would do with a candidate once it landed on
-# the command line. Readline inserts the candidate and Enter runs the line.
-@test "no completion candidate is shell-active on the command line" {
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/$(printf PWNED >&2)"},{"context":"signoff/foo;touch pwned"},{"context":"signoff/`id`"},{"context":"signoff/ok-name"},{"context":"signoff/Lint"}]}}]}'
-
-  complete_words gh-signoff check
-
-  # None of the shell-active names are offered
-  [[ " ${COMPREPLY[*]-} " != *'$('* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " != *';'* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " != *'`'* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " != *"PWNED"* ]] || return 1
-
-  # The real check, and an independent one: printf %q quotes anything the
-  # shell would act on, so a candidate that comes back unchanged is a single
-  # literal word on a command line. Proven without running any of them.
-  for candidate in "${COMPREPLY[@]-}"; do
-    [[ "$(printf '%q' "$candidate")" == "$candidate" ]] || return 1
-  done
-
-  # Not vacuous: the usable names did survive
-  [[ " ${COMPREPLY[*]-} " == *" ok-name "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" Lint "* ]] || return 1
-}
-
-@test "completion offers no candidate that would be read as an option" {
-  # An adopted signoff/-danger completes to -danger, which check, install,
-  # uninstall and create all reject as an unknown option. A candidate that
-  # cannot be used is worse than none, and there is no -- grammar to hide
-  # behind.
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/Lint"}]}}]}'
-
-  complete_words gh-signoff check
-  [[ "${#COMPREPLY[@]}" -eq 2 ]] || return 1
-  [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
-  [[ "${COMPREPLY[1]}" == "Lint" ]] || return 1
-
-  # At the top level no context is offered at all: it is a command position,
-  # and a context must never be a candidate where Enter would run a command
-  complete_words gh-signoff
-  [[ " ${COMPREPLY[*]-} " != *" Lint "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " != *" -danger "* ]] || return 1
-  [[ " ${COMPREPLY[*]-} " == *" uninstall "* ]] || return 1
-}
-
-@test "completion filters contexts by the typed prefix" {
-  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
-
-  complete_prefix gh-signoff check L
-  [[ "${#COMPREPLY[@]}" -eq 1 ]] || return 1
-  [[ "${COMPREPLY[0]}" == "Lint" ]] || return 1
-}
 
 
 # Leading -f dispatcher grammar tests
@@ -2149,9 +1884,6 @@ complete_prefix() {
 @test "trailing arguments are reported rather than ignored" {
   run -1 gh-signoff version --commit nope
   [[ "$output" == *"unexpected argument: --commit"* ]] || return 1
-
-  run -1 gh-signoff completion --contexts extra
-  [[ "$output" == *"unexpected argument: extra"* ]] || return 1
 }
 
 @test "--branch with no argument reports the missing argument" {

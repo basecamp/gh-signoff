@@ -58,13 +58,11 @@ Those ruleset names are reserved: gh-signoff treats a repository branch ruleset 
 
 A context name you give gh-signoff — the part after `signoff/` — must be an **identifier**: letters, digits, `.` `_` `/` `-`, starting with a letter or a digit. `tests`, `bash-3`, `build/linux` and `Lint` are all fine; `foo bar`, `-danger` and `café` are not.
 
-The grammar is narrow on purpose. Shell completion suggests these names back to you, and a suggestion is only safe to accept if the shell reads it as a plain word — a context named `$(...)` or `foo;rm -rf ~` would otherwise arrive on your command line as an instruction. So the rule is a single invariant: **gh-signoff suggests a context if and only if it would accept it as input.** The same grammar governs `install`, `check`, `uninstall` and `gh signoff <context>` alike.
-
-Completion is also careful about *where* it suggests contexts. It never offers them at a position where a command could go — the bare `gh signoff <TAB>` spot, or right after a leading `-f` — because a context named like a command (say `uninstall`) would otherwise sit there beside the real command and complete to it. The tradeoff: `gh signoff te<TAB>` won't complete the shorthand context `tests` at the bare position. Reach contexts through `gh signoff create <TAB>`, as `install`/`check`/`uninstall` arguments, or after you've typed the first one.
+The grammar is narrow on purpose. It keeps the signoff namespace coherent — a context you create is one you can also `install`, `check` and `uninstall` by exactly that name — and it keeps names free of the shell metacharacters and quoting hazards that have no place in a status-check context. The same grammar governs `install`, `check`, `uninstall` and `gh signoff <context>` alike.
 
 Two other rules sit alongside it, and they are deliberately different:
 
-- **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them, identifier or not. gh-signoff does not edit a requirement it merely adopted — it just won't suggest the odd ones back to you.
+- **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them, identifier or not. gh-signoff does not edit a requirement it merely adopted.
 - **Display is lossy.** Anything outside printable ASCII is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different names can display identically while staying entirely distinct in what they enforce. Distinguishing them on screen would mean a Unicode escaping engine written in bash, for names the tool refuses to create in the first place.
 
 Branch names are held to neither — `feature/x` and worse are legitimate refs, and a branch is named by your repository rather than by gh-signoff. They are only checked for what would break a request body, and shown through the same `?` display.
@@ -150,14 +148,6 @@ gh signoff status
 ✗ lint
 ✗ security
 ```
-
-### Bash completion
-
-```bash
-# Add to ~/.bashrc:
-eval "$(gh signoff completion)"
-```
-
 
 ## License
 The tool is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
