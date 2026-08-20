@@ -68,7 +68,7 @@ gh signoff install
 gh signoff install --branch other
 ```
 
-Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted; if you've layered other settings onto it (required reviews, other status checks, admin enforcement), it's left intact with a note to remove the now-duplicate signoff contexts yourself in repo settings.
+Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted; if you've layered other settings onto it (required reviews, other status checks, linear history, admin enforcement), those all stay — only the signoff status-check contexts are removed from it, since the ruleset enforces them now.
 
 ## Advanced usage: Partial signoff
 

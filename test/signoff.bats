@@ -494,7 +494,7 @@ make_pushed_repo() {
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
 
   # The legacy contexts carry over into the ruleset
   body=$(cat "$MOCK_BODY_LOG")
@@ -506,15 +506,22 @@ make_pushed_repo() {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff install
   [[ "$output" == *"now requires signoff"* ]] || return 1
-  [[ "$output" == *"remove them in repo settings"* ]] || return 1
-  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
+  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
-  [[ "$calls" != *"DELETE "* ]] || return 1
+  # No wholesale protection delete: only the signoff contexts are removed,
+  # surgically, leaving other-ci and every other setting in place
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" != *"other-ci"* ]] || return 1
 }
 
 @test "install treats admin-enforced protection as not ours to delete" {
@@ -525,10 +532,108 @@ make_pushed_repo() {
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -0 gh-signoff install
-  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
-  [[ "$calls" != *"DELETE "* ]] || return 1
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+}
+
+@test "install preserves protection features old installs never wrote" {
+  # The classifier must read any enabled protection flag — linear history,
+  # signatures, whatever GitHub adds next — as someone else's configuration,
+  # never as signoff-shaped
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]},"enforce_admins":{"enabled":false},"required_linear_history":{"enabled":true}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
+  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+}
+
+@test "install migrates only exactly-named signoff contexts" {
+  # signoff-security is a foreign context that happens to share the prefix:
+  # it keeps the protection classified as not ours, never lands in the
+  # ruleset, and is never removed from the protection
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff-security","signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" != *"signoff-security"* ]] || return 1
+}
+
+@test "reads do not claim foreign signoff-prefixed contexts" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff-security"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  # Exact output: no requirement found, and no upgrade hint either, because
+  # the foreign context is not legacy signoff enforcement
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "reads tolerate an indeterminate legacy protection read" {
+  export MOCK_BRANCH_PROTECTION_EXIT=1
+  export MOCK_BRANCH_PROTECTION_ERROR_STATUS=500
+
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "writers fail on an indeterminate legacy protection read" {
+  # A 403/500/timeout is not "no protection": acting on it could migrate
+  # from or delete protection the writer never actually saw
+  export MOCK_BRANCH_PROTECTION_EXIT=1
+  export MOCK_BRANCH_PROTECTION_ERROR_STATUS=500
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff install
+  [[ "$output" == *"failed to read branch protection"* ]] || return 1
+
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"failed to read branch protection"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"POST "* && "$calls" != *"PUT "* && "$calls" != *"DELETE "* ]] || return 1
+}
+
+@test "writers fail when the default branch cannot be resolved" {
+  # Ruleset identity hinges on whether the branch is the default; guessing
+  # would create 'signoff (main)' alongside 'signoff' on a transient failure
+  export MOCK_DEFAULT_BRANCH_EXIT=1
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff install --branch main tests
+  [[ "$output" == *"failed to get default branch"* ]] || return 1
+
+  run -1 gh-signoff uninstall --branch main tests
+  [[ "$output" == *"failed to get default branch"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"POST "* && "$calls" != *"PUT "* && "$calls" != *"DELETE "* ]] || return 1
+}
+
+@test "ruleset listing excludes parent and non-branch rulesets" {
+  # An org policy or tag ruleset that happens to be named 'signoff' is
+  # another tenant's artifact; the query keeps them out server-side
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff check
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"GET repos/:owner/:repo/rulesets?includes_parents=false&targets=branch"* ]] || return 1
 }
 
 @test "install --branch other targets a branch-named ruleset" {
@@ -597,7 +702,7 @@ make_pushed_repo() {
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ "$calls" == *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
 }
 
 @test "uninstall fails when nothing is installed" {
@@ -605,19 +710,70 @@ make_pushed_repo() {
   [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
 }
 
-@test "uninstall leaves non-signoff protection intact" {
+@test "bare uninstall removes signoff contexts from mixed legacy protection" {
+  # The protection keeps other-ci and all its other settings; only the
+  # signoff contexts are removed, so uninstall's claim is actually true
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff","signoff/tests"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff uninstall
   [[ "$output" == *"no longer requires signoff"* ]] || return 1
-  [[ "$output" == *"remove them in repo settings"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ "$calls" == *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
-  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'["signoff","signoff/tests"]'* ]] || return 1
+  [[ "$body" != *"other-ci"* ]] || return 1
+}
+
+@test "contextual uninstall removes contexts from mixed legacy protection" {
+  # The requested context lives only in mixed legacy protection: it must
+  # actually stop being enforced, not survive behind a success message
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  # Nothing remains, so no ruleset gets created or updated
+  [[ "$calls" != *"POST "* && "$calls" != *"PUT "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'["signoff/tests"]'* ]] || return 1
+}
+
+@test "uninstall fails when legacy protection cannot be deleted" {
+  # Reporting the requirement removed while legacy protection still enforces
+  # it would be a lie; rerunning uninstall retries idempotently
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_DELETE_PROTECTION_EXIT=1
+
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"failed to remove signoff from legacy branch protection"* ]] || return 1
+  [[ "$output" != *"no longer requires signoff"* ]] || return 1
+}
+
+@test "contextual uninstall fails when legacy contexts cannot be removed" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_DELETE_PROTECTION_CONTEXTS_EXIT=1
+
+  run -1 gh-signoff uninstall tests
+  [[ "$output" == *"failed to remove signoff from legacy branch protection"* ]] || return 1
+  [[ "$output" != *"no longer requires signoff"* ]] || return 1
 }
 
 @test "contextual uninstall keeps the remaining contexts" {
@@ -653,7 +809,7 @@ make_pushed_repo() {
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
 
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'{"context":"signoff"}'* ]] || return 1

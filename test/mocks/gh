@@ -19,8 +19,10 @@ fi
 : ${MOCK_COMMIT_STATUS_JSON:='{"statuses":[]}'}
 : ${MOCK_COMMIT_STATUS_EXIT:=0}
 
-: ${MOCK_BRANCH_PROTECTION_JSON:=''} # Empty means no protection found
-: ${MOCK_BRANCH_PROTECTION_EXIT:=1}  # Default to exit 1 (like 404 Not Found)
+: ${MOCK_BRANCH_PROTECTION_JSON:=''}         # Empty means no protection found
+: ${MOCK_BRANCH_PROTECTION_EXIT:=1}          # Default to exit 1 (like 404 Not Found)
+: ${MOCK_BRANCH_PROTECTION_ERROR_STATUS:=404} # HTTP status the error body reports
+: ${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:=0} # Remove-status-check-contexts call
 
 : ${MOCK_POST_STATUS_EXIT:=0}
 : ${MOCK_PUT_PROTECTION_EXIT:=0}
@@ -130,9 +132,11 @@ emit() {
 }
 
 # gh prints the API error body to stdout and exits nonzero, so callers have to
-# reset their capture rather than treat the body as a response
+# reset their capture rather than treat the body as a response. The optional
+# second argument sets the HTTP status the body reports (default 404), for
+# callers that distinguish a confirmed 404 from other failures.
 emit_error() {
-  echo "{\"message\":\"$1\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"404\"}"
+  echo "{\"message\":\"$1\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"${2:-404}\"}"
 }
 
 # --- Determine Response Based on API Call ---
@@ -167,7 +171,9 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]];
   if [[ "$MOCK_BRANCH_PROTECTION_EXIT" -eq 0 ]]; then
     emit "$MOCK_BRANCH_PROTECTION_JSON"
   else
-    emit_error "Branch not protected"
+    # Status configurable so tests can present a non-404 failure, which
+    # writers must treat differently from "no protection"
+    emit_error "Branch not protected" "${MOCK_BRANCH_PROTECTION_ERROR_STATUS:-404}"
   fi
   exit "$MOCK_BRANCH_PROTECTION_EXIT"
 
@@ -186,6 +192,15 @@ elif [[ "$api_method" == "PUT" && "$api_path" == *"branches/"*"/protection"* ]];
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Branch Protection" >&2
   exit "$MOCK_PUT_PROTECTION_EXIT"
 
+# Remove Status Check Contexts Call (DELETE) — before the whole-protection
+# DELETE glob, which would otherwise swallow this path
+elif [[ "$api_method" == "DELETE" && "$api_path" == *"/protection/required_status_checks/contexts" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Protection Contexts" >&2
+  if [[ "${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:-0}" -ne 0 ]]; then
+    emit_error "Validation Failed" "422"
+  fi
+  exit "${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:-0}"
+
 # Delete Branch Protection Call (DELETE)
 elif [[ "$api_method" == "DELETE" && "$api_path" == *"branches/"*"/protection"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Branch Protection" >&2
@@ -201,8 +216,8 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"/rulesets/"* ]]; then
   fi
   exit "$MOCK_RULESET_EXIT"
 
-# Rulesets List Call (GET)
-elif [[ "$api_method" == "GET" && "$api_path" == *"/rulesets" ]]; then
+# Rulesets List Call (GET) — with or without query parameters
+elif [[ "$api_method" == "GET" && ("$api_path" == *"/rulesets" || "$api_path" == *"/rulesets?"*) ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Rulesets List" >&2
   if [[ "$MOCK_RULESETS_LIST_EXIT" -eq 0 ]]; then
     emit "$MOCK_RULESETS_LIST_JSON"

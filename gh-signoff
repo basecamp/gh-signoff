@@ -121,6 +121,16 @@ default_branch() {
   echo "$DEFAULT_BRANCH"
 }
 
+# Populate the DEFAULT_BRANCH cache in this shell, or die. A
+# $(default_branch) capture caches only inside its subshell, so ruleset
+# identity — which hinges on whether the branch is the default — would
+# re-resolve per call and could flip mid-command on a transient API failure,
+# misnaming the ruleset. Writers call this up front and fail rather than
+# guess; readers warm the cache tolerantly and degrade to "none found".
+require_default_branch() {
+  default_branch >/dev/null || fail "failed to get default branch"
+}
+
 # --- Rulesets ---
 #
 # Signoff requirements live in a repository ruleset that this extension owns
@@ -174,14 +184,23 @@ signoff_ruleset_ref() {
 # Find our ruleset by its deterministic name, reporting via SIGNOFF_RULESET_ID
 # (empty = none). The list endpoint answers 200 [] when no rulesets exist, so
 # "none" is an empty id, not an error; nonzero means the API call itself
-# failed, which writers treat as fatal and readers as "none". If two rulesets
-# somehow share our name, first match wins and only that one is ever touched.
+# failed, which writers treat as fatal and readers as "none".
+#
+# includes_parents=false keeps org-level rulesets out: the list includes them
+# by default, and an org policy that happens to be named "signoff" is another
+# tenant's artifact, not ours to read or write. targets=branch likewise
+# excludes tag and push rulesets. Within this repo's branch rulesets, though,
+# the name IS the identity claim: a repo admin who creates a ruleset named
+# exactly "signoff" is claiming signoff semantics, and install adopting it
+# (union its contexts, normalize its shape) is the intended behavior, not a
+# collision to defend against. If two somehow share the name, first match
+# wins and only that one is ever touched.
 find_signoff_ruleset_id() {
   local branch="$1" name rows id rname
   SIGNOFF_RULESET_ID=""
 
   name=$(signoff_ruleset_name "$branch")
-  rows=$(gh api "repos/:owner/:repo/rulesets" --paginate \
+  rows=$(gh api "repos/:owner/:repo/rulesets?includes_parents=false&targets=branch" --paginate \
     --jq '.[] | [.id, .name] | @tsv' 2>/dev/null) || return 1
   rows=${rows//$'\r'/}
 
@@ -205,11 +224,13 @@ signoff_ruleset_contexts() {
 }
 
 # The branch's legacy signoff contexts, one per line on stdout. A 404 (no
-# protection) reads as empty, matching the old unprotected signal.
+# protection) reads as empty, matching the old unprotected signal. Exactly
+# 'signoff' or 'signoff/…' — the only names this tool has ever written — so a
+# foreign context like 'signoff-security' is never claimed as ours.
 legacy_signoff_contexts() {
   local branch="$1" contexts
   contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(startswith("signoff"))' \
+    --jq '.required_status_checks.contexts[]? | select(. == "signoff" or startswith("signoff/"))' \
     2>/dev/null) || contexts=""
   echo "${contexts//$'\r'/}"
 }
@@ -239,6 +260,11 @@ fetch_required_signoff_contexts() {
   local branch="$1" ruleset_contexts legacy ctx
   SIGNOFF_CONTEXTS=""
   SIGNOFF_LEGACY_PRESENT=false
+
+  # Warm the default-branch cache in this shell so the identity lookups below
+  # resolve consistently and without refetching; when it's unavailable, the
+  # ruleset simply won't be found, matching how reads treat API failures
+  default_branch >/dev/null 2>&1 || true
 
   ruleset_contexts=""
   if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
@@ -332,21 +358,37 @@ delete_signoff_ruleset() {
 }
 
 # Classify the branch's legacy branch protection via LEGACY_PROTECTION:
-#   none    — no protection (the API 404s)
-#   signoff — exactly what old gh-signoff install wrote (only signoff*
-#             contexts, strict false, admins unenforced, no reviews, no
-#             restrictions), safe to delete wholesale
-#   other   — someone else's configuration, left intact
-# LEGACY_SIGNOFF_CONTEXTS collects the signoff* contexts either way. One API
+#   none    — confirmed no protection (the API 404s)
+#   signoff — exactly what old gh-signoff install wrote (only signoff
+#             contexts, strict false, no reviews, no restrictions, and no
+#             enabled flag anywhere — old installs left enforce_admins,
+#             linear history, signatures, and every other {enabled} toggle
+#             at their false defaults), safe to delete wholesale
+#   other   — someone else's configuration, never deleted wholesale
+# LEGACY_SIGNOFF_CONTEXTS collects the signoff contexts either way. One API
 # call: the first line summarizes the shape, the rest are the contexts.
+#
+# The enabled-flag sweep is recursive ([.. | objects]) rather than a field
+# list, so a protection feature GitHub adds later reads as "other" instead of
+# silently passing as ours.
+#
+# Nonzero only on a non-404 failure: "no protection" is an answer, but a
+# 403/500/timeout is not, and a writer acting on it could migrate from or
+# delete protection it never actually saw. gh prints the API error body to
+# stdout, so the captured response distinguishes the two.
 legacy_protection_disposition() {
-  local branch="$1" response summary non_signoff strict admins reviews restrictions
+  local branch="$1" response summary non_signoff strict flags reviews restrictions
   LEGACY_PROTECTION="none"
   LEGACY_SIGNOFF_CONTEXTS=""
 
   response=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '([([.required_status_checks.contexts[]? | select(startswith("signoff") | not)] | length), (.required_status_checks.strict // false), (.enforce_admins.enabled // false), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (.required_status_checks.contexts[]? | select(startswith("signoff")))' \
-    2>/dev/null) || return 0
+    --jq '([([.required_status_checks.contexts[]? | select((. == "signoff" or startswith("signoff/")) | not)] | length), (.required_status_checks.strict // false), ([.. | objects | select(has("enabled")) | .enabled] | any), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (.required_status_checks.contexts[]? | select(. == "signoff" or startswith("signoff/")))' \
+    2>/dev/null) || {
+    if [[ "$response" == *'"status":"404"'* ]]; then
+      return 0
+    fi
+    return 1
+  }
   response=${response//$'\r'/}
 
   summary="${response%%$'\n'*}"
@@ -354,8 +396,8 @@ legacy_protection_disposition() {
     LEGACY_SIGNOFF_CONTEXTS="${response#*$'\n'}"
   fi
 
-  IFS=$'\t' read -r non_signoff strict admins reviews restrictions <<<"$summary"
-  if [[ "$non_signoff" == "0" && "$strict" == "false" && "$admins" == "false" &&
+  IFS=$'\t' read -r non_signoff strict flags reviews restrictions <<<"$summary"
+  if [[ "$non_signoff" == "0" && "$strict" == "false" && "$flags" == "false" &&
     "$reviews" == "false" && "$restrictions" == "false" ]]; then
     LEGACY_PROTECTION="signoff"
   else
@@ -363,29 +405,49 @@ legacy_protection_disposition() {
   fi
 }
 
-# Remove legacy branch protection. Warn rather than fail: the ruleset is
-# already in place, so a failed cleanup leaves a harmless duplicate
-# requirement, not a gap.
-delete_legacy_protection() {
-  local branch="$1"
-  gh api --method DELETE "repos/:owner/:repo/branches/${branch}/protection" >/dev/null 2>&1 ||
-    echo "Warning: could not remove legacy branch protection on ${branch}; remove it in repo settings" >&2
+# Surgically remove LEGACY_SIGNOFF_CONTEXTS from the branch's protection via
+# the remove-status-check-contexts endpoint, leaving every other protection
+# setting untouched. Nonzero when they could not be removed.
+remove_legacy_signoff_contexts() {
+  local branch="$1" json="" ctx response
+
+  while read -r ctx; do
+    [[ -n "$ctx" ]] || continue
+    # These came back from the API, but serialize defensively: a context this
+    # tool would refuse to install can't be removed by this JSON either
+    case "$ctx" in
+      *[\"\\]* | *$'\t'*) return 1 ;;
+    esac
+    json="${json:+$json,}\"${ctx}\""
+  done <<<"$LEGACY_SIGNOFF_CONTEXTS"
+  [[ -n "$json" ]] || return 0
+
+  response=$(printf '[%s]' "$json" | gh api \
+    "repos/:owner/:repo/branches/${branch}/protection/required_status_checks/contexts" \
+    --method DELETE \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --input - 2>/dev/null) || {
+    if [[ -n "$response" ]]; then echo "$response" >&2; fi
+    return 1
+  }
 }
 
-# After a ruleset write or delete, retire what legacy protection required:
-# signoff-shaped protection is wholly ours and goes away; anything else is
-# someone's deliberate configuration and only gets its stray signoff
-# contexts flagged.
-cleanup_legacy_protection() {
+# Retire what legacy protection required for signoff: signoff-shaped
+# protection is wholly ours and is deleted; protection carrying anything
+# else keeps every other setting, with only the signoff contexts surgically
+# removed. Nonzero when any of that failed — install may shrug it off (the
+# ruleset already enforces the contexts, so a leftover is a harmless
+# duplicate), but uninstall must fail rather than report signoff removed
+# while legacy protection still enforces it.
+retire_legacy_signoff() {
   local branch="$1"
   case "$LEGACY_PROTECTION" in
     signoff)
-      delete_legacy_protection "$branch"
+      gh api --method DELETE "repos/:owner/:repo/branches/${branch}/protection" >/dev/null 2>&1
       ;;
     other)
-      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
-        echo "Warning: branch protection on ${branch} still requires signoff contexts alongside other settings; remove them in repo settings" >&2
-      fi
+      remove_legacy_signoff_contexts "$branch"
       ;;
   esac
 }
@@ -724,10 +786,12 @@ cmd_install() {
     esac
   done
 
-  # If branch not specified, use default branch
+  # Ruleset identity hinges on whether the branch is the default, so resolve
+  # the default branch in this shell before deriving anything from it — even
+  # when --branch was given
+  require_default_branch
   if [[ -z "$branch" ]]; then
-    branch=$(default_branch) ||
-      fail "failed to get default branch"
+    branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
@@ -756,7 +820,9 @@ cmd_install() {
       fail "failed to read signoff ruleset"
   fi
 
-  legacy_protection_disposition "$branch"
+  # Fatal on an indeterminate read: migrating from protection we never
+  # actually saw could drop its contexts from the union
+  legacy_protection_disposition "$branch" || fail "failed to read branch protection"
 
   # Additive union: what our ruleset already requires, what legacy protection
   # still requires, and what this invocation asks for
@@ -786,11 +852,17 @@ cmd_install() {
     done
   fi
 
-  # The ruleset now carries every legacy signoff context, so signoff-shaped
-  # protection is redundant and gets retired
-  cleanup_legacy_protection "$branch"
-  if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
-    echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+  # The ruleset now carries every legacy signoff context, so their legacy
+  # enforcement is redundant and gets retired. Warn rather than fail on a
+  # cleanup error: enforcement already moved, a leftover is a duplicate.
+  if retire_legacy_signoff "$branch"; then
+    if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+      echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+    elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+      echo "${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
+    fi
+  else
+    echo "Warning: could not remove signoff from legacy branch protection on ${branch}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
   fi
 }
 
@@ -826,8 +898,11 @@ cmd_uninstall() {
     esac
   done
 
+  # As in install: ruleset identity needs the default branch known, even when
+  # --branch was given
+  require_default_branch
   if [[ -z "$branch" ]]; then
-    branch=$(default_branch) || fail "failed to get default branch"
+    branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
@@ -841,9 +916,12 @@ cmd_uninstall() {
   # As in install: acting on a listing that failed could orphan or duplicate
   # the ruleset, so bail instead
   find_signoff_ruleset_id "$branch" || fail "failed to list rulesets"
-  legacy_protection_disposition "$branch"
 
-  local migrated=false
+  # Fatal on an indeterminate read: "removed" claims below hinge on knowing
+  # what legacy protection enforces, and a 403/500 is not "nothing"
+  legacy_protection_disposition "$branch" || fail "failed to read branch protection"
+
+  local migration_note=""
 
   if $bare; then
     local removed=false
@@ -852,10 +930,14 @@ cmd_uninstall() {
       delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
       removed=true
     fi
-    if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+    if [[ "$LEGACY_PROTECTION" == "signoff" || -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
       removed=true
     fi
-    cleanup_legacy_protection "$branch"
+    # Unlike install, a failed legacy cleanup here is fatal: reporting the
+    # requirement removed while legacy protection still enforces it would be
+    # a lie, and rerunning uninstall retries idempotently
+    retire_legacy_signoff "$branch" ||
+      fail "failed to remove signoff from legacy branch protection on ${branch}"
     $removed || fail "no signoff requirement installed on ${branch}"
   else
     # Everything currently required, from our ruleset and legacy protection
@@ -892,14 +974,19 @@ cmd_uninstall() {
       debug "keeping ${#keep[@]} signoff contexts on branch: ${branch}"
       write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${keep[@]}"
       if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
-        migrated=true
+        migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+      elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+        migration_note="${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
       fi
     elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
       # The last context is going away: no empty ruleset left behind
       debug "deleting signoff ruleset ${SIGNOFF_RULESET_ID} for branch: ${branch}"
       delete_signoff_ruleset "$SIGNOFF_RULESET_ID"
     fi
-    cleanup_legacy_protection "$branch"
+    # Fatal, as in the bare case: the contexts just uninstalled may live in
+    # legacy protection too, and a failed removal there keeps enforcing them
+    retire_legacy_signoff "$branch" ||
+      fail "failed to remove signoff from legacy branch protection on ${branch}"
   fi
 
   # Output success messages
@@ -915,8 +1002,8 @@ cmd_uninstall() {
     done
   fi
 
-  if $migrated; then
-    echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+  if [[ -n "$migration_note" ]]; then
+    echo "$migration_note"
   fi
 }
 
