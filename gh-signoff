@@ -138,7 +138,10 @@ require_default_branch() {
 # newline-delimited shell variables. Carrying the raw name in that stream is
 # what made two separate bugs possible, so contexts travel as records instead:
 #
-#     folded_key <TAB> json_token
+#     folded_key <TAB> json_token <TAB> display
+#
+# Three fields because the name is asked three different questions, and one
+# spelling cannot answer all of them.
 #
 # json_token is the name as a JSON string literal, produced jq-side by
 # tojson. A newline inside a context name arrives as the two characters \n,
@@ -153,17 +156,33 @@ require_default_branch() {
 # GitHub documents contexts as case-insensitive identifiers, so signoff/Tests
 # and signoff/tests are one requirement; comparing folded keys makes that true
 # everywhere at once, while the token keeps the original spelling for anything
-# sent back or displayed.
+# sent back.
+#
+# display is the raw name with every control and format character — Unicode
+# categories Cc and Cf — replaced by U+FFFD (the � below). This is the only
+# field that reaches a terminal. tojson escapes what JSON requires and no
+# more, so a token still carries C1 controls and format characters verbatim,
+# and U+202E RIGHT-TO-LEFT OVERRIDE in an adopted context name would reorder
+# the line it is printed on: an adopted requirement could be made to read as
+# a different one. Replacing them shows that something is there without
+# letting it act. Tab and newline are Cc too, so the display field is
+# incapable of forging a record either, and an ordinary name is simply
+# itself.
 #
 # Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
 #
-# Bash composes tokens in exactly one place — contexts named on the command
+# Bash composes records in exactly one place — contexts named on the command
 # line — and require_json_safe has already refused the characters JSON would
 # have to escape, so wrapping the name in quotes is all the serialization it
-# needs. It folds with tr, because Bash 3 has no ${var,,}. It never unescapes
-# a token: nothing downstream wants the raw bytes back, and a half-written
-# unescaper would hand this class of bug straight back.
-CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)"'
+# needs. It folds with tr, because Bash 3 has no ${var,,}. Its display field
+# is the argument as typed: require_json_safe does not refuse C1 or format
+# characters, but this path only ever echoes the user's own argument back to
+# them in the same terminal they typed it into. What a repo admin put in a
+# ruleset is the untrusted input, and that always arrives through jq.
+#
+# Bash never unescapes a token: nothing downstream wants the raw bytes back,
+# and a half-written unescaper would hand this class of bug straight back.
+CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[\\p{Cc}\\p{Cf}]"; "�"))"'
 
 # LC_ALL=C so the fold is exactly A-Z, matching jq's ascii_downcase. Left to
 # the ambient locale, tr's [:upper:] can take in a single-byte locale's
@@ -175,16 +194,7 @@ context_key() {
 }
 
 context_record() {
-  printf '%s\t"%s"' "$(context_key "$1")" "$1"
-}
-
-# A token's display form: the JSON literal without its quotes. Ordinary names
-# print as themselves; a strange one prints escaped, which is unambiguous and,
-# for compgen and the status listing alike, still exactly one line.
-context_display() {
-  local token="$1"
-  token=${token#\"}
-  printf '%s' "${token%\"}"
+  printf '%s\t"%s"\t%s' "$(context_key "$1")" "$1" "$1"
 }
 
 # --- Rulesets ---
@@ -336,13 +346,13 @@ legacy_signoff_contexts() {
 # against a parallel list of the keys already taken; Bash 3 has no
 # associative arrays.
 merge_contexts() {
-  local list key token seen=""
+  local list key token display seen=""
   MERGED_CONTEXTS=""
   for list in "$@"; do
-    while IFS=$'\t' read -r key token; do
+    while IFS=$'\t' read -r key token display; do
       [[ -n "$key" ]] || continue
       if [[ $'\n'"$seen"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
-        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}${key}"$'\t'"${token}"
+        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
         seen="${seen:+$seen$'\n'}$key"
       fi
     done <<<"$list"
@@ -525,9 +535,9 @@ legacy_protection_disposition() {
 # endpoint matches contexts case-insensitively is undocumented, and asking it
 # to remove a spelling nobody configured is a question worth not asking.
 remove_legacy_signoff_contexts() {
-  local branch="$1" json="" key token response
+  local branch="$1" json="" key token display response
 
-  while IFS=$'\t' read -r key token; do
+  while IFS=$'\t' read -r key token display; do
     [[ -n "$token" ]] || continue
     json="${json:+$json,}${token}"
   done <<<"$LEGACY_SIGNOFF_CONTEXTS"
@@ -568,17 +578,22 @@ retire_legacy_signoff() {
 # upgrade hint here.
 #
 # The folded key answers whether the context is in the signoff/ namespace,
-# whatever case it was spelled in, and the token supplies the display form.
-# Both start with a quote and the same eight prefix characters, so the name
-# to offer is what follows them, in its original spelling.
+# whatever case it was spelled in. The key and the display field both begin
+# with the same eight prefix characters, so the name to offer is what follows
+# them, in its original spelling.
 #
-# A display form carrying a backslash is dropped rather than offered. It is
-# an escape sequence standing in for a character the name really holds, and
-# completing it would type a name back that create and install would refuse —
-# a candidate that cannot be used is worse than no candidate. Names with
-# spaces are offered as they are; the completion function keeps them whole.
+# A candidate is only worth offering if it could be typed back as an
+# argument, and one comparison settles that: the display field equals the
+# token without its quotes exactly when tojson escaped nothing (no quote,
+# backslash or C0 control) and the sanitizer replaced nothing (no C1 control
+# or format character). Any other name is one create and install would refuse
+# — completing it would hand the user an argument that cannot work. A name
+# holding a literal U+FFFD compares equal and is offered, which is right: it
+# is a perfectly typeable name. Leading dashes are refused separately, since
+# every command reads those as options. Names with spaces are offered as they
+# are; the completion function keeps them whole.
 get_signoff_contexts() {
-  local branch="${1:-}" key token display
+  local branch="${1:-}" key token display typed
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
@@ -587,14 +602,13 @@ get_signoff_contexts() {
 
   fetch_required_signoff_contexts "$branch"
 
-  while IFS=$'\t' read -r key token; do
+  while IFS=$'\t' read -r key token display; do
     if [[ "$key" == '"signoff/'* ]]; then
-      display=$(context_display "$token")
-      display="${display:8}"
-      case "$display" in
-        *\\*) ;;
-        *) printf '%s\n' "$display" ;;
-      esac
+      typed=${token#\"}
+      typed=${typed%\"}
+      if [[ "$display" == "$typed" && "${display:8}" != -* ]]; then
+        printf '%s\n' "${display:8}"
+      fi
     fi
   done <<<"$SIGNOFF_CONTEXTS"
 }
@@ -959,8 +973,8 @@ cmd_install() {
   # still requires, and what this invocation asks for
   merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS" "$requested"
 
-  local union=() key token
-  while IFS=$'\t' read -r key token; do
+  local union=() key token display
+  while IFS=$'\t' read -r key token display; do
     if [[ -n "$token" ]]; then
       union+=("$token")
     fi
@@ -1092,15 +1106,15 @@ cmd_uninstall() {
 
     # Subtract by folded key: signoff/Tests is the tests requirement as far
     # as GitHub is concerned, so `uninstall tests` has to remove it
-    local requested="" remaining="" context key token
+    local requested="" remaining="" context key token display
     for context in "${contexts[@]}"; do
       requested="${requested:+$requested$'\n'}$(context_key "signoff/${context}")"
     done
 
-    while IFS=$'\t' read -r key token; do
+    while IFS=$'\t' read -r key token display; do
       [[ -n "$key" ]] || continue
       if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
-        remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"
+        remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
       fi
     done <<<"$available"
 
@@ -1108,7 +1122,7 @@ cmd_uninstall() {
       # Write the remainder — creating the ruleset when the contexts lived
       # only in legacy protection, so contextual uninstall migrates too
       local keep=()
-      while IFS=$'\t' read -r key token; do
+      while IFS=$'\t' read -r key token display; do
         keep+=("$token")
       done <<<"$remaining"
       debug "keeping ${#keep[@]} signoff contexts on branch: ${branch}"
@@ -1311,11 +1325,11 @@ cmd_status() {
     legacy_upgrade_hint
   fi
 
-  local key token
-  while IFS=$'\t' read -r key token; do
+  local key token display
+  while IFS=$'\t' read -r key token display; do
     # Skip empty or default signoff, however spelled: already included
     [[ -z "$key" || "$key" == '"signoff"' ]] && continue
-    required+=("${key}"$'\t'"${token}")
+    required+=("${key}"$'\t'"${token}"$'\t'"${display}")
   done <<< "$SIGNOFF_CONTEXTS"
 
   # Map contexts to states as newline-delimited "key=state" records.
@@ -1324,7 +1338,7 @@ cmd_status() {
   # would let 'signoff/foo-signoff=success' satisfy a lookup for plain
   # 'signoff=success' by substring.
   local context_map="" state found req
-  while IFS=$'\t' read -r key token state; do
+  while IFS=$'\t' read -r key token display state; do
     [[ -z "$key" ]] && continue
     context_map="${context_map}${key}=${state}"$'\n'
 
@@ -1333,15 +1347,17 @@ cmd_status() {
     for req in "${required[@]}"; do
       [[ "${req%%$'\t'*}" == "$key" ]] && { found=true; break; }
     done
-    $found || required+=("${key}"$'\t'"${token}")
+    $found || required+=("${key}"$'\t'"${token}"$'\t'"${display}")
   done <<< "$statuses"
 
-  # Generate status output for all contexts (required + actual)
+  # Generate status output for all contexts (required + actual). What prints
+  # is the record's display field: the name with control and format
+  # characters replaced by U+FFFD, so an adopted context cannot reorder or
+  # repaint the line it appears on.
   local all_results=() display_name
   for req in "${required[@]}"; do
     key="${req%%$'\t'*}"
-    token="${req#*$'\t'}"
-    display_name=$(context_display "$token")
+    display_name="${req##*$'\t'}"
     [[ "$key" == '"signoff/'* ]] && display_name="${display_name:8}"
 
     # Check if we have a successful status for this context: whole-record

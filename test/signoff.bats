@@ -917,14 +917,50 @@ make_pushed_repo() {
 }
 
 @test "completion omits contexts that could not be typed back" {
-  # A display form with a backslash is an escape standing in for a character
-  # the name really holds; completing it would type back a name create and
-  # install refuse. One line each for the rest, spelling intact.
+  # Offer a candidate only if it could be typed back as an argument: an
+  # escaped name (we\nird), a name holding a format character, and one
+  # starting with a dash are all names create and install would refuse.
+  # One line each for the rest, spelling intact.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
 
   run -0 gh-signoff completion --contexts
   [[ "$output" == "foo bar"$'\n'"Lint" ]] || return 1
+}
+
+# tojson escapes what JSON requires and nothing else, so a token still holds
+# C1 controls and format characters verbatim. U+202E RIGHT-TO-LEFT OVERRIDE
+# in an adopted context name would reorder the line it prints on — an
+# adopted requirement made to read as a different one. The display field
+# replaces those; the token, and so the payload, keeps them.
+@test "status replaces control and format characters rather than printing them" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/ev\u202eil"},{"context":"signoff/c1\u009bhere"}]}}]}'
+
+  run -0 gh-signoff status
+  # Something is visibly there ...
+  [[ "$output" == *$'\xef\xbf\xbd'* ]] || return 1
+  # ... but neither the override nor the C1 control reaches the terminal
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$output" != *$'\xc2\x9b'* ]] || return 1
+  # and the rest of the name is intact, prefix stripped as usual
+  [[ "$output" == *"${STATUS_FAILURE} ev"* ]] || return 1
+  [[ "$output" == *"il"* ]] || return 1
+}
+
+@test "sanitizing for display never reaches the payload" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/ev\u202eil"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  # The union writes the name back exactly as GitHub spelled it
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$body" != *$'\xef\xbf\xbd'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
 @test "uninstall subtracts a context whose spelling differs in case" {
@@ -1790,6 +1826,25 @@ complete_prefix() {
   [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
   [[ "${COMPREPLY[1]}" == "foo bar" ]] || return 1
   [[ "${COMPREPLY[2]}" == "Lint" ]] || return 1
+}
+
+@test "completion offers no candidate that would be read as an option" {
+  # An adopted signoff/-danger completes to -danger, which check, install,
+  # uninstall and create all reject as an unknown option. A candidate that
+  # cannot be used is worse than none, and there is no -- grammar to hide
+  # behind.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/-danger"},{"context":"signoff/ev\u202eil"},{"context":"signoff/Lint"}]}}]}'
+
+  complete_words gh-signoff check
+  [[ "${#COMPREPLY[@]}" -eq 2 ]] || return 1
+  [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
+  [[ "${COMPREPLY[1]}" == "Lint" ]] || return 1
+
+  # And the same at the top level, where contexts share the list with commands
+  complete_words gh-signoff
+  [[ " ${COMPREPLY[*]-} " == *" Lint "* ]] || return 1
+  [[ " ${COMPREPLY[*]-} " != *" -danger "* ]] || return 1
 }
 
 @test "completion filters contexts by the typed prefix" {

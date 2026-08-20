@@ -54,6 +54,8 @@ gh signoff install
 
 Those ruleset names are reserved: gh-signoff treats a repository branch ruleset named `signoff` or `signoff (<branch>)` as its own, so install will normalize its shape and uninstall will delete it.
 
+Contexts already in that ruleset are carried along untouched, whatever they are named. Names are written back exactly as GitHub spells them, but when one is *shown* to you, control and format characters in it are replaced with `�` — a context name is not allowed to reorder or repaint the line it appears on. Completion only offers names you could type back as an argument, so a context whose name needs escaping, or that starts with a dash, is left out of the suggestions.
+
 Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
 
 ```bash
