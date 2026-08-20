@@ -49,6 +49,8 @@ fi
 api_method="GET" # Default method
 api_path=""
 jq_filter=""
+input_src=""
+request_body=""
 
 # Simple argument parsing loop
 while [[ $# -gt 0 ]]; do
@@ -64,11 +66,18 @@ while [[ $# -gt 0 ]]; do
       jq_filter="$2"
       shift 2
       ;;
+    --input)
+      input_src="$2"
+      shift 2
+      ;;
+    --paginate)
+      shift
+      ;;
     # Assume the first non-flag argument after 'api' is the path
     -*)
       # Ignore other flags for now (like -f, -H)
       shift
-      if [[ "$1" != -* && $# -gt 0 ]]; then
+      if [[ $# -gt 0 && "$1" != -* ]]; then
          shift # Consume flag argument
       fi
       ;;
@@ -80,6 +89,24 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Drain stdin before routing: the script feeds --input - through a pipe, and
+# a mock that exits without reading it hands the writer an EPIPE, which the
+# script's pipefail/ERR trap reports as an unexpected error.
+if [[ "$input_src" == "-" ]]; then
+  request_body=$(cat)
+elif [[ -n "$input_src" ]]; then
+  request_body=$(cat "$input_src")
+fi
+
+# Optional call/body logs so tests can assert which requests were made and
+# with what payloads
+if [[ -n "${MOCK_CALL_LOG:-}" ]]; then
+  echo "$api_method $api_path" >>"$MOCK_CALL_LOG"
+fi
+if [[ -n "${MOCK_BODY_LOG:-}" ]]; then
+  echo "$api_method $api_path $request_body" >>"$MOCK_BODY_LOG"
+fi
 
 # --- Response Helpers ---
 
@@ -154,12 +181,9 @@ elif [[ "$api_method" == "DELETE" && "$api_path" == *"branches/"*"/protection"* 
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Branch Protection" >&2
   exit "$MOCK_DELETE_PROTECTION_EXIT"
 
-# Fallback for unhandled calls
+# Fallback for unhandled calls. Strict: a silently-succeeding unstubbed call
+# would let a test pass without exercising the request it meant to assert.
 else
-  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: No specific match found for '$api_method $api_path'" >&2
-  # Default success for other potential calls like 'gh auth status' etc.
-  # Or fail if strict matching is desired:
-  # echo "Error: Unhandled mock API call: $api_method $api_path" >&2
-  # exit 99
-  exit 0
+  echo "Error: Unhandled mock API call: $api_method $api_path" >&2
+  exit 99
 fi
