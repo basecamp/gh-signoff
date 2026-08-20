@@ -637,12 +637,12 @@ make_pushed_repo() {
   [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
-@test "control characters in legacy contexts cannot forge ownership records" {
-  # A single check named "signoff/tests\nother-ci" (real newline) would split
-  # into two records in the line-delimited streams, smuggling the foreign
-  # name into the ruleset and into the removal call that strips the
-  # app-bound other-ci requirement. Such a name is never ours: install
-  # refuses to create one, so it is disowned wholesale.
+@test "legacy contexts with control characters are never ours" {
+  # A check named "signoff/tests\nother-ci" (real newline) is not something
+  # install could have written — it refuses such a name — so migrating or
+  # removing it would be claiming someone else's configuration. Disowned
+  # wholesale, which also keeps the removal call from stripping the app-bound
+  # other-ci requirement that shares the name's tail.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff/tests\nother-ci","app_id":null},{"context":"other-ci","app_id":777}]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
@@ -680,8 +680,8 @@ make_pushed_repo() {
 }
 
 @test "install and uninstall reject context names with control characters" {
-  # One argument with an embedded newline would smuggle a second context
-  # through the line-delimited merge and subtraction
+  # A context named on the command line is turned into a JSON token by
+  # quoting alone, so it has to be a name that needs no escaping
   run -1 gh-signoff install $'tests\nlint'
   [[ "$output" == *"unsafe for JSON"* ]] || return 1
 
@@ -805,6 +805,136 @@ make_pushed_repo() {
   [[ "$output" == *"unsafe for JSON"* ]] || return 1
 }
 
+# A ruleset we adopt by name holds whatever a repo admin put there, and the
+# rules API does not exclude control characters from a context name.
+# "foreign\nsignoff/tests" is ONE requirement that used to forge two records
+# in the line-delimited streams — enough to make `check tests` claim success
+# and to make `uninstall tests` write back a bare `foreign` requirement
+# nobody asked for. As a JSON token it is one record that compares as itself
+# and is written back byte for byte.
+@test "a ruleset context with an embedded newline stays one context" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"foreign\nsignoff/tests"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  # The forged half must not satisfy the check
+  run -0 gh-signoff check tests
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on tests" ]] || return 1
+
+  # ... nor be subtracted by it: the ruleset is rewritten unchanged
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  # ... and a union keeps it intact alongside the new context
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  # The escaped token round-trips: one context, spelled exactly as it arrived,
+  # and no bare "foreign" requirement ever materializes
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"foreign\nsignoff/tests"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+  [[ "$body" != *'{"context":"foreign"}'* ]] || return 1
+  [[ "$body" != *'"context":"signoff/tests"'* ]] || return 1
+}
+
+@test "completion offers an escaped context on one line" {
+  # compgen splits on newlines, so the display form is the token without its
+  # quotes — the escape stays escaped rather than becoming a second word
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/Lint"}]}}]}'
+
+  run -0 gh-signoff completion --contexts
+  [[ "$output" == 'we\nird'$'\n'"Lint" ]] || return 1
+}
+
+@test "uninstall subtracts a context whose spelling differs in case" {
+  # GitHub compares status check contexts case-insensitively, so
+  # signoff/Tests IS the tests requirement. A case-sensitive subtraction
+  # would remove nothing and PUT it straight back while reporting success.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/Tests"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  # Nothing remains, so the ruleset goes rather than being rewritten
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"PUT "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" != *"signoff/Tests"* ]] || return 1
+}
+
+@test "an app-bound twin disowns its unbound signoff check whatever its case" {
+  # The removal endpoint matches contexts case-insensitively too, so a
+  # name-based removal of the unbound signoff would take the app-bound
+  # SignOff requirement with it. Fail closed: the name is not ours.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff","app_id":null},{"context":"SignOff","app_id":777}]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install tests
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
+
+  # And a read does not count the disowned name as a requirement: exact
+  # output, so no upgrade hint leaks either
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "contexts differing only in case are one requirement" {
+  # The ruleset and legacy protection spell the same requirement two ways;
+  # reads show it once, and the union writes back one — the first spelling
+  # seen, which is the ruleset's
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/Tests"}]}}]}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff check tests
+  [[ "$output" == *"requires signoff on tests"* ]] || return 1
+
+  run -0 gh-signoff status
+  [[ "$output" == *"${STATUS_FAILURE} Tests"* ]] || return 1
+  [[ "$output" != *"Tests"*"tests"* ]] || return 1
+  [[ "$output" != *"tests"*"Tests"* ]] || return 1
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/Tests"}'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff/tests"}'* ]] || return 1
+}
+
+@test "a signoff status satisfies a requirement spelled in another case" {
+  # The commit carries SignOff; the ruleset requires signoff. Same context
+  # as far as GitHub is concerned, so the requirement is met.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"SignOff","state":"success","description":"Test User signed off"}]}'
+
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_SUCCESS} signoff" ]] || return 1
+}
+
 @test "uninstall removes ruleset and signoff-shaped legacy protection" {
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]}}'
@@ -844,6 +974,22 @@ make_pushed_repo() {
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'{"contexts":["signoff","signoff/tests"]}'* ]] || return 1
   [[ "$body" != *"other-ci"* ]] || return 1
+}
+
+@test "legacy removal asks for the spelling the protection actually uses" {
+  # The context is matched case-insensitively but removed by the name the
+  # protection carries: whether that endpoint folds case is undocumented, and
+  # asking it to drop a spelling nobody configured is a question worth not
+  # asking
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff/Tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"contexts":["signoff/Tests"]}'* ]] || return 1
 }
 
 @test "contextual uninstall removes contexts from mixed legacy protection" {

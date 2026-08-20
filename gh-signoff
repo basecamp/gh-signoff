@@ -131,6 +131,62 @@ require_default_branch() {
   default_branch >/dev/null || fail "failed to get default branch"
 }
 
+# --- The context record protocol ---
+#
+# Status check contexts are arbitrary strings chosen by whoever configured
+# them, and this script ferries lists of them between API calls through
+# newline-delimited shell variables. Carrying the raw name in that stream is
+# what made two separate bugs possible, so contexts travel as records instead:
+#
+#     folded_key <TAB> json_token
+#
+# json_token is the name as a JSON string literal, produced jq-side by
+# tojson. A newline inside a context name arrives as the two characters \n,
+# so one context can never split into two records, and no record can hold a
+# raw newline, tab or CR — the whole class of forged records is gone by
+# construction rather than by detection. The token also splices straight into
+# a request body: {"context":TOKEN} is already escaped exactly as GitHub sent
+# it, so a name round-trips byte for byte through a union or a subtraction.
+#
+# folded_key is tojson of the ascii_downcase'd name, and it is what every
+# identity comparison uses — dedup, subtraction, membership, status lookup.
+# GitHub documents contexts as case-insensitive identifiers, so signoff/Tests
+# and signoff/tests are one requirement; comparing folded keys makes that true
+# everywhere at once, while the token keeps the original spelling for anything
+# sent back or displayed.
+#
+# Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
+#
+# Bash composes tokens in exactly one place — contexts named on the command
+# line — and require_json_safe has already refused the characters JSON would
+# have to escape, so wrapping the name in quotes is all the serialization it
+# needs. It folds with tr, because Bash 3 has no ${var,,}. It never unescapes
+# a token: nothing downstream wants the raw bytes back, and a half-written
+# unescaper would hand this class of bug straight back.
+CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)"'
+
+# LC_ALL=C so the fold is exactly A-Z, matching jq's ascii_downcase. Left to
+# the ambient locale, tr's [:upper:] can take in a single-byte locale's
+# accented letters and rewrite bytes that are really half of a UTF-8
+# character — a key that no longer matches the one jq computed, which would
+# show up as a subtraction that silently removes nothing.
+context_key() {
+  printf '"%s"' "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+}
+
+context_record() {
+  printf '%s\t"%s"' "$(context_key "$1")" "$1"
+}
+
+# A token's display form: the JSON literal without its quotes. Ordinary names
+# print as themselves; a strange one prints escaped, which is unambiguous and,
+# for compgen and the status listing alike, still exactly one line.
+context_display() {
+  local token="$1"
+  token=${token#\"}
+  printf '%s' "${token%\"}"
+}
+
 # --- Rulesets ---
 #
 # Signoff requirements live in a repository ruleset that this extension owns
@@ -211,39 +267,56 @@ find_signoff_ruleset_id() {
   done <<<"$rows"
 }
 
-# The contexts a ruleset requires, one per line on stdout. Nonzero on API
-# failure: readers may shrug that off as empty, but writers must treat it as
-# fatal — computing a union or remainder from contexts that merely failed to
-# load would silently drop requirements.
+# The contexts a ruleset requires, one record per line on stdout. We adopt a
+# ruleset by name, so these are whatever a repo admin put there — including
+# names the rules API accepts and this tool would never write. The record
+# protocol carries them faithfully: a name with an embedded newline stays one
+# record, compares as itself, and is written back exactly as it arrived.
+#
+# Nonzero on API failure: readers may shrug that off as empty, but writers
+# must treat it as fatal — computing a union or remainder from contexts that
+# merely failed to load would silently drop requirements.
 signoff_ruleset_contexts() {
   local id="$1" contexts
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
-    --jq '.rules[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' \
+    --jq ".rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[].context | ${CONTEXT_RECORD_JQ}" \
     2>/dev/null) || return 1
   echo "${contexts//$'\r'/}"
 }
 
 # The one definition of "a legacy status check that is ours": named exactly
-# 'signoff' or 'signoff/…' — the only names this tool has ever written —
-# containing no control characters (install refuses to create such a name,
-# and an embedded newline would forge extra records in the line-delimited
-# streams these filters feed), and bound to no particular GitHub App,
-# because old installs never bound one. A 'signoff-security' context or a
-# signoff check pinned to an app_id is someone else's configuration: never
-# claimed, migrated, removed, or counted by reads. Reads from `checks` (the
-# modern view carrying app identity), normalizing the deprecated `contexts`
-# list when a response has only that.
+# 'signoff' or 'signoff/…' — the only names this tool has ever written — in
+# that exact case, containing no control characters, and bound to no
+# particular GitHub App, because old installs never bound one. A
+# 'signoff-security' context, a lone 'SignOff', or a signoff check pinned to
+# an app_id is someone else's configuration: never claimed, migrated,
+# removed, or counted by reads.
+#
+# Ownership is the one comparison that stays case-sensitive and exact, and
+# the control-character clause stays with it, even though the record protocol
+# now carries such a name safely. These are per-check claims about who wrote
+# what: install refuses to create a name with a control character in it, so a
+# legacy check that has one was written by someone else and is not ours to
+# migrate or delete. Our own reserved-name ruleset is the opposite case — it
+# is wholly ours, contents included, however strangely a repo admin spelled
+# them.
+#
+# Reads from `checks` (the modern view carrying app identity), normalizing
+# the deprecated `contexts` list when a response has only that.
 LEGACY_CHECKS='(.required_status_checks.checks // [.required_status_checks.contexts[]? | {context: ., app_id: null}])'
 LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1) and ((.context | test("[[:cntrl:]]")) | not))'
 
-# The stream of our context names, with one more guard: a name shared with
+# The stream of our context records, with one more guard: a name shared with
 # an app-bound check is not ours either. The removal endpoint matches by
 # name alone, so claiming the unbound twin would strip the app-bound foreign
-# requirement along with it — fail closed by disowning the shared name.
-LEGACY_OUR_CONTEXTS="${LEGACY_CHECKS}"' as $checks | $checks[]? | '"select(${LEGACY_CHECK_IS_OURS})"' | .context as $name | select(([$checks[]? | select((.context == $name) and ((.app_id == null or .app_id == -1) | not))] | length) == 0) | $name'
+# requirement along with it — fail closed by disowning the shared name. The
+# comparison folds case, because GitHub's context identity does and the
+# removal endpoint's own case matching is undocumented: an app-bound SignOff
+# disowns an unbound signoff too.
+LEGACY_OUR_CONTEXTS="${LEGACY_CHECKS}"' as $checks | $checks[]? | '"select(${LEGACY_CHECK_IS_OURS})"' | .context as $name | ($name | ascii_downcase) as $key | select(([$checks[]? | select((((.context // "") | ascii_downcase) == $key) and ((.app_id == null or .app_id == -1) | not))] | length) == 0) | $name | '"${CONTEXT_RECORD_JQ}"
 
-# The branch's legacy signoff contexts, one per line on stdout. A 404 (no
-# protection) reads as empty, matching the old unprotected signal.
+# The branch's legacy signoff contexts, one record per line on stdout. A 404
+# (no protection) reads as empty, matching the old unprotected signal.
 legacy_signoff_contexts() {
   local branch="$1" contexts
   contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
@@ -252,17 +325,21 @@ legacy_signoff_contexts() {
   echo "${contexts//$'\r'/}"
 }
 
-# Merge newline-separated context lists, preserving order and dropping blanks
-# and duplicates. Reports via MERGED_CONTEXTS. Membership is the whole-line
-# substring check used throughout; Bash 3 has no associative arrays.
+# Merge newline-separated context record lists, preserving order and dropping
+# blanks and duplicates. Reports via MERGED_CONTEXTS. Two records are the same
+# requirement when their folded keys match, and the first spelling seen is the
+# one kept. Membership is the whole-line substring check used throughout,
+# against a parallel list of the keys already taken; Bash 3 has no
+# associative arrays.
 merge_contexts() {
-  local list line
+  local list key token seen=""
   MERGED_CONTEXTS=""
   for list in "$@"; do
-    while read -r line; do
-      [[ -n "$line" ]] || continue
-      if [[ $'\n'"$MERGED_CONTEXTS"$'\n' != *$'\n'"${line}"$'\n'* ]]; then
-        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}$line"
+    while IFS=$'\t' read -r key token; do
+      [[ -n "$key" ]] || continue
+      if [[ $'\n'"$seen"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}${key}"$'\t'"${token}"
+        seen="${seen:+$seen$'\n'}$key"
       fi
     done <<<"$list"
   done
@@ -270,11 +347,11 @@ merge_contexts() {
 
 # Every signoff context the branch requires: our ruleset's, merged with any
 # legacy branch protection still in place. Reports via SIGNOFF_CONTEXTS (one
-# per line) and SIGNOFF_LEGACY_PRESENT rather than stdout — a $(...) capture
-# would strand the flag in a subshell (the RESOLVED_COMMIT pattern). API
-# failures read as "none", matching the old 404 handling.
+# record per line) and SIGNOFF_LEGACY_PRESENT rather than stdout — a $(...)
+# capture would strand the flag in a subshell (the RESOLVED_COMMIT pattern).
+# API failures read as "none", matching the old 404 handling.
 fetch_required_signoff_contexts() {
-  local branch="$1" ruleset_contexts legacy ctx
+  local branch="$1" ruleset_contexts legacy
   SIGNOFF_CONTEXTS=""
   SIGNOFF_LEGACY_PRESENT=false
 
@@ -302,11 +379,11 @@ legacy_upgrade_hint() {
   echo "Note: signoff is enforced via legacy branch protection; run 'gh signoff install' to migrate it to a ruleset" >&2
 }
 
-# The ruleset payload is assembled as a JSON string, and contexts travel
-# through newline-delimited streams. Rather than escape arbitrary input,
-# refuse the characters that would break out of a JSON string literal or
-# forge extra stream records — none are plausible in a branch or context
-# name.
+# The ruleset payload is assembled as a JSON string. Context names arrive
+# pre-serialized as tokens, but a branch name is spliced in raw, and a context
+# named on the command line is turned into a token by quoting alone: rather
+# than escape arbitrary input, refuse the characters that would break out of a
+# JSON string literal — none are plausible in a branch or context name.
 require_json_safe() {
   local what="$1" value="$2"
   case "$value" in
@@ -324,18 +401,21 @@ require_json_safe() {
 # legacy branch protection blocked branch deletion and force pushes by
 # default — every 0.3.0 install had that side effect, so a ruleset without
 # these rules would quietly weaken a migrated (or fresh) install.
+#
+# The contexts arrive as JSON tokens — already quoted and escaped, by jq for
+# anything read back from GitHub and by require_json_safe plus quoting for
+# anything named on the command line — so they splice in as they are.
 build_signoff_ruleset_json() {
   local branch="$1"
   shift
-  local name ref checks="" context
+  local name ref checks="" token
 
   require_json_safe "branch name" "$branch"
   name=$(signoff_ruleset_name "$branch")
   ref=$(signoff_ruleset_ref "$branch")
 
-  for context in "$@"; do
-    require_json_safe "context name" "$context"
-    checks="${checks:+$checks,}{\"context\":\"${context}\"}"
+  for token in "$@"; do
+    checks="${checks:+$checks,}{\"context\":${token}}"
   done
 
   printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
@@ -436,17 +516,16 @@ legacy_protection_disposition() {
 # Surgically remove LEGACY_SIGNOFF_CONTEXTS from the branch's protection via
 # the remove-status-check-contexts endpoint, leaving every other protection
 # setting untouched. Nonzero when they could not be removed.
+#
+# The tokens go back exactly as the protection spelled them. Whether that
+# endpoint matches contexts case-insensitively is undocumented, and asking it
+# to remove a spelling nobody configured is a question worth not asking.
 remove_legacy_signoff_contexts() {
-  local branch="$1" json="" ctx response
+  local branch="$1" json="" key token response
 
-  while read -r ctx; do
-    [[ -n "$ctx" ]] || continue
-    # These came back from the API, but serialize defensively: a context this
-    # tool would refuse to install can't be removed by this JSON either
-    case "$ctx" in
-      *[\"\\]* | *$'\t'*) return 1 ;;
-    esac
-    json="${json:+$json,}\"${ctx}\""
+  while IFS=$'\t' read -r key token; do
+    [[ -n "$token" ]] || continue
+    json="${json:+$json,}${token}"
   done <<<"$LEGACY_SIGNOFF_CONTEXTS"
   [[ -n "$json" ]] || return 0
 
@@ -483,8 +562,13 @@ retire_legacy_signoff() {
 # Get required signoff contexts, stripping the 'signoff/' prefix. The bare
 # 'signoff' context has no display name, so it is dropped. Feeds compgen: no
 # upgrade hint here.
+#
+# The folded key answers whether the context is in the signoff/ namespace,
+# whatever case it was spelled in, and the token supplies the display form.
+# Both start with a quote and the same eight prefix characters, so the name
+# to offer is what follows them, in its original spelling.
 get_signoff_contexts() {
-  local branch="${1:-}" ctx
+  local branch="${1:-}" key token display
 
   # If branch not specified, use default branch
   if [[ -z "$branch" ]]; then
@@ -493,9 +577,10 @@ get_signoff_contexts() {
 
   fetch_required_signoff_contexts "$branch"
 
-  while read -r ctx; do
-    if [[ "$ctx" == signoff/* ]]; then
-      echo "${ctx#signoff/}"
+  while IFS=$'\t' read -r key token; do
+    if [[ "$key" == '"signoff/'* ]]; then
+      display=$(context_display "$token")
+      printf '%s\n' "${display:8}"
     fi
   done <<<"$SIGNOFF_CONTEXTS"
 }
@@ -807,10 +892,10 @@ cmd_install() {
         fail "unknown option: $1"
         ;;
       *)
-        # All positional arguments are contexts. Refuse characters this tool
-        # would never write into a context name before anything touches the
-        # API: an embedded newline would smuggle extra contexts through the
-        # line-delimited merge below.
+        # All positional arguments are contexts. This is the one place bash
+        # composes a token itself, by quoting, so refuse the characters JSON
+        # would have to escape before anything touches the API — this tool
+        # would never write such a name anyway.
         require_json_safe "context name" "$1"
         contexts+=("$1")
         shift
@@ -832,14 +917,14 @@ cmd_install() {
     contexts=("")
   fi
 
-  # The requested contexts by their full status-check names
+  # The requested contexts as records, by their full status-check names
   local requested="" context context_name
   for context in "${contexts[@]}"; do
     context_name="signoff"
     if [[ -n "$context" ]]; then
       context_name="signoff/${context}"
     fi
-    requested="${requested:+$requested$'\n'}$context_name"
+    requested="${requested:+$requested$'\n'}$(context_record "$context_name")"
   done
 
   # A failed listing must be fatal here: proceeding would POST a duplicate of
@@ -860,10 +945,10 @@ cmd_install() {
   # still requires, and what this invocation asks for
   merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS" "$requested"
 
-  local union=() line
-  while read -r line; do
-    if [[ -n "$line" ]]; then
-      union+=("$line")
+  local union=() key token
+  while IFS=$'\t' read -r key token; do
+    if [[ -n "$token" ]]; then
+      union+=("$token")
     fi
   done <<<"$MERGED_CONTEXTS"
 
@@ -925,9 +1010,9 @@ cmd_uninstall() {
       *)
         # All positional arguments are contexts. An empty one would slip past
         # the bare-vs-contextual split below and quietly subtract nothing
-        # while claiming the whole requirement removed; one with an embedded
-        # newline would smuggle extra removals through the line-delimited
-        # subtraction.
+        # while claiming the whole requirement removed; the rest are refused
+        # for the same reason install refuses them, since the subtraction key
+        # is composed here by quoting.
         [[ -n "$1" ]] || fail "context name cannot be empty"
         require_json_safe "context name" "$1"
         contexts+=("$1")
@@ -991,14 +1076,17 @@ cmd_uninstall() {
       fail "no signoff requirement installed on ${branch}"
     fi
 
-    local requested="" remaining="" context line
+    # Subtract by folded key: signoff/Tests is the tests requirement as far
+    # as GitHub is concerned, so `uninstall tests` has to remove it
+    local requested="" remaining="" context key token
     for context in "${contexts[@]}"; do
-      requested="${requested:+$requested$'\n'}signoff/${context}"
+      requested="${requested:+$requested$'\n'}$(context_key "signoff/${context}")"
     done
 
-    while read -r line; do
-      if [[ $'\n'"$requested"$'\n' != *$'\n'"${line}"$'\n'* ]]; then
-        remaining="${remaining:+$remaining$'\n'}$line"
+    while IFS=$'\t' read -r key token; do
+      [[ -n "$key" ]] || continue
+      if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+        remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"
       fi
     done <<<"$available"
 
@@ -1006,8 +1094,8 @@ cmd_uninstall() {
       # Write the remainder — creating the ruleset when the contexts lived
       # only in legacy protection, so contextual uninstall migrates too
       local keep=()
-      while read -r line; do
-        keep+=("$line")
+      while IFS=$'\t' read -r key token; do
+        keep+=("$token")
       done <<<"$remaining"
       debug "keeping ${#keep[@]} signoff contexts on branch: ${branch}"
       write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${keep[@]}"
@@ -1114,8 +1202,9 @@ cmd_check() {
 
     debug "checking protection for branch: ${branch} with context: ${context_name}"
 
-    # Whole-line match, so 'signoff' isn't satisfied by 'signoff/tests'
-    if [[ $'\n'"$SIGNOFF_CONTEXTS"$'\n' == *$'\n'"${context_name}"$'\n'* ]]; then
+    # Whole-key match — the key runs to the record's tab — so 'signoff' isn't
+    # satisfied by 'signoff/tests', while 'signoff/Tests' does satisfy it
+    if [[ $'\n'"$SIGNOFF_CONTEXTS" == *$'\n'"$(context_key "$context_name")"$'\t'* ]]; then
       if [[ -z "$context" ]]; then
         echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
       else
@@ -1174,11 +1263,14 @@ cmd_status() {
     commit=$(git rev-parse HEAD) || fail "failed to get current commit"
   fi
 
-  # Get the signoff statuses on this commit as context/state pairs. A filter
-  # error surfaces here rather than silently rendering every context as failed.
+  # Get the signoff statuses on this commit as context records with their
+  # state appended — a state is one of GitHub's few enum values, so it needs
+  # no token of its own. A filter error surfaces here rather than silently
+  # rendering every context as failed. The namespace test folds case, so a
+  # SignOff status is recognized as the signoff it is.
   local statuses
   statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
-    --jq '.statuses[]? | select(.context? | . == "signoff" or startswith("signoff/")) | [.context, .state] | @tsv' \
+    --jq ".statuses[]? | select(((.context? // \"\") | ascii_downcase) | (. == \"signoff\" or startswith(\"signoff/\"))) | .state as \$state | .context | ${CONTEXT_RECORD_JQ} + \"\t\" + \$state" \
     2>/dev/null) || {
     echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
@@ -1186,7 +1278,8 @@ cmd_status() {
   statuses=${statuses//$'\r'/}
 
   # Create required contexts list - always start with "signoff"
-  local required=("signoff")
+  local required
+  required=("$(context_record "signoff")")
 
   # Add any additional required contexts from our ruleset and legacy protection
   fetch_required_signoff_contexts "$branch"
@@ -1195,40 +1288,42 @@ cmd_status() {
     legacy_upgrade_hint
   fi
 
-  local ctx
-  while read -r ctx; do
-    [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
-    required+=("$ctx")
+  local key token
+  while IFS=$'\t' read -r key token; do
+    # Skip empty or default signoff, however spelled: already included
+    [[ -z "$key" || "$key" == '"signoff"' ]] && continue
+    required+=("${key}"$'\t'"${token}")
   done <<< "$SIGNOFF_CONTEXTS"
 
-  # Map contexts to states as newline-delimited "context=state" records.
+  # Map contexts to states as newline-delimited "key=state" records.
   # A lightweight stand-in for associative arrays, which Bash 3 lacks.
   # Records are matched whole-line below: a delimiter-free concatenation
   # would let 'signoff/foo-signoff=success' satisfy a lookup for plain
   # 'signoff=success' by substring.
-  local context_map="" context state found req
-  while IFS=$'\t' read -r context state; do
-    [[ -z "$context" ]] && continue
-    context_map="${context_map}${context}=${state}"$'\n'
+  local context_map="" state found req
+  while IFS=$'\t' read -r key token state; do
+    [[ -z "$key" ]] && continue
+    context_map="${context_map}${key}=${state}"$'\n'
 
     # Show contexts that were signed off even if protection doesn't require them
     found=false
     for req in "${required[@]}"; do
-      [[ "$req" == "$context" ]] && { found=true; break; }
+      [[ "${req%%$'\t'*}" == "$key" ]] && { found=true; break; }
     done
-    $found || required+=("$context")
+    $found || required+=("${key}"$'\t'"${token}")
   done <<< "$statuses"
 
   # Generate status output for all contexts (required + actual)
-  local all_results=()
-  for context in "${required[@]}"; do
-    local display_name="$context"
-    [[ "$context" == "signoff/"* ]] && display_name="${context#signoff/}"
-    [[ "$context" == "signoff" ]] && display_name="signoff"
+  local all_results=() display_name
+  for req in "${required[@]}"; do
+    key="${req%%$'\t'*}"
+    token="${req#*$'\t'}"
+    display_name=$(context_display "$token")
+    [[ "$key" == '"signoff/'* ]] && display_name="${display_name:8}"
 
     # Check if we have a successful status for this context: whole-record
     # match, so no other context's record can stand in for it
-    if [[ $'\n'"$context_map" == *$'\n'"${context}=success"$'\n'* ]]; then
+    if [[ $'\n'"$context_map" == *$'\n'"${key}=success"$'\n'* ]]; then
       all_results+=("${STATUS_SUCCESS} $display_name")
     else
       all_results+=("${STATUS_FAILURE} $display_name")

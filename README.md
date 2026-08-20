@@ -61,6 +61,8 @@ gh signoff uninstall tests   # stop requiring signoff on tests, keep the rest
 gh signoff uninstall         # remove the signoff requirement entirely
 ```
 
+GitHub treats status check contexts as case-insensitive, and so does gh-signoff: `uninstall tests` removes a `signoff/Tests` requirement, `check tests` finds it, and a `SignOff` status satisfies a required `signoff`. Whatever spelling is already configured is the one kept.
+
 ### Upgrading from branch protection
 
 Versions before 0.4.0 enforced signoff with legacy branch protection. Everything keeps working on those repos — `check` and `status` read both — but to move onto a ruleset, run once per protected branch:
@@ -72,7 +74,7 @@ gh signoff install --branch other
 
 Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted; if you've layered other settings onto it (required reviews, other status checks, linear history, admin enforcement), those all stay — only the signoff status-check contexts are removed from it, since the ruleset enforces them now.
 
-Only checks gh-signoff itself could have written count as its own: named exactly `signoff` or `signoff/<context>` and bound to no particular GitHub App. A signoff-named check you've pinned to an app is deliberately treated as foreign — it is never migrated, removed, or reported by `check`/`status`, and protection containing one is left alone.
+Only checks gh-signoff itself could have written count as its own: named exactly `signoff` or `signoff/<context>` and bound to no particular GitHub App. A signoff-named check you've pinned to an app is deliberately treated as foreign — it is never migrated, removed, or reported by `check`/`status`, and protection containing one is left alone. An app-bound check disowns its unbound twin as well, and it does so case-insensitively, the way GitHub compares status check contexts: an app-bound `SignOff` makes a plain `signoff` foreign too. The endpoint that removes a context matches by name alone, so a removal aimed at the twin could take the app-bound requirement with it.
 
 ## Advanced usage: Partial signoff
 
