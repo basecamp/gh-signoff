@@ -278,17 +278,15 @@ make_pushed_repo() {
   [[ "$output" == *"repository has uncommitted changes"* ]] || return 1
 }
 
-@test "check shows status for protected branch" {
-  # Simulate protection requiring default signoff
+@test "check falls back to legacy branch protection" {
+  # Simulate pre-migration protection requiring default signoff
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   run -0 gh-signoff check
   [[ "$output" == *"requires signoff"* ]] || return 1
 }
 
-@test "install enables protection" {
-  # Expect PUT protection call to succeed
-  export MOCK_PUT_PROTECTION_EXIT=0
+@test "install requires signoff via a ruleset" {
   run -0 gh-signoff install
   [[ "$output" == *"now requires signoff"* ]] || return 1
 }
@@ -327,15 +325,13 @@ make_pushed_repo() {
   [[ "$output" == *"for windows"* ]] || return 1
 }
 
-@test "install with context enables contextual protection" {
-  # Expect PUT protection call to succeed
-  export MOCK_PUT_PROTECTION_EXIT=0
+@test "install with context enables contextual requirement" {
   run -0 gh-signoff install windows
   [[ "$output" == *"now requires signoff on windows"* ]] || return 1
 }
 
-@test "check with context shows contextual status" {
-  # Simulate protection requiring 'linux' signoff
+@test "check with context falls back to legacy branch protection" {
+  # Simulate pre-migration protection requiring 'linux' signoff
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/linux"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   run -0 gh-signoff check linux
@@ -374,10 +370,274 @@ make_pushed_repo() {
 }
 
 @test "install with branch and context arguments" {
-  # Expect PUT protection call to succeed
-  export MOCK_PUT_PROTECTION_EXIT=0
   run -0 gh-signoff install --branch main linux
   [[ "$output" == *"now requires signoff on linux"* ]] || return 1
+}
+
+# Ruleset tests. The mock's ruleset list defaults to [] (how the API reports
+# "no rulesets") and branch protection defaults to 404, so each test states
+# only what exists. MOCK_CALL_LOG/MOCK_BODY_LOG record the requests the mock
+# served, for asserting what was written where.
+
+@test "check reads requirements from our ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  # Exact output: no legacy protection, so no upgrade hint may leak
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
+
+  run -0 gh-signoff check tests
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1
+
+  run -0 gh-signoff check windows
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on windows" ]] || return 1
+}
+
+@test "status reads requirements from our ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"}]}'
+
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_SUCCESS} signoff"$'\n'"${STATUS_FAILURE} tests" ]] || return 1
+}
+
+@test "completion contexts come from our ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"},{"context":"signoff/lint"}]}}]}'
+
+  run -0 gh-signoff completion --contexts
+  [[ "$output" == "tests"$'\n'"lint" ]] || return 1
+}
+
+@test "rulesets that are not ours are never read" {
+  # Exact name match: neither someone else's ruleset nor our ruleset for a
+  # different branch counts for main
+  export MOCK_RULESETS_LIST_JSON='[{"id":7,"name":"org-policy"},{"id":8,"name":"signoff (other)"}]'
+
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "check merges ruleset and legacy contexts with an upgrade hint" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"}]}}]}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/tests","signoff/lint"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff check tests lint
+  [[ "$output" == *"requires signoff on tests"* ]] || return 1
+  [[ "$output" == *"requires signoff on lint"* ]] || return 1
+  [[ "$output" == *"legacy branch protection"* ]] || return 1
+  [[ "$output" == *"gh signoff install"* ]] || return 1
+}
+
+@test "status dedupes contexts required by both sources and hints upgrade" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"}]}}]}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff status
+  [[ "$output" == *"${STATUS_FAILURE} tests"* ]] || return 1
+  # The overlapping context appears once, not once per source
+  [[ "$output" != *"tests"*"tests"* ]] || return 1
+  [[ "$output" == *"legacy branch protection"* ]] || return 1
+}
+
+@test "install creates our ruleset" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"name":"signoff"'* ]] || return 1
+  [[ "$body" == *'"include":["~DEFAULT_BRANCH"]'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" == *'"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]'* ]] || return 1
+  [[ "$body" == *'"strict_required_status_checks_policy":false'* ]] || return 1
+}
+
+@test "install unions new contexts into the existing ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"POST repos/:owner/:repo/rulesets"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "install migrates signoff-shaped legacy protection" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff","signoff/tests"]},"enforce_admins":{"enabled":false},"required_pull_request_reviews":null,"restrictions":null}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+  [[ "$output" == *"Migrated legacy branch protection to a ruleset"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+
+  # The legacy contexts carry over into the ruleset
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+}
+
+@test "install leaves non-signoff protection intact" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+  [[ "$output" == *"remove them in repo settings"* ]] || return 1
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE "* ]] || return 1
+}
+
+@test "install treats admin-enforced protection as not ours to delete" {
+  # Old gh-signoff always wrote enforce_admins=null, so enabled enforcement
+  # means someone tightened it on purpose
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]},"enforce_admins":{"enabled":true}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff install
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+}
+
+@test "install --branch other targets a branch-named ruleset" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install --branch other
+  [[ "$output" == *"GitHub other branch now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"name":"signoff (other)"'* ]] || return 1
+  [[ "$body" == *'"include":["refs/heads/other"]'* ]] || return 1
+}
+
+@test "install reports a failed ruleset create" {
+  export MOCK_POST_RULESET_EXIT=1
+
+  run -1 gh-signoff install
+  [[ "$output" == *"failed to create signoff ruleset"* ]] || return 1
+}
+
+@test "install reports a failed ruleset listing" {
+  export MOCK_RULESETS_LIST_EXIT=1
+
+  run -1 gh-signoff install
+  [[ "$output" == *"failed to list rulesets"* ]] || return 1
+}
+
+@test "install rejects contexts unsafe for JSON" {
+  run -1 gh-signoff install 'bad"context'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+}
+
+@test "uninstall removes ruleset and signoff-shaped legacy protection" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+}
+
+@test "uninstall fails when nothing is installed" {
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
+}
+
+@test "uninstall leaves non-signoff protection intact" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+  [[ "$output" == *"remove them in repo settings"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/"* ]] || return 1
+}
+
+@test "contextual uninstall keeps the remaining contexts" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"},{"context":"signoff/lint"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+  [[ "$body" != *'"signoff/tests"'* ]] || return 1
+}
+
+@test "contextual uninstall migrates remaining legacy contexts" {
+  # No ruleset yet: the contexts live only in legacy protection, so the
+  # remainder lands in a fresh ruleset and the legacy protection goes away
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff","signoff/tests"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+  [[ "$output" == *"Migrated legacy branch protection to a ruleset"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" != *'"signoff/tests"'* ]] || return 1
+}
+
+@test "contextual uninstall fails when nothing is installed" {
+  run -1 gh-signoff uninstall tests
+  [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
 }
 
 @test "status shows no signoff required when no protection exists" {
