@@ -637,6 +637,58 @@ make_pushed_repo() {
   [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
+@test "control characters in legacy contexts cannot forge ownership records" {
+  # A single check named "signoff/tests\nother-ci" (real newline) would split
+  # into two records in the line-delimited streams, smuggling the foreign
+  # name into the ruleset and into the removal call that strips the
+  # app-bound other-ci requirement. Such a name is never ours: install
+  # refuses to create one, so it is disowned wholesale.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff/tests\nother-ci","app_id":null},{"context":"other-ci","app_id":777}]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+  [[ "$body" != *"other-ci"* ]] || return 1
+}
+
+@test "a signoff check that also exists app-bound is not ours" {
+  # The removal endpoint matches by name alone, so claiming the unbound twin
+  # would strip the app-bound foreign requirement with it — the shared name
+  # is disowned instead
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff","app_id":null},{"context":"signoff","app_id":777}]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install tests
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
+}
+
+@test "install and uninstall reject context names with control characters" {
+  # One argument with an embedded newline would smuggle a second context
+  # through the line-delimited merge and subtraction
+  run -1 gh-signoff install $'tests\nlint'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+
+  run -1 gh-signoff uninstall $'tests\nsignoff/lint'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+}
+
 @test "reads do not claim foreign signoff-prefixed contexts" {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"contexts":["signoff-security"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
@@ -1012,6 +1064,20 @@ make_pushed_repo() {
 
   run -0 gh-signoff completion --contexts
   [[ -z "$output" ]] || return 1
+}
+
+@test "status matches signoff states by exact record, not substring" {
+  # 'signoff/foosignoff/tests' succeeded, but that must not satisfy the
+  # required 'signoff/tests'; likewise 'signoff/foo-signoff' must not
+  # satisfy plain 'signoff'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff/foosignoff/tests","state":"success","description":"x"},{"context":"signoff/foo-signoff","state":"success","description":"x"}]}'
+  export MOCK_COMMIT_STATUS_EXIT=0
+
+  run -0 gh-signoff status
+  [[ $'\n'"$output"$'\n' == *$'\n'"${STATUS_FAILURE} signoff"$'\n'* ]] || return 1
+  [[ $'\n'"$output"$'\n' == *$'\n'"${STATUS_FAILURE} tests"$'\n'* ]] || return 1
 }
 
 @test "status does not display foreign signoff-prefixed statuses" {
