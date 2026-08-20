@@ -196,6 +196,12 @@ elif [[ "$api_method" == "PUT" && "$api_path" == *"branches/"*"/protection"* ]];
 # DELETE glob, which would otherwise swallow this path
 elif [[ "$api_method" == "DELETE" && "$api_path" == *"/protection/required_status_checks/contexts" ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Protection Contexts" >&2
+  # The documented request body is {"contexts":[...]} — reject anything else
+  # so a drive-by payload change can't pass silently
+  if [[ "$request_body" != '{"contexts":['*']}' ]]; then
+    echo "Error: DELETE contexts expects {\"contexts\":[...]}, got: $request_body" >&2
+    exit 99
+  fi
   if [[ "${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:-0}" -ne 0 ]]; then
     emit_error "Validation Failed" "422"
   fi

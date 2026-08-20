@@ -462,6 +462,10 @@ make_pushed_repo() {
   [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
   [[ "$body" == *'"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]'* ]] || return 1
   [[ "$body" == *'"strict_required_status_checks_policy":false'* ]] || return 1
+  # Legacy protection blocked branch deletion and force pushes by default,
+  # so the ruleset must too — anything less weakens a migrated install
+  [[ "$body" == *'{"type":"deletion"}'* ]] || return 1
+  [[ "$body" == *'{"type":"non_fast_forward"}'* ]] || return 1
 }
 
 @test "install unions new contexts into the existing ruleset" {
@@ -573,6 +577,64 @@ make_pushed_repo() {
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
   [[ "$body" != *"signoff-security"* ]] || return 1
+}
+
+@test "app-bound signoff checks are not ours to migrate or remove" {
+  # A signoff check pinned to a GitHub App is a configuration this tool
+  # never wrote: it stays exactly where it is — not unioned into the
+  # ruleset, not removed from the protection, never deleted wholesale
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff","app_id":12345}],"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install tests
+  [[ "$output" != *"Migrated"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
+}
+
+@test "reads do not claim app-bound signoff checks" {
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff","app_id":12345}],"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  # Exact output: not required by anything of ours, and no upgrade hint,
+  # because install would not migrate it
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "uninstall leaves protection with no signoff contexts untouched" {
+  # An otherwise-empty protected branch still blocks force pushes and
+  # deletion; a tool that never wrote it must not delete it
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":[]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
+
+  export MOCK_BRANCH_PROTECTION_JSON='{"enforce_admins":{"enabled":false}}'
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE "* ]] || return 1
+}
+
+@test "uninstall rejects an empty context name" {
+  # '' would slip past the bare-vs-contextual split, subtract nothing, and
+  # still claim the whole requirement was removed
+  run -1 gh-signoff uninstall ''
+  [[ "$output" == *"context name cannot be empty"* ]] || return 1
+
+  run -1 gh-signoff uninstall tests ''
+  [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
 @test "reads do not claim foreign signoff-prefixed contexts" {
@@ -728,7 +790,7 @@ make_pushed_repo() {
   [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
 
   body=$(cat "$MOCK_BODY_LOG")
-  [[ "$body" == *'["signoff","signoff/tests"]'* ]] || return 1
+  [[ "$body" == *'{"contexts":["signoff","signoff/tests"]}'* ]] || return 1
   [[ "$body" != *"other-ci"* ]] || return 1
 }
 
@@ -750,7 +812,7 @@ make_pushed_repo() {
   [[ "$calls" != *"POST "* && "$calls" != *"PUT "* ]] || return 1
 
   body=$(cat "$MOCK_BODY_LOG")
-  [[ "$body" == *'["signoff/tests"]'* ]] || return 1
+  [[ "$body" == *'{"contexts":["signoff/tests"]}'* ]] || return 1
 }
 
 @test "uninstall fails when legacy protection cannot be deleted" {
@@ -950,6 +1012,15 @@ make_pushed_repo() {
 
   run -0 gh-signoff completion --contexts
   [[ -z "$output" ]] || return 1
+}
+
+@test "status does not display foreign signoff-prefixed statuses" {
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success","description":"Test User signed off"},{"context":"signoff-security","state":"success","description":"Some scanner"}]}'
+  export MOCK_COMMIT_STATUS_EXIT=0
+
+  run -0 gh-signoff status
+  [[ "$output" == *"${STATUS_SUCCESS} signoff"* ]] || return 1
+  [[ "$output" != *"signoff-security"* ]] || return 1
 }
 
 @test "status shows signoffs even without branch protection" {

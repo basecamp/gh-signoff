@@ -50,7 +50,9 @@ A branch checked out from a cross-repository pull request (`gh pr checkout` on a
 gh signoff install
 ```
 
-`install` creates a repository ruleset named `signoff` (or `signoff (<branch>)` for a non-default branch) that requires the signoff commit status. Repository admins can bypass it, matching how signoff has always behaved. The ruleset layers alongside any other rulesets your repo or org defines; gh-signoff only ever touches its own.
+`install` creates a repository ruleset named `signoff` (or `signoff (<branch>)` for a non-default branch) that requires the signoff commit status and — like the branch protection it replaces — blocks force pushes and branch deletion. Repository admins can bypass it, matching how signoff has always behaved. The ruleset layers alongside any other rulesets your repo or org defines; gh-signoff only ever touches its own.
+
+Those ruleset names are reserved: gh-signoff treats a repository branch ruleset named `signoff` or `signoff (<branch>)` as its own, so install will normalize its shape and uninstall will delete it.
 
 Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
 

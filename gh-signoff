@@ -223,14 +223,22 @@ signoff_ruleset_contexts() {
   echo "${contexts//$'\r'/}"
 }
 
+# The one definition of "a legacy status check that is ours": named exactly
+# 'signoff' or 'signoff/…' — the only names this tool has ever written — and
+# bound to no particular GitHub App, because old installs never bound one.
+# A 'signoff-security' context or a signoff check pinned to an app_id is
+# someone else's configuration: never claimed, migrated, removed, or counted
+# by reads. Reads from `checks` (the modern view carrying app identity),
+# normalizing the deprecated `contexts` list when a response has only that.
+LEGACY_CHECKS='(.required_status_checks.checks // [.required_status_checks.contexts[]? | {context: ., app_id: null}])[]?'
+LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1))'
+
 # The branch's legacy signoff contexts, one per line on stdout. A 404 (no
-# protection) reads as empty, matching the old unprotected signal. Exactly
-# 'signoff' or 'signoff/…' — the only names this tool has ever written — so a
-# foreign context like 'signoff-security' is never claimed as ours.
+# protection) reads as empty, matching the old unprotected signal.
 legacy_signoff_contexts() {
   local branch="$1" contexts
   contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(. == "signoff" or startswith("signoff/"))' \
+    --jq "${LEGACY_CHECKS} | select(${LEGACY_CHECK_IS_OURS}) | .context" \
     2>/dev/null) || contexts=""
   echo "${contexts//$'\r'/}"
 }
@@ -300,6 +308,11 @@ require_json_safe() {
 # bypass_actors grants repository admins an always-on bypass, preserving the
 # legacy enforce_admins=null semantics: actor_id 5 is the Admin repository
 # role, per GitHub's own UI-exported rulesets.
+#
+# deletion and non_fast_forward ride along with the status checks because
+# legacy branch protection blocked branch deletion and force pushes by
+# default — every 0.3.0 install had that side effect, so a ruleset without
+# these rules would quietly weaken a migrated (or fresh) install.
 build_signoff_ruleset_json() {
   local branch="$1"
   shift
@@ -314,7 +327,7 @@ build_signoff_ruleset_json() {
     checks="${checks:+$checks,}{\"context\":\"${context}\"}"
   done
 
-  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
+  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
 }
 
 # Create (no id) or update (id) our ruleset to require exactly the given
@@ -359,13 +372,17 @@ delete_signoff_ruleset() {
 
 # Classify the branch's legacy branch protection via LEGACY_PROTECTION:
 #   none    — confirmed no protection (the API 404s)
-#   signoff — exactly what old gh-signoff install wrote (only signoff
-#             contexts, strict false, no reviews, no restrictions, and no
-#             enabled flag anywhere — old installs left enforce_admins,
-#             linear history, signatures, and every other {enabled} toggle
-#             at their false defaults), safe to delete wholesale
+#   signoff — exactly what old gh-signoff install wrote: at least one
+#             signoff check that is ours (see LEGACY_CHECK_IS_OURS) and
+#             nothing else — no other checks, strict false, no reviews, no
+#             restrictions, and no enabled flag anywhere, since old installs
+#             left enforce_admins, linear history, signatures, and every
+#             other {enabled} toggle at their false defaults. Safe to delete
+#             wholesale. An otherwise-empty protection is NOT ours: it still
+#             blocks force pushes and deletions, and this tool never wrote a
+#             protection without a signoff check.
 #   other   — someone else's configuration, never deleted wholesale
-# LEGACY_SIGNOFF_CONTEXTS collects the signoff contexts either way. One API
+# LEGACY_SIGNOFF_CONTEXTS collects our signoff contexts either way. One API
 # call: the first line summarizes the shape, the rest are the contexts.
 #
 # The enabled-flag sweep is recursive ([.. | objects]) rather than a field
@@ -382,7 +399,7 @@ legacy_protection_disposition() {
   LEGACY_SIGNOFF_CONTEXTS=""
 
   response=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '([([.required_status_checks.contexts[]? | select((. == "signoff" or startswith("signoff/")) | not)] | length), (.required_status_checks.strict // false), ([.. | objects | select(has("enabled")) | .enabled] | any), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (.required_status_checks.contexts[]? | select(. == "signoff" or startswith("signoff/")))' \
+    --jq "([([${LEGACY_CHECKS} | select(${LEGACY_CHECK_IS_OURS} | not)] | length), (.required_status_checks.strict // false), ([.. | objects | select(has(\"enabled\")) | .enabled] | any), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (${LEGACY_CHECKS} | select(${LEGACY_CHECK_IS_OURS}) | .context)" \
     2>/dev/null) || {
     if [[ "$response" == *'"status":"404"'* ]]; then
       return 0
@@ -397,8 +414,8 @@ legacy_protection_disposition() {
   fi
 
   IFS=$'\t' read -r non_signoff strict flags reviews restrictions <<<"$summary"
-  if [[ "$non_signoff" == "0" && "$strict" == "false" && "$flags" == "false" &&
-    "$reviews" == "false" && "$restrictions" == "false" ]]; then
+  if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" && "$non_signoff" == "0" && "$strict" == "false" &&
+    "$flags" == "false" && "$reviews" == "false" && "$restrictions" == "false" ]]; then
     LEGACY_PROTECTION="signoff"
   else
     LEGACY_PROTECTION="other"
@@ -422,7 +439,7 @@ remove_legacy_signoff_contexts() {
   done <<<"$LEGACY_SIGNOFF_CONTEXTS"
   [[ -n "$json" ]] || return 0
 
-  response=$(printf '[%s]' "$json" | gh api \
+  response=$(printf '{"contexts":[%s]}' "$json" | gh api \
     "repos/:owner/:repo/branches/${branch}/protection/required_status_checks/contexts" \
     --method DELETE \
     -H "Accept: application/vnd.github+json" \
@@ -891,7 +908,10 @@ cmd_uninstall() {
         fail "unknown option: $1"
         ;;
       *)
-        # All positional arguments are contexts
+        # All positional arguments are contexts. An empty one would slip past
+        # the bare-vs-contextual split below and quietly subtract nothing
+        # while claiming the whole requirement removed.
+        [[ -n "$1" ]] || fail "context name cannot be empty"
         contexts+=("$1")
         shift
         ;;
@@ -1140,7 +1160,7 @@ cmd_status() {
   # error surfaces here rather than silently rendering every context as failed.
   local statuses
   statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
-    --jq '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' \
+    --jq '.statuses[]? | select(.context? | . == "signoff" or startswith("signoff/")) | [.context, .state] | @tsv' \
     2>/dev/null) || {
     echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
