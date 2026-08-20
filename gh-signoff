@@ -1535,6 +1535,26 @@ case "$1" in
   "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
   "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
+  "completion")
+    # Tombstone for a removed command. Completion never worked through
+    # `gh signoff` (see the removal commit), but the setup line we published,
+    # `eval "$(gh signoff completion)"`, lives on in users' shell startup
+    # files. With the command gone, `completion` is just a context name and
+    # would fall through to direct signoff below — so that stale eval line
+    # would POST a false signoff/completion status in any clean, pushed repo,
+    # then try to run the "✓ Signed off" sentence it captured as a command.
+    #
+    # Intercept it ahead of the fallback: make no API call, say NOTHING on
+    # stdout (eval runs whatever stdout carries, and empty is a safe no-op, so
+    # no "✓: command not found"), explain on stderr, and exit nonzero. This
+    # fires whatever leading -f/--commit was parsed, which is why it does not
+    # bother with reject_force/reject_commit. `gh signoff create completion`
+    # still reaches the create arm above and signs off the literal context,
+    # for anyone who truly wants it.
+    printf '%s\n' "gh-signoff: shell completion has been removed; it never worked through 'gh signoff'." >&2
+    printf '%s\n' "Remove this line from your shell startup file (e.g. ~/.bashrc): eval \"\$(gh signoff completion)\"" >&2
+    exit 1
+    ;;
   "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
   -*)
     # Unknown option

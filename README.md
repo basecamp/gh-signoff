@@ -89,6 +89,16 @@ Existing signoff contexts carry over into the ruleset. If the branch protection 
 
 Only checks gh-signoff itself could have written count as its own: named exactly `signoff` or `signoff/<context>` and bound to no particular GitHub App. A signoff-named check you've pinned to an app is deliberately treated as foreign — it is never migrated, removed, or reported by `check`/`status`, and protection containing one is left alone. An app-bound check disowns its unbound twin as well, and it does so case-insensitively, the way GitHub compares status check contexts: an app-bound `SignOff` makes a plain `signoff` foreign too. The endpoint that removes a context matches by name alone, so a removal aimed at the twin could take the app-bound requirement with it.
 
+### Shell completion has been removed
+
+0.4.0 removes the `completion` command. It never actually worked through `gh signoff` — `gh` doesn't route tab-completion to extensions — so nothing was lost, but if you followed the old setup instructions you have a stale line to delete. **Remove this from your shell startup file (e.g. `~/.bashrc`):**
+
+```bash
+eval "$(gh signoff completion)"
+```
+
+Leaving it in is harmless — `gh signoff completion` now just prints a reminder to stderr and exits without signing anything — but it does nothing useful.
+
 ## Advanced usage: Partial signoff
 
 A single signoff is all you need for most projects. If you're feeling extra fancy, picky, or organized, you can use *partial* signoff to reflect each CI step, each build platform (e.g. linux, macos, windows), each signoff role (e.g. qa, dev, ops), etc.

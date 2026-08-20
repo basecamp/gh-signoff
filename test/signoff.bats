@@ -1838,6 +1838,87 @@ make_pushed_repo() {
   [[ ! "$output" == *"for"* ]] || return 1
 }
 
+# The completion command was removed, but `eval "$(gh signoff completion)"`
+# lives in users' shell startup files. With `completion` now an ordinary
+# context word, that stale line would fall through to direct signoff and POST
+# a false signoff/completion status in a clean, pushed repo, then eval the
+# "✓ Signed off" sentence it captured. A tombstone arm intercepts it: no API
+# call, nothing on stdout (so the captured eval is a safe no-op), a message
+# on stderr, nonzero exit.
+@test "the completion tombstone makes no API call and prints nothing on stdout" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run --separate-stderr -1 gh-signoff completion
+  [[ -z "$output" ]] || return 1
+  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "the completion tombstone ignores trailing arguments like --contexts" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run --separate-stderr -1 gh-signoff completion --contexts
+  [[ -z "$output" ]] || return 1
+  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "the completion tombstone catches a leading -f in a clean pushed repo" {
+  # The core regression: -f plus a clean pushed repo would otherwise force a
+  # POST. The leading option loop consumes -f, so $1 is still 'completion'
+  # and the tombstone fires before any signoff happens.
+  make_pushed_repo
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run --separate-stderr -1 gh-signoff -f completion
+  [[ -z "$output" ]] || return 1
+  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "the completion tombstone catches a leading --commit in a clean pushed repo" {
+  make_pushed_repo
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run --separate-stderr -1 gh-signoff --commit HEAD completion
+  [[ -z "$output" ]] || return 1
+  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "create completion still signs off the literal context" {
+  # The escape hatch: `create` takes its own arm before the tombstone, so a
+  # context genuinely named 'completion' is still reachable
+  make_pushed_repo
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff create completion
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for completion"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"POST repos/:owner/:repo/statuses/"* ]] || return 1
+}
+
+@test "the exact old initializer line signs nothing and errors cleanly" {
+  # Headline regression: the literal line users were told to add to ~/.bashrc.
+  # In a clean pushed repo it must POST no status, and eval of the (empty)
+  # stdout must not surface a "✓: command not found" or a "Signed off".
+  make_pushed_repo
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run eval "$(gh-signoff completion)"
+  [[ "$output" != *"command not found"* ]] || return 1
+  [[ "$output" != *"Signed off"* ]] || return 1
+
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
 @test "leading -f applies to contextual signoff" {
   run -0 gh-signoff -f linux
   [[ "$output" == *"Signed off on"* ]] || return 1
