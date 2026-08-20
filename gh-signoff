@@ -40,12 +40,12 @@ RESOLVED_COMMIT_IS_LOCAL=true
 
 debug() {
   if [[ -n "$DEBUG" ]]; then
-    echo "Debug: $*" >&2
+    printf 'Debug: %s\n' "$*" >&2
   fi
 }
 
 fail() {
-  echo "Error: $*" >&2
+  printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
@@ -118,7 +118,7 @@ default_branch() {
     }
     DEFAULT_BRANCH=${DEFAULT_BRANCH//$'\r'/}
   fi
-  echo "$DEFAULT_BRANCH"
+  printf '%s\n' "$DEFAULT_BRANCH"
 }
 
 # Populate the DEFAULT_BRANCH cache in this shell, or die. A
@@ -224,7 +224,7 @@ signoff_ruleset_name() {
   if [[ "$branch" == "$(default_branch)" ]]; then
     echo "signoff"
   else
-    echo "signoff (${branch})"
+    printf '%s\n' "signoff (${branch})"
   fi
 }
 
@@ -233,7 +233,7 @@ signoff_ruleset_ref() {
   if [[ "$branch" == "$(default_branch)" ]]; then
     echo "~DEFAULT_BRANCH"
   else
-    echo "refs/heads/${branch}"
+    printf '%s\n' "refs/heads/${branch}"
   fi
 }
 
@@ -281,30 +281,34 @@ signoff_ruleset_contexts() {
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
     --jq ".rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[].context | ${CONTEXT_RECORD_JQ}" \
     2>/dev/null) || return 1
-  echo "${contexts//$'\r'/}"
+  printf '%s\n' "${contexts//$'\r'/}"
 }
 
 # The one definition of "a legacy status check that is ours": named exactly
 # 'signoff' or 'signoff/…' — the only names this tool has ever written — in
-# that exact case, containing no control characters, and bound to no
-# particular GitHub App, because old installs never bound one. A
-# 'signoff-security' context, a lone 'SignOff', or a signoff check pinned to
-# an app_id is someone else's configuration: never claimed, migrated,
-# removed, or counted by reads.
+# that exact case, and bound to no particular GitHub App, because old
+# installs never bound one. A 'signoff-security' context, a lone 'SignOff',
+# or a signoff check pinned to an app_id is someone else's configuration:
+# never claimed, migrated, removed, or counted by reads. Ownership is the one
+# comparison that stays case-sensitive and exact.
 #
-# Ownership is the one comparison that stays case-sensitive and exact, and
-# the control-character clause stays with it, even though the record protocol
-# now carries such a name safely. These are per-check claims about who wrote
-# what: install refuses to create a name with a control character in it, so a
-# legacy check that has one was written by someone else and is not ours to
-# migrate or delete. Our own reserved-name ruleset is the opposite case — it
-# is wholly ours, contents included, however strangely a repo admin spelled
-# them.
+# There is deliberately no control-character clause. One used to live here,
+# on the reasoning that install refuses to create such a name so a legacy
+# check with one cannot be ours. That premise was wrong about our own
+# history: 0.3.0 passed context arguments straight through to the API, so an
+# old install could and did write whatever it was handed, which makes a
+# control-bearing signoff check plausibly ours after all — and disowning it
+# stranded a requirement no later version would migrate or remove. The clause
+# was really standing in for the injection it enabled, and the record
+# protocol has since made that structural: such a name is one record, is
+# spliced back as one token, and is removed by exactly the name it has.
+# Recognizing it costs nothing now. require_json_safe still refuses to create
+# one, which is a rule about what we write, not about what we recognize.
 #
 # Reads from `checks` (the modern view carrying app identity), normalizing
 # the deprecated `contexts` list when a response has only that.
 LEGACY_CHECKS='(.required_status_checks.checks // [.required_status_checks.contexts[]? | {context: ., app_id: null}])'
-LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1) and ((.context | test("[[:cntrl:]]")) | not))'
+LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1))'
 
 # The stream of our context records, with one more guard: a name shared with
 # an app-bound check is not ours either. The removal endpoint matches by
@@ -322,7 +326,7 @@ legacy_signoff_contexts() {
   contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
     --jq "${LEGACY_OUR_CONTEXTS}" \
     2>/dev/null) || contexts=""
-  echo "${contexts//$'\r'/}"
+  printf '%s\n' "${contexts//$'\r'/}"
 }
 
 # Merge newline-separated context record lists, preserving order and dropping
@@ -438,7 +442,7 @@ write_signoff_ruleset() {
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       --input - 2>/dev/null) || {
-      if [[ -n "$response" ]]; then echo "$response" >&2; fi
+      if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
       fail "failed to update signoff ruleset"
     }
   else
@@ -447,7 +451,7 @@ write_signoff_ruleset() {
       -H "Accept: application/vnd.github+json" \
       -H "X-GitHub-Api-Version: 2022-11-28" \
       --input - 2>/dev/null) || {
-      if [[ -n "$response" ]]; then echo "$response" >&2; fi
+      if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
       fail "failed to create signoff ruleset"
     }
   fi
@@ -456,7 +460,7 @@ write_signoff_ruleset() {
 delete_signoff_ruleset() {
   local id="$1" response
   response=$(gh api --method DELETE "repos/:owner/:repo/rulesets/${id}" 2>/dev/null) || {
-    if [[ -n "$response" ]]; then echo "$response" >&2; fi
+    if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
     fail "failed to remove signoff ruleset"
   }
 }
@@ -535,7 +539,7 @@ remove_legacy_signoff_contexts() {
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     --input - 2>/dev/null) || {
-    if [[ -n "$response" ]]; then echo "$response" >&2; fi
+    if [[ -n "$response" ]]; then printf '%s\n' "$response" >&2; fi
     return 1
   }
 }
@@ -567,6 +571,12 @@ retire_legacy_signoff() {
 # whatever case it was spelled in, and the token supplies the display form.
 # Both start with a quote and the same eight prefix characters, so the name
 # to offer is what follows them, in its original spelling.
+#
+# A display form carrying a backslash is dropped rather than offered. It is
+# an escape sequence standing in for a character the name really holds, and
+# completing it would type a name back that create and install would refuse —
+# a candidate that cannot be used is worse than no candidate. Names with
+# spaces are offered as they are; the completion function keeps them whole.
 get_signoff_contexts() {
   local branch="${1:-}" key token display
 
@@ -580,7 +590,11 @@ get_signoff_contexts() {
   while IFS=$'\t' read -r key token; do
     if [[ "$key" == '"signoff/'* ]]; then
       display=$(context_display "$token")
-      printf '%s\n' "${display:8}"
+      display="${display:8}"
+      case "$display" in
+        *\\*) ;;
+        *) printf '%s\n' "$display" ;;
+      esac
     fi
   done <<<"$SIGNOFF_CONTEXTS"
 }
@@ -852,9 +866,9 @@ cmd_create() {
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
+        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
       else
-        echo "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
+        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
       fi
     fi
   done
@@ -958,13 +972,13 @@ cmd_install() {
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff on ${context}"
       fi
     done
   fi
@@ -979,7 +993,7 @@ cmd_install() {
       echo "${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
     fi
   else
-    echo "Warning: could not remove signoff from legacy branch protection on ${branch}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
+    printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
   fi
 }
 
@@ -1117,19 +1131,19 @@ cmd_uninstall() {
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
       fi
     done
   fi
 
   if [[ -n "$migration_note" ]]; then
-    echo "$migration_note"
+    printf '%s\n' "$migration_note"
   fi
 }
 
@@ -1158,7 +1172,12 @@ cmd_check() {
         fail "unknown option: $1"
         ;;
       *)
-        # All positional arguments are contexts
+        # All positional arguments are contexts, refused on the same terms as
+        # install's and uninstall's. A read composes a lookup key by quoting
+        # too, so an argument carrying a quote and a tab could spell a key
+        # that spans two fetched records and report a context as required
+        # that nobody ever required.
+        require_json_safe "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1181,9 +1200,9 @@ cmd_check() {
   if [[ -z "$SIGNOFF_CONTEXTS" ]]; then
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
       else
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
       fi
     done
     exit 1
@@ -1206,15 +1225,15 @@ cmd_check() {
     # satisfied by 'signoff/tests', while 'signoff/Tests' does satisfy it
     if [[ $'\n'"$SIGNOFF_CONTEXTS" == *$'\n'"$(context_key "$context_name")"$'\t'* ]]; then
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff on ${context}"
       fi
     else
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
       else
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
       fi
     fi
   done
@@ -1264,15 +1283,19 @@ cmd_status() {
   fi
 
   # Get the signoff statuses on this commit as context records with their
-  # state appended — a state is one of GitHub's few enum values, so it needs
-  # no token of its own. A filter error surfaces here rather than silently
+  # state appended. A state rides along raw rather than as a token of its
+  # own, so it is held to GitHub's documented closed enum first and anything
+  # else becomes "unknown" — a state is not a name, and one carrying a tab or
+  # a newline could otherwise spell a record of its own making. Mapping
+  # rather than dropping keeps a context with a strange state visible, as the
+  # failure it is. A filter error surfaces here rather than silently
   # rendering every context as failed. The namespace test folds case, so a
   # SignOff status is recognized as the signoff it is.
   local statuses
   statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
-    --jq ".statuses[]? | select(((.context? // \"\") | ascii_downcase) | (. == \"signoff\" or startswith(\"signoff/\"))) | .state as \$state | .context | ${CONTEXT_RECORD_JQ} + \"\t\" + \$state" \
+    --jq ".statuses[]? | select(((.context? // \"\") | ascii_downcase) | (. == \"signoff\" or startswith(\"signoff/\"))) | (if (.state == \"error\" or .state == \"failure\" or .state == \"pending\" or .state == \"success\") then .state else \"unknown\" end) as \$state | .context | ${CONTEXT_RECORD_JQ} + \"\t\" + \$state" \
     2>/dev/null) || {
-    echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
+    printf '%s\n' "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
   }
   statuses=${statuses//$'\r'/}
@@ -1347,10 +1370,38 @@ cmd_completion() {
   cat <<'EOF'
 # bash completion for gh signoff
 
+# Replace COMPREPLY with the static words matching the typed prefix. These are
+# this tool's own commands and flags, so compgen's word splitting is exactly
+# right for them. compgen exits nonzero when nothing matches, which is an
+# answer rather than a failure — and an unguarded one aborts a caller running
+# under set -e.
+_gh_signoff_words() {
+  local cur="$1"
+  shift
+  COMPREPLY=( $(compgen -W "$*" -- "$cur") ) || COMPREPLY=()
+}
+
+# Append the required contexts to COMPREPLY, one candidate per line of
+# `gh signoff completion --contexts`.
+#
+# Deliberately not compgen: it reparses its word list as shell input, so a
+# context containing a space would become two candidates and one containing a
+# backslash would come back with the backslash eaten. Candidates that reach
+# COMPREPLY as whole array elements are inserted verbatim, with readline
+# quoting whatever needs it. The prefix test is a quoted case pattern, so a
+# context containing a glob character matches literally rather than matching
+# everything.
 _gh_signoff_contexts() {
-  # Get dynamic contexts from branch protection
+  local cur="$1" contexts line
   contexts=$(gh signoff completion --contexts 2>/dev/null)
-  echo "$contexts"
+
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      case "$line" in
+        "$cur"*) COMPREPLY[${#COMPREPLY[@]}]="$line" ;;
+      esac
+    fi
+  done <<<"$contexts"
 }
 
 # The first word that is neither a global option nor its argument. -f and
@@ -1364,7 +1415,7 @@ _gh_signoff_command() {
     case "${COMP_WORDS[$i]}" in
       -f)       i=$((i+1)) ;;
       --commit) i=$((i+2)) ;;
-      *)        echo "${COMP_WORDS[$i]}"; return ;;
+      *)        printf '%s\n' "${COMP_WORDS[$i]}"; return ;;
     esac
   done
 }
@@ -1377,8 +1428,8 @@ _gh_signoff() {
   case "$prev" in
     signoff)
       # Include dynamic contexts in top-level completion
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
+      _gh_signoff_words "$cur" create install uninstall check status version -f --commit --help
+      _gh_signoff_contexts "$cur"
       return 0
       ;;
     --commit)
@@ -1388,26 +1439,26 @@ _gh_signoff() {
     -f)
       # A leading -f may be followed by the create command, --commit or a
       # context; elsewhere only contexts remain
-      local contexts=$(_gh_signoff_contexts)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "create --commit $contexts" -- "$cur") )
+        _gh_signoff_words "$cur" create --commit
       else
-        COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+        COMPREPLY=()
       fi
+      _gh_signoff_contexts "$cur"
       return 0
       ;;
     create)
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "-f --commit $contexts" -- "$cur") )
+      _gh_signoff_words "$cur" -f --commit
+      _gh_signoff_contexts "$cur"
       return 0
       ;;
     status)
-      COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
+      _gh_signoff_words "$cur" --branch --commit
       return 0
       ;;
     install|uninstall|check)
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
+      _gh_signoff_words "$cur" --branch
+      _gh_signoff_contexts "$cur"
       return 0
       ;;
   esac
@@ -1418,13 +1469,13 @@ _gh_signoff() {
   if [[ $cur == --* ]]; then
     case "$command" in
       install|uninstall|check)
-        COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
+        _gh_signoff_words "$cur" --branch
         ;;
       status)
-        COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
+        _gh_signoff_words "$cur" --branch --commit
         ;;
       *)
-        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
+        _gh_signoff_words "$cur" --commit
         ;;
     esac
     return 0
@@ -1434,8 +1485,8 @@ _gh_signoff() {
   # directly after `signoff`, which a leading -f or --commit would otherwise
   # push out of reach
   if [[ -z "$command" ]]; then
-    local contexts=$(_gh_signoff_contexts)
-    COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
+    _gh_signoff_words "$cur" create install uninstall check status version -f --commit --help
+    _gh_signoff_contexts "$cur"
     return 0
   fi
 
@@ -1445,8 +1496,8 @@ _gh_signoff() {
         "$command" != "status" && "$command" != "version" &&
         "$command" != "completion" && "$command" != "--help" &&
         "$command" != "-h" ]]; then
-    local contexts=$(_gh_signoff_contexts)
-    COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
+    COMPREPLY=()
+    _gh_signoff_contexts "$cur"
     return 0
   fi
 

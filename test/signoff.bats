@@ -637,26 +637,36 @@ make_pushed_repo() {
   [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
-@test "legacy contexts with control characters are never ours" {
-  # A check named "signoff/tests\nother-ci" (real newline) is not something
-  # install could have written — it refuses such a name — so migrating or
-  # removing it would be claiming someone else's configuration. Disowned
-  # wholesale, which also keeps the removal call from stripping the app-bound
-  # other-ci requirement that shares the name's tail.
+@test "legacy checks with control characters are ours and migrate faithfully" {
+  # This expectation is the reverse of what it was. The name was disowned on
+  # the theory that install could not have written it — but 0.3.0 passed
+  # context arguments straight through to the API, so it could have, and
+  # disowning stranded a requirement no later version would migrate or
+  # remove. What the clause was really standing in for was the injection such
+  # a name enabled, and the record protocol has made that structural: one
+  # record, one spliced token, removal by exactly the name it has. The
+  # app-bound other-ci check is untouched either way.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff/tests\nother-ci","app_id":null},{"context":"other-ci","app_id":777}]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff install lint
-  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
 
+  # Surgically removed, never a wholesale protection delete: other-ci is
+  # someone else's requirement and its protection is not ours to drop
   calls=$(cat "$MOCK_CALL_LOG")
-  [[ "$calls" != *"DELETE "* ]] || return 1
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
 
   body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/tests\nother-ci"}'* ]] || return 1
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
-  [[ "$body" != *"other-ci"* ]] || return 1
+  # The removal asks for that one name, whole — never the app-bound other-ci
+  [[ "$body" == *'{"contexts":["signoff/tests\nother-ci"]}'* ]] || return 1
+  [[ "$body" != *'["other-ci"'* ]] || return 1
+  [[ "$body" != *'{"context":"other-ci"}'* ]] || return 1
 }
 
 @test "a signoff check that also exists app-bound is not ours" {
@@ -842,14 +852,79 @@ make_pushed_repo() {
   [[ "$body" != *'"context":"signoff/tests"'* ]] || return 1
 }
 
-@test "completion offers an escaped context on one line" {
-  # compgen splits on newlines, so the display form is the token without its
-  # quotes — the escape stays escaped rather than becoming a second word
+@test "check refuses context arguments that could forge a lookup key" {
+  # A read composes its lookup key by quoting, just as a write composes its
+  # token, so check has to refuse the same names. An argument carrying a
+  # quote and a tab spells a key that spans two whole fetched records —
+  # matching them both and reporting a context as required that nobody ever
+  # required.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/Lint"}]}}]}'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo"},{"context":"signoff/bar"}]}}]}'
+
+  run -1 gh-signoff check $'foo"\t"signoff/foo"\n"signoff/bar'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" != *"requires signoff"* ]] || return 1
+
+  # A plain quote is refused too, rather than quietly matching nothing
+  run -1 gh-signoff check 'bad"context'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+}
+
+@test "an empty ruleset context round-trips rather than vanishing" {
+  # An empty context is not something install would write, but dropping one
+  # silently on the next write is exactly the kind of edit this tool has no
+  # business making to a ruleset it merely adopted
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":""},{"context":"signoff"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":""}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "records survive a shell whose echo expands escapes" {
+  # bash -O xpg_echo makes echo decode backslash escapes. A token's two
+  # characters \n would become a real newline: one record splitting into two,
+  # and a PUT body quietly renaming the context. Every path that emits data
+  # uses printf, so the token reaches GitHub exactly as it arrived.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 bash -O xpg_echo "$TEST_DIR/gh-signoff" install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/we\nird"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "a hostile commit status state cannot forge a signoff record" {
+  # The state rides beside the token as raw text, so it is held to GitHub's
+  # documented enum first: this one spells out a whole extra record, which
+  # would otherwise mark tests signed off on a commit that never was
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success\n\"signoff/tests\"\t\"signoff/tests\"\tsuccess"}]}'
+
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_FAILURE} signoff"$'\n'"${STATUS_FAILURE} tests" ]] || return 1
+}
+
+@test "completion omits contexts that could not be typed back" {
+  # A display form with a backslash is an escape standing in for a character
+  # the name really holds; completing it would type back a name create and
+  # install refuse. One line each for the rest, spelling intact.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/we\nird"},{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
 
   run -0 gh-signoff completion --contexts
-  [[ "$output" == 'we\nird'$'\n'"Lint" ]] || return 1
+  [[ "$output" == "foo bar"$'\n'"Lint" ]] || return 1
 }
 
 @test "uninstall subtracts a context whose spelling differs in case" {
@@ -1701,6 +1776,41 @@ complete_prefix() {
   complete_words gh-signoff linux -f
   [[ " ${COMPREPLY[*]-} " == *" linux "* ]] || return 1
   [[ ! " ${COMPREPLY[*]-} " == *" create "* ]] || return 1
+}
+
+# Candidates reach COMPREPLY as whole array elements. compgen -W would reparse
+# them as shell input first: a context with a space would arrive as two
+# candidates, and one with a backslash would arrive with the backslash eaten.
+@test "completion keeps a context with a space as one candidate" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo bar"},{"context":"signoff/we\nird"},{"context":"signoff/Lint"}]}}]}'
+
+  complete_words gh-signoff check
+  [[ "${#COMPREPLY[@]}" -eq 3 ]] || return 1
+  [[ "${COMPREPLY[0]}" == "--branch" ]] || return 1
+  [[ "${COMPREPLY[1]}" == "foo bar" ]] || return 1
+  [[ "${COMPREPLY[2]}" == "Lint" ]] || return 1
+}
+
+@test "completion filters contexts by the typed prefix" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo bar"},{"context":"signoff/Lint"}]}}]}'
+
+  complete_prefix gh-signoff check L
+  [[ "${#COMPREPLY[@]}" -eq 1 ]] || return 1
+  [[ "${COMPREPLY[0]}" == "Lint" ]] || return 1
+}
+
+@test "completion matches a context with a glob character literally" {
+  # The prefix test is a quoted case pattern: a candidate holding * matches
+  # only what it spells, and a typed * offers only candidates that start
+  # with one
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/*star"},{"context":"signoff/Lint"}]}}]}'
+
+  complete_prefix gh-signoff check '*'
+  [[ "${#COMPREPLY[@]}" -eq 1 ]] || return 1
+  [[ "${COMPREPLY[0]}" == '*star' ]] || return 1
 }
 
 # Leading -f dispatcher grammar tests

@@ -131,6 +131,20 @@ emit() {
   fi
 }
 
+# A ruleset write body has to be JSON of the shape the rules API documents.
+# Validate the parsed JSON rather than its spelling, as the remove-contexts
+# route does: a payload that is malformed, or that lost a key to a bad splice,
+# must fail the test loudly instead of globbing its way past an assertion.
+require_ruleset_body() {
+  if ! printf '%s\n' "$request_body" | jq -e '(type == "object")
+      and (has("name") and has("target") and has("enforcement") and has("conditions") and has("rules"))
+      and (.rules | type == "array")
+      and (.conditions | type == "object")' >/dev/null 2>&1; then
+    echo "Error: ruleset write expects a JSON object with name/target/enforcement/conditions/rules, got: $request_body" >&2
+    exit 99
+  fi
+}
+
 # gh prints the API error body to stdout and exits nonzero, so callers have to
 # reset their capture rather than treat the body as a response. The optional
 # second argument sets the HTTP status the body reports (default 404), for
@@ -236,6 +250,7 @@ elif [[ "$api_method" == "GET" && ("$api_path" == *"/rulesets" || "$api_path" ==
 # Create Ruleset Call (POST)
 elif [[ "$api_method" == "POST" && "$api_path" == *"/rulesets" ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched POST Ruleset" >&2
+  require_ruleset_body
   if [[ "$MOCK_POST_RULESET_EXIT" -ne 0 ]]; then
     emit_error "Validation Failed"
   fi
@@ -244,6 +259,7 @@ elif [[ "$api_method" == "POST" && "$api_path" == *"/rulesets" ]]; then
 # Update Ruleset Call (PUT)
 elif [[ "$api_method" == "PUT" && "$api_path" == *"/rulesets/"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Ruleset" >&2
+  require_ruleset_body
   if [[ "$MOCK_PUT_RULESET_EXIT" -ne 0 ]]; then
     emit_error "Validation Failed"
   fi
