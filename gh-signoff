@@ -716,28 +716,41 @@ cmd_install() {
     contexts=("")
   fi
 
-  # Build API fields for all contexts
-  local api_fields=()
-  api_fields+=("--field" "required_status_checks[strict]=false")
-  api_fields+=("--field" "enforce_admins=null")
-  api_fields+=("--field" "required_pull_request_reviews=null")
-  api_fields+=("--field" "restrictions=null")
-
+  # The requested contexts by their full status-check names
+  local requested="" context context_name
   for context in "${contexts[@]}"; do
-    local context_name="signoff"
+    context_name="signoff"
     if [[ -n "$context" ]]; then
       context_name="signoff/${context}"
     fi
-    api_fields+=("--field" "required_status_checks[contexts][]=${context_name}")
+    requested="${requested:+$requested$'\n'}$context_name"
   done
 
-  debug "installing protection on branch: ${branch} with ${#contexts[@]} contexts"
+  # A failed listing must be fatal here: proceeding would POST a duplicate of
+  # a ruleset the listing merely failed to see
+  find_signoff_ruleset_id "$branch" || fail "failed to list rulesets"
 
-  gh api "/repos/:owner/:repo/branches/${branch}/protection" \
-    --method PUT \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${api_fields[@]}" >/dev/null || fail "failed to set branch protection"
+  local existing=""
+  if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+    existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID")
+  fi
+
+  legacy_protection_disposition "$branch"
+
+  # Additive union: what our ruleset already requires, what legacy protection
+  # still requires, and what this invocation asks for
+  merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS" "$requested"
+
+  local union=() line
+  while read -r line; do
+    if [[ -n "$line" ]]; then
+      union+=("$line")
+    fi
+  done <<<"$MERGED_CONTEXTS"
+
+  debug "installing signoff ruleset on branch: ${branch} with ${#union[@]} contexts"
+
+  write_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${union[@]}"
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
@@ -751,6 +764,21 @@ cmd_install() {
       fi
     done
   fi
+
+  # The ruleset now carries every legacy signoff context, so signoff-shaped
+  # protection is redundant: delete it. Anything else is someone's deliberate
+  # configuration — leave it, but flag the duplicate signoff requirement.
+  case "$LEGACY_PROTECTION" in
+    signoff)
+      delete_legacy_protection "$branch"
+      echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+      ;;
+    other)
+      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+        echo "Warning: branch protection on ${branch} also requires signoff contexts alongside other settings; remove them in repo settings" >&2
+      fi
+      ;;
+  esac
 }
 
 cmd_uninstall() {
