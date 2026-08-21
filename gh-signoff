@@ -374,13 +374,28 @@ find_signoff_ruleset_id() {
 # report. The record protocol carries a signoff name faithfully — an embedded
 # newline stays one record and is written back exactly as it arrived.
 #
+# A non-empty second argument gates on enforcement: a ruleset whose
+# .enforcement is not "active" (i.e. "disabled" or "evaluate", GitHub's
+# dry-run mode) contributes NO contexts. This is for READS only — check,
+# status and their basis — because a disabled ruleset is not being enforced,
+# so reporting its contexts as required would be a lie. WRITES pass no second
+# argument and see the contexts regardless: install must preserve a disabled
+# ruleset's contexts (and re-activate it), and uninstall must still be able to
+# subtract from or delete one.
+#
 # Nonzero on API failure: readers may shrug that off as empty, but writers
 # must treat it as fatal — computing a union or remainder from contexts that
 # merely failed to load would silently drop requirements.
 signoff_ruleset_contexts() {
-  local id="$1" contexts
+  local id="$1" active_only="${2:-}" gate="" contexts
+  if [[ -n "$active_only" ]]; then
+    # A real ruleset GET always carries .enforcement, so the // "active"
+    # default only covers a response that omits it (never a live one) rather
+    # than silently masking a disabled ruleset
+    gate='select((.enforcement // "active") == "active") | '
+  fi
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
-    --jq ".rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[].context | (ascii_downcase) as \$k | select(\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) | ${CONTEXT_RECORD_JQ}" \
+    --jq "${gate}.rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[].context | (ascii_downcase) as \$k | select(\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) | ${CONTEXT_RECORD_JQ}" \
     2>/dev/null) || return 1
   printf '%s\n' "${contexts//$'\r'/}"
 }
@@ -466,9 +481,11 @@ fetch_required_signoff_contexts() {
   # ruleset simply won't be found, matching how reads treat API failures
   default_branch >/dev/null 2>&1 || true
 
+  # A read: gate on enforcement, so a disabled or evaluate-mode signoff
+  # ruleset contributes nothing and check/status report not-required
   ruleset_contexts=""
   if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") || ruleset_contexts=""
+    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID" active) || ruleset_contexts=""
   fi
 
   legacy=$(legacy_signoff_contexts "$branch")
@@ -491,10 +508,21 @@ legacy_upgrade_hint() {
 # this and no more: git allows more than printable ASCII in a ref name, that
 # is git's business, and a branch is named by the repository rather than by
 # us. Its display is scrubbed instead.
+#
+# "Unsafe for JSON" means exactly the quote, the backslash, and the C0
+# controls U+0000–U+001F — the only characters a JSON string literal must
+# escape. Deliberately NOT [[:cntrl:]], which in a UTF-8 locale also matches
+# the C1 controls (U+0080–U+009F, e.g. U+0085 NEL) whose bytes are legal both
+# in a git ref and, unescaped, in a JSON string — rejecting them would refuse
+# a valid branch. LC_ALL=C keeps the range a byte range, and the record-
+# forging characters newline (0x0A) and tab (0x09) are within C0, so the
+# record protocol stays safe. C1 controls pass and are display-scrubbed, as
+# the branch contract says.
 require_json_safe() {
   local what="$1" value="$2"
+  local LC_ALL=C
   case "$value" in
-    *[\"\\]* | *[[:cntrl:]]*)
+    *[\"\\]* | *[$'\x01'-$'\x1f']*)
       fail "${what} contains characters unsafe for JSON: $(scrub "$value")"
       ;;
   esac
@@ -628,7 +656,7 @@ json_array_of_tokens() {
 # non-empty but the adopted ruleset had no required_status_checks rule at all,
 # one is appended.
 build_reconcile_filter() {
-  local branch="$1" want_array="$2" name_json ref_json
+  local branch="$1" want_array="$2" enforcement_expr="$3" name_json ref_json
 
   require_json_safe "branch name" "$branch"
   name_json="\"$(signoff_ruleset_name "$branch")\""
@@ -643,7 +671,7 @@ build_reconcile_filter() {
   ({
     name: (.name // '"$name_json"'),
     target: (.target // "branch"),
-    enforcement: (.enforcement // "active"),
+    enforcement: '"$enforcement_expr"',
     bypass_actors: (.bypass_actors // [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}]),
     conditions: (.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}}),
     rules: (
@@ -671,10 +699,16 @@ build_reconcile_filter() {
 # reconciling to nothing when nothing exists is a no-op. An existing ruleset
 # is read once and transformed jq-side: the verdict says whether to delete it
 # (wholly ours, nothing left to require) or PUT the preserved remainder.
+#
+# The mode decides the written ruleset's enforcement. "activate" (install)
+# forces "active": installing signoff means enforcing it, so a disabled or
+# evaluate-mode ruleset is flipped back on while its contexts are preserved.
+# "preserve" (uninstall) keeps whatever enforcement the ruleset had — removing
+# a context is no reason to change whether the remainder is enforced.
 apply_signoff_ruleset() {
-  local branch="$1" id="$2"
-  shift 2
-  local want_array filter result verdict body
+  local branch="$1" id="$2" mode="$3"
+  shift 3
+  local want_array enforcement_expr filter result verdict body
 
   if [[ -z "$id" ]]; then
     if [[ $# -gt 0 ]]; then
@@ -683,8 +717,14 @@ apply_signoff_ruleset() {
     return
   fi
 
+  if [[ "$mode" == "activate" ]]; then
+    enforcement_expr='"active"'
+  else
+    enforcement_expr='(.enforcement // "active")'
+  fi
+
   want_array=$(json_array_of_tokens "$@")
-  filter=$(build_reconcile_filter "$branch" "$want_array")
+  filter=$(build_reconcile_filter "$branch" "$want_array" "$enforcement_expr")
   result=$(gh api "repos/:owner/:repo/rulesets/${id}" --jq "$filter" 2>/dev/null) ||
     fail "failed to read signoff ruleset"
   result=${result//$'\r'/}
@@ -1187,7 +1227,7 @@ cmd_install() {
 
   debug "installing signoff ruleset on branch: $(scrub "$branch") with ${#union[@]} contexts"
 
-  apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${union[@]}"
+  apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" activate "${union[@]}"
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
@@ -1291,7 +1331,7 @@ cmd_uninstall() {
       # Empty want: the reconcile deletes the ruleset when it is wholly ours,
       # or preserves it (dropping only our signoff checks) when it also holds
       # foreign checks or rules an admin added
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID"
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve
       removed=true
     fi
     if [[ "$LEGACY_PROTECTION" == "signoff" || -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
@@ -1340,7 +1380,7 @@ cmd_uninstall() {
         keep+=("$token")
       done <<<"$remaining"
       debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" "${keep[@]}"
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "${keep[@]}"
       if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
         migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
       elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
@@ -1349,7 +1389,7 @@ cmd_uninstall() {
     elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
       # The last signoff context is going away: delete the ruleset if it is
       # wholly ours, or keep it (foreign checks/rules preserved) otherwise
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID"
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve
     fi
     # Fatal, as in the bare case: the contexts just uninstalled may live in
     # legacy protection too, and a failed removal there keeps enforcing them

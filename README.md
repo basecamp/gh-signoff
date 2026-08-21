@@ -54,6 +54,8 @@ gh signoff install
 
 Those ruleset names are reserved: gh-signoff treats a repository branch ruleset named `signoff` or `signoff (<branch>)` as its own. But it manages only the signoff namespace inside it — the `signoff` and `signoff/<context>` checks. If you've added anything else to such a ruleset (a non-signoff status check, a check pinned to a GitHub App via its integration ID, an extra rule, admin-bypass or enforcement settings), all of it is preserved exactly across install and uninstall; only the signoff checks are added or removed. A bare `uninstall` deletes the ruleset only when it holds nothing but signoff checks and gh-signoff's own guards; if anything foreign remains, the ruleset is kept with just the signoff checks removed. And if two rulesets somehow share the reserved name, gh-signoff refuses to act until you remove the duplicate, rather than guess which one is real.
 
+`check` and `status` report a signoff requirement only when the ruleset is actively enforced. If you disable the ruleset or set it to evaluate (dry-run) mode in GitHub settings, `check` reports signoff as not required — because GitHub isn't enforcing it. Running `gh signoff install` again re-activates the ruleset, keeping its existing contexts.
+
 ### Context names
 
 A context name you give gh-signoff — the part after `signoff/` — must be an **identifier**: letters, digits, `.` `_` `/` `-`, starting with a letter or a digit. `tests`, `bash-3`, `build/linux` and `Lint` are all fine; `foo bar`, `-danger` and `café` are not.

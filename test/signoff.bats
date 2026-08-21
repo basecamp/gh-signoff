@@ -497,6 +497,120 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "a disabled signoff ruleset is not enforced, so reads report not-required" {
+  # GitHub is not enforcing a disabled ruleset, so check/status must not claim
+  # its contexts are required
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+
+  run -1 gh-signoff check tests
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on tests" ]] || return 1
+
+  # status shows only the always-present bare signoff row, as a missing one;
+  # the disabled ruleset's contexts do not appear as required
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_FAILURE} signoff" ]] || return 1
+}
+
+@test "an evaluate-mode signoff ruleset is dry-run, so reads report not-required" {
+  # evaluate is GitHub's non-enforcing dry-run mode; treated like disabled
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"evaluate","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  run -1 gh-signoff check tests
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on tests" ]] || return 1
+}
+
+@test "install re-activates a disabled ruleset and preserves its contexts" {
+  # Installing signoff means enforcing it: a disabled ruleset is flipped back
+  # to active, its existing signoff AND foreign checks kept, our new one added.
+  # The read-path enforcement gate must not make the union basis drop them.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"},{"context":"other-ci","integration_id":7}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"enforcement":"active"'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" == *'"context":"other-ci"'* ]] || return 1
+  [[ "$body" == *'"integration_id":7'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "uninstall still deletes a disabled ruleset that is wholly ours" {
+  # Enforcement does not gate writes: uninstall finds and removes a disabled
+  # ruleset like any other
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+}
+
+@test "uninstall preserves the enforcement of a ruleset it only trims" {
+  # Removing one context from a disabled ruleset that also holds a foreign
+  # check keeps it disabled — trimming is no reason to start enforcing
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/tests"},{"context":"other-ci"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"enforcement":"disabled"'* ]] || return 1
+  [[ "$body" == *'"context":"other-ci"'* ]] || return 1
+}
+
+@test "an active ruleset still contributes its contexts to reads" {
+  # No regression: explicit active enforcement behaves exactly as before
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  run -0 gh-signoff check tests
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1
+}
+
+@test "a branch name with a C1 control is accepted and reaches the payload" {
+  # Finding B: [[:cntrl:]] over-rejected C1 controls like U+0085 (NEL), whose
+  # bytes are legal in a git ref and unescaped in a JSON string. The branch
+  # contract allows non-ASCII; only C0, quote and backslash are unsafe.
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install --branch $'main\xc2\x85x'
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  # The ruleset name/ref carry the branch bytes verbatim into the JSON payload
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xc2\x85'* ]] || return 1
+}
+
+@test "a branch name with a C0 control is still rejected" {
+  # A real newline (C0) would forge records and break JSON; still refused
+  run -1 gh-signoff install --branch $'main\x0ax'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+
+  run -1 gh-signoff install --branch 'main"x'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+
+  run -1 gh-signoff install --branch 'main\x'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+}
+
 @test "install preserves a signoff check's integration_id" {
   # An adopted required check may be pinned to a GitHub App via integration_id
   # ("only this app may satisfy it"). We manage the signoff namespace but must
