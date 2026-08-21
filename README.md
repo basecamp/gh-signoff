@@ -45,8 +45,8 @@ A branch checked out from a cross-repository pull request (`gh pr checkout` on a
 
 ### Reporting a failure
 
-When a run fails -- especially one detached on a CI runner, where silence
-is indistinguishable from "never ran" -- leave a visible red mark:
+When a run fails — especially one detached on a CI runner, where silence
+is indistinguishable from "never ran" — leave a visible red mark:
 
 ```bash
 gh signoff fail
@@ -55,7 +55,9 @@ gh signoff fail --commit abc1234 --description "suite exploded"
 ```
 
 A red status is a warning, not an attestation, so no cleanliness check
-applies: the only requirement is that GitHub knows the commit.
+applies and no git identity is needed: the only requirement is that GitHub
+knows the commit. The default description is `<user.name>: CI failed`, or
+just `CI failed` on a checkout with no identity configured.
 
 ### To require signoff for PR merges
 

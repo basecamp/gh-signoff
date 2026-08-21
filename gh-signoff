@@ -1348,8 +1348,10 @@ cmd_create() {
 
 # Post a failing signoff status, so a CI run that fails — especially one
 # detached on a runner — leaves a visible red mark instead of silence. A red
-# status is a warning, not an attestation, so no cleanliness check applies:
-# the only requirement is that GitHub knows the commit at all.
+# status is a warning, not an attestation, so no cleanliness check applies,
+# and no git identity is needed: the only requirement is that GitHub knows the
+# commit at all. A runner's checkout typically has no user.name; it colors the
+# default description when present and is simply absent from it otherwise.
 cmd_fail() {
   local commit=""
   local description=""
@@ -1372,26 +1374,34 @@ cmd_fail() {
       -f)
         fail "-f is only valid for create"
         ;;
+      --)
+        # End of options: the rest are contexts, as for create
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
     esac
   done
 
-  local user
-  user=$(git config user.name) || fail "failed to get git user name"
-  [[ -z "$user" ]] && fail "git user.name is not set"
-
   if [[ -z "$commit" ]]; then
     commit=$(git rev-parse HEAD) || fail "failed to get current commit"
   fi
 
   if [[ -z "$description" ]]; then
-    description="${user}: CI failed"
+    local user
+    user=$(git config user.name 2>/dev/null) || user=""
+    description="${user:+${user}: }CI failed"
   fi
 
   if [ ${#contexts[@]} -eq 0 ]; then
@@ -1407,7 +1417,7 @@ cmd_fail() {
       context_name="signoff/${context}"
     fi
 
-    debug "creating failure status for commit ${commit} with context ${context_name}"
+    debug "creating failure status for commit ${commit} with context $(scrub "$context_name")"
 
     if gh api \
       --method POST \
@@ -1419,14 +1429,14 @@ cmd_fail() {
       if [[ -z "$context" ]]; then
         messages+=("${STATUS_FAILURE} Reported CI failure on ${commit}")
       else
-        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit} for ${context}")
+        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit} for $(scrub "$context")")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "Failed to report CI failure on ${commit}" >&2
+        printf '%s\n' "Failed to report CI failure on ${commit}" >&2
       else
-        echo "Failed to report CI failure on ${commit} for ${context}" >&2
+        printf '%s\n' "Failed to report CI failure on ${commit} for $(scrub "$context")" >&2
       fi
     fi
   done

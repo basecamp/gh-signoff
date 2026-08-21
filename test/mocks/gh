@@ -60,6 +60,7 @@ api_path=""
 jq_filter=""
 input_src=""
 request_body=""
+form_fields=""
 
 # Simple argument parsing loop
 while [[ $# -gt 0 ]]; do
@@ -81,6 +82,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --paginate)
       shift
+      ;;
+    -f|-F)
+      # Form fields are the request body for create and fail; keep them so
+      # the body log can show what a status POST actually carried
+      form_fields="${form_fields:+${form_fields} }$2"
+      shift 2
       ;;
     # Assume the first non-flag argument after 'api' is the path
     -*)
@@ -114,7 +121,7 @@ if [[ -n "${MOCK_CALL_LOG:-}" ]]; then
   echo "$api_method $api_path" >>"$MOCK_CALL_LOG"
 fi
 if [[ -n "${MOCK_BODY_LOG:-}" ]]; then
-  echo "$api_method $api_path $request_body" >>"$MOCK_BODY_LOG"
+  echo "$api_method $api_path ${request_body}${request_body:+${form_fields:+ }}${form_fields}" >>"$MOCK_BODY_LOG"
 fi
 
 # --- Response Helpers ---

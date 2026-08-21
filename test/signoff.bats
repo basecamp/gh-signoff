@@ -210,15 +210,54 @@ EOF
 # the untracked gh-signoff and gh mock binaries.
 @test "fail reports a CI failure without any cleanliness check" {
   [[ -n "$(git status --porcelain)" ]] || return 1
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  sha=$(git rev-parse HEAD)
 
   run -0 gh-signoff fail
-  [[ "$output" == *"${STATUS_FAILURE} Reported CI failure on"* ]] || return 1
+  [[ "$output" == *"${STATUS_FAILURE} Reported CI failure on $sha"* ]] || return 1
+
+  # The mock accepts any status POST, so prove what this one carried: a red
+  # state on the bare signoff context, described by whoever ran it
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == "POST repos/:owner/:repo/statuses/$sha state=failure context=signoff description=Test User: CI failed" ]] || return 1
 }
 
 @test "fail reports a CI failure for each named context" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
   run -0 gh-signoff fail tests lint
   [[ "$output" == *"for tests"* ]] || return 1
   [[ "$output" == *"for lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=failure context=signoff/tests description="* ]] || return 1
+  [[ "$body" == *" state=failure context=signoff/lint description="* ]] || return 1
+}
+
+@test "fail sends a custom --description verbatim" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff fail --description "suite exploded on bash 3"
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=failure context=signoff description=suite exploded on bash 3" ]] || return 1
+}
+
+# A runner's checkout has no git identity. The only requirement fail states
+# is that GitHub knows the commit, so identity must not be one in practice:
+# it merely drops out of the default description.
+@test "fail needs no git identity" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  git config --unset user.name
+  [[ -z "$(git config user.name)" ]] || return 1
+
+  run -0 gh-signoff fail
+  [[ "$output" == *"Reported CI failure on"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" description=CI failed" ]] || return 1
+
+  run -0 gh-signoff fail --description "suite exploded"
+  [[ "$output" == *"Reported CI failure on"* ]] || return 1
 }
 
 @test "fail targets the commit named by --commit" {
@@ -227,6 +266,21 @@ EOF
 
   run -0 gh-signoff fail --commit "${sha:0:8}"
   [[ "$output" == *"Reported CI failure on $sha"* ]] || return 1
+}
+
+@test "fail holds context names to the same rule as create" {
+  run -1 gh-signoff fail ""
+  [[ "$output" == *"context name cannot be empty"* ]] || return 1
+
+  run -1 gh-signoff fail 'qa"review'
+  [[ "$output" == *"context name contains characters unsafe for JSON"* ]] || return 1
+
+  # -- ends options, as for create, so a leading-dash name is a context
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  run -0 gh-signoff fail -- -qa
+  [[ "$output" == *"for -qa"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" context=signoff/-qa "* ]] || return 1
 }
 
 @test "fail --description requires an argument" {
