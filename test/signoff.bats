@@ -703,6 +703,24 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "install adds an unpinned signoff beside an app-pinned twin" {
+  # When the only signoff check is app-pinned, reads exclude it (foreign), so
+  # install wants an unpinned signoff. The pinned twin must not suppress that
+  # addition — a gh-signoff status could never satisfy the pinned one — while
+  # the pinned object is still preserved verbatim.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff","integration_id":12345}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  # The pinned check is preserved AND an unpinned signoff is added beside it
+  [[ "$body" == *'"context":"signoff","integration_id":12345'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+}
+
 @test "an adopted ruleset's foreign check is never surfaced but always preserved" {
   # An admin may have added a non-signoff check (other-ci) to a ruleset named
   # signoff. It is not a signoff requirement, so reads never show it — and it

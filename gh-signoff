@@ -780,10 +780,14 @@ def ours_check: (is_signoff((.context // "")|ascii_downcase)) and (.integration_
       [ .rules[]?
         | if .type=="required_status_checks" then
             (.parameters.required_status_checks // []) as $ex
-            | ($ex | map((.context // "")|ascii_downcase)) as $exk
+            # Dedup additions against OUR existing checks only, not every check:
+            # an app-pinned signoff twin is foreign (not ours_check), so it must
+            # not suppress adding our unpinned signoff — the keep clause below
+            # still preserves the pinned object verbatim.
+            | ($ex | map(select(ours_check) | ((.context // "")|ascii_downcase))) as $ourk
             | .parameters.required_status_checks =
                 ( [ $ex[] | ((.context // "")|ascii_downcase) as $k | select( (ours_check and (($wantkeys | index($k)) | not)) | not ) ]
-                  + [ $want[] | ascii_downcase as $wk | select( ($exk | index($wk)) | not ) | {context: .} ] )
+                  + [ $want[] | ascii_downcase as $wk | select( ($ourk | index($wk)) | not ) | {context: .} ] )
           else . end
       ]
       | map(select( (.type=="required_status_checks" and ((.parameters.required_status_checks|length)==0)) | not ))
