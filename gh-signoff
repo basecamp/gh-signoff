@@ -407,7 +407,7 @@ signoff_ruleset_contexts() {
     gate='select((.enforcement // "active") == "active") | '
   fi
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
-    --jq "${gate}.rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[].context | (ascii_downcase) as \$k | select(\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) | ${CONTEXT_RECORD_JQ}" \
+    --jq "${gate}.rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]? | ((.context // \"\") | ascii_downcase) as \$k | select((\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) and (.integration_id == null or .integration_id == -1)) | .context | ${CONTEXT_RECORD_JQ}" \
     2>/dev/null) || return 1
   printf '%s\n' "${contexts//$'\r'/}"
 }
@@ -740,10 +740,12 @@ build_reconcile_filter() {
   fi
 
   printf '%s' 'def is_signoff($k): $k == "signoff" or ($k | startswith("signoff/"));
+def ours_check: (is_signoff((.context // "")|ascii_downcase)) and (.integration_id == null or .integration_id == -1);
 '"$want_array"' as $want
 | ($want | map(ascii_downcase)) as $wantkeys
 | ( ([.rules[]? | .type | select(. as $t | (["deletion","non_fast_forward","required_status_checks"] | index($t)) | not)] | length == 0)
-    and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | is_signoff((.context // "")|ascii_downcase)] | all)
+    and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | ours_check] | all)
+    and ([.rules[]? | select(.type=="required_status_checks") | (.parameters.strict_required_status_checks_policy // false)] | all(. == false))
     and ((.target // "branch") == "branch")
     and (.bypass_actors == [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}])
     and '"$pristine_conditions"'
@@ -761,7 +763,7 @@ build_reconcile_filter() {
             (.parameters.required_status_checks // []) as $ex
             | ($ex | map((.context // "")|ascii_downcase)) as $exk
             | .parameters.required_status_checks =
-                ( [ $ex[] | ((.context // "")|ascii_downcase) as $k | select( (is_signoff($k)|not) or ($wantkeys | index($k)) ) ]
+                ( [ $ex[] | ((.context // "")|ascii_downcase) as $k | select( (ours_check and (($wantkeys | index($k)) | not)) | not ) ]
                   + [ $want[] | ascii_downcase as $wk | select( ($exk | index($wk)) | not ) | {context: .} ] )
           else . end
       ]
@@ -873,21 +875,24 @@ legacy_protection_disposition() {
   fi
 }
 
-# Surgically remove LEGACY_SIGNOFF_CONTEXTS from the branch's protection via
+# Surgically remove the given context records from the branch's protection via
 # the remove-status-check-contexts endpoint, leaving every other protection
-# setting untouched. Nonzero when they could not be removed.
+# setting untouched. The records are newline-delimited (empty removes nothing);
+# a bare uninstall passes all of LEGACY_SIGNOFF_CONTEXTS, a contextual one
+# passes only the requested contexts that actually live in the protection.
+# Nonzero when they could not be removed.
 #
 # The tokens go back exactly as the protection spelled them. Whether that
 # endpoint matches contexts case-insensitively is undocumented, and asking it
 # to remove a spelling nobody configured is a question worth not asking.
-remove_legacy_signoff_contexts() {
-  local branch="$1" json="" key token display response branch_path
+remove_legacy_contexts() {
+  local branch="$1" records="$2" json="" key token display response branch_path
   branch_path=$(urlencode_branch "$branch")
 
   while IFS=$'\t' read -r key token display; do
     [[ -n "$token" ]] || continue
     json="${json:+$json,}${token}"
-  done <<<"$LEGACY_SIGNOFF_CONTEXTS"
+  done <<<"$records"
   [[ -n "$json" ]] || return 0
 
   response=$(printf '{"contexts":[%s]}' "$json" | gh api \
@@ -916,7 +921,7 @@ retire_legacy_signoff() {
       gh api --method DELETE "repos/:owner/:repo/branches/${branch_path}/protection" >/dev/null 2>&1
       ;;
     other)
-      remove_legacy_signoff_contexts "$branch"
+      remove_legacy_contexts "$branch" "$LEGACY_SIGNOFF_CONTEXTS"
       ;;
   esac
 }
@@ -1442,44 +1447,81 @@ cmd_uninstall() {
       fail "no signoff requirement installed on ${branch_shown}"
     fi
 
-    # Subtract by folded key: signoff/Tests is the tests requirement as far
-    # as GitHub is concerned, so `uninstall tests` has to remove it
-    local requested="" remaining="" context key token display
+    # The requested contexts as folded keys. Subtract by folded key:
+    # signoff/Tests is the tests requirement as far as GitHub is concerned, so
+    # `uninstall tests` has to remove it.
+    local requested="" context key token display
     for context in "${contexts[@]}"; do
       requested="${requested:+$requested$'\n'}$(context_key "signoff/${context}")"
     done
 
-    while IFS=$'\t' read -r key token display; do
-      [[ -n "$key" ]] || continue
-      if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
-        remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
-      fi
-    done <<<"$available"
-
-    if [[ -n "$remaining" ]]; then
-      # Reconcile to the remainder — creating the ruleset when the contexts
-      # lived only in legacy protection, so contextual uninstall migrates too,
-      # and preserving any foreign checks/rules when the ruleset already exists
-      local keep=()
+    if [[ "$LEGACY_PROTECTION" == "other" ]]; then
+      # Customized legacy protection is left intact, exactly as install leaves
+      # it: remove ONLY the requested contexts from it, surgically, and keep
+      # the remaining signoff contexts under it (with the admin's strict,
+      # enforce_admins and other settings). They are NOT migrated into a
+      # canonical ruleset — that would drop the admin's policy. The ruleset,
+      # if any, subtracts only its own contexts.
+      local ruleset_remaining="" legacy_to_remove=""
       while IFS=$'\t' read -r key token display; do
-        keep+=("$token")
-      done <<<"$remaining"
-      debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards "${keep[@]}"
-      if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
-        migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
-      elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
-        migration_note="${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+          ruleset_remaining="${ruleset_remaining:+$ruleset_remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$existing"
+
+      if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+        local keep=()
+        while IFS=$'\t' read -r key token display; do
+          [[ -n "$token" ]] && keep+=("$token")
+        done <<<"$ruleset_remaining"
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards ${keep[@]+"${keep[@]}"}
       fi
-    elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-      # The last signoff context is going away: delete the ruleset if it is
-      # wholly ours, or keep it (foreign checks/rules preserved) otherwise
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards
+
+      # Only the requested contexts that actually live in the protection
+      while IFS=$'\t' read -r key token display; do
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' == *$'\n'"${key}"$'\n'* ]]; then
+          legacy_to_remove="${legacy_to_remove:+$legacy_to_remove$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$LEGACY_SIGNOFF_CONTEXTS"
+      remove_legacy_contexts "$branch" "$legacy_to_remove" ||
+        fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
+    else
+      # none or signoff-shaped: subtract from the union and migrate the
+      # remainder into the ruleset. A signoff-shaped legacy is then deleted, so
+      # the ruleset must carry the force-push/deletion guards that protection
+      # provided by default — same as the install-migrate path.
+      local guards="noguards" remaining=""
+      [[ "$LEGACY_PROTECTION" == "signoff" ]] && guards="guards"
+
+      while IFS=$'\t' read -r key token display; do
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+          remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$available"
+
+      if [[ -n "$remaining" ]]; then
+        local keep=()
+        while IFS=$'\t' read -r key token display; do
+          keep+=("$token")
+        done <<<"$remaining"
+        debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "$guards" "${keep[@]}"
+        if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+          migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+        fi
+      elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+        # The last signoff context is going away: delete the ruleset if it is
+        # pristine, or keep it (foreign checks/rules preserved) otherwise
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "$guards"
+      fi
+      # Fatal, as in the bare case: the contexts just uninstalled may live in
+      # legacy protection too, and a failed removal there keeps enforcing them
+      retire_legacy_signoff "$branch" ||
+        fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
     fi
-    # Fatal, as in the bare case: the contexts just uninstalled may live in
-    # legacy protection too, and a failed removal there keeps enforcing them
-    retire_legacy_signoff "$branch" ||
-      fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
   fi
 
   # Output success messages

@@ -791,6 +791,48 @@ EOF
   [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
 }
 
+@test "a ruleset with strict policy set is not pristine" {
+  # F3: pristine must compare the known mutable parameter, not just rule types.
+  # An admin who set strict_required_status_checks_policy=true customized the
+  # ruleset, so bare uninstall must rewrite (keep it, drop our signoff checks),
+  # not delete the whole thing including guards.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+}
+
+@test "an app-pinned signoff check is foreign to reads but preserved on writes" {
+  # F4: consistent with legacy (which excludes app-bound signoff checks). A
+  # signoff check pinned to a GitHub App via integration_id is not one
+  # gh-signoff created with the user token, and a plain user status can't
+  # satisfy it — so reads do not count it, though writes preserve it verbatim.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests","integration_id":123}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  # Reads: the pinned signoff/tests is not counted, so status shows only the
+  # baseline signoff row and check does not report it required
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_FAILURE} signoff" ]] || return 1
+
+  run -0 gh-signoff check tests
+  [[ "$output" == *"does not require signoff on tests"* ]] || return 1
+
+  # Writes: install lint preserves the pinned check verbatim (integration_id)
+  run -0 gh-signoff install lint
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"context":"signoff/tests"'* ]] || return 1
+  [[ "$body" == *'"integration_id":123'* ]] || return 1
+}
+
 @test "bare uninstall still deletes a ruleset that is wholly ours" {
   # The other side: only signoff checks and our own rules means delete it.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
@@ -1809,6 +1851,59 @@ EOF
   [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
   [[ "$body" != *'"signoff/tests"'* ]] || return 1
+}
+
+@test "contextual uninstall of signoff-shaped legacy arms guards on the remainder" {
+  # F1: consistent with install-migrate. Signoff-shaped legacy holding
+  # signoff/tests + signoff/lint; `uninstall tests` migrates lint into a
+  # ruleset and deletes the legacy protection — so the ruleset must carry the
+  # deletion/non_fast_forward guards that protection provided by default, or
+  # force pushes and deletions are silently enabled.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff/tests","signoff/lint"]},"enforce_admins":null,"required_pull_request_reviews":null,"restrictions":null}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"type":"deletion"}'* ]] || return 1
+  [[ "$body" == *'{"type":"non_fast_forward"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+  [[ "$body" != *"signoff/tests"* ]] || return 1
+}
+
+@test "contextual uninstall of customized legacy removes only the requested context" {
+  # F2: consistent with the leave-customized-intact install decision. Strict,
+  # admin-enforced protection holds signoff/tests + signoff/lint; `uninstall
+  # tests` removes ONLY signoff/tests from it, surgically, and leaves
+  # signoff/lint enforced under the intact customized protection — never
+  # migrating the remainder into a canonical ruleset (that would drop the
+  # admin's strict/enforce_admins policy).
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":true,"contexts":["signoff/tests","signoff/lint"]},"enforce_admins":{"enabled":true},"required_pull_request_reviews":null,"restrictions":null}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  # Only a surgical context removal; no ruleset created/updated, no wholesale delete
+  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" != *"POST repos/:owner/:repo/rulesets"* ]] || return 1
+  [[ "$calls" != *"PUT repos/:owner/:repo/rulesets"* ]] || return 1
+
+  # Exactly the requested context is removed; signoff/lint is left behind
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"contexts":["signoff/tests"]}'* ]] || return 1
+  [[ "$body" != *"signoff/lint"* ]] || return 1
 }
 
 @test "contextual uninstall migrates remaining legacy contexts" {
