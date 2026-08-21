@@ -86,8 +86,17 @@ resolve_commit() {
 
 # Is the commit on a remote we know about? Remote-tracking refs are only as
 # fresh as the last fetch, so this is a local proxy; -f overrides.
+#
+# Stale or absent tracking refs get the same one-time refresh is_clean gives
+# them: a CI runner's slot that just checked out a pushed commit has nothing
+# under refs/remotes yet, and `gh signoff --commit HEAD` (the documented CI
+# form) must not refuse what plain `gh signoff` on the same checkout accepts.
 commit_is_on_a_remote() {
-  if [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]; then
+  if commit_in_remote_tracking_refs "$1"; then
+    return 0
+  fi
+
+  if refresh_remote_tracking && commit_in_remote_tracking_refs "$1"; then
     return 0
   fi
 
@@ -99,6 +108,10 @@ commit_is_on_a_remote() {
   # `gh signoff` just proved was published.
   url_remote_tip || return 1
   git merge-base --is-ancestor "$1" "$URL_REMOTE_TIP" 2>/dev/null
+}
+
+commit_in_remote_tracking_refs() {
+  [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
 }
 
 # Get default branch with caching
@@ -1116,9 +1129,9 @@ url_remote_tip() {
   return 0
 }
 
-# check_clean, with one retry after refreshing the branch's remote-tracking
-# ref. A CI runner's slot — or any second machine — can hold the pushed commit
-# while its tracking ref is stale or absent (a freshly created checkout has
+# check_clean, with one retry after refreshing the remote-tracking ref it
+# judges. A CI runner's slot — or any second machine — can hold the pushed
+# commit while that ref is stale or absent (a freshly created checkout has
 # never fetched), which would misreport published work as unpushed. Only the
 # push-verification reasons warrant the fetch; uncommitted changes can't be
 # fixed by one.
@@ -1137,15 +1150,44 @@ is_clean() {
   esac
 }
 
+# Fetch the remote-tracking ref check_clean judges, so a recheck sees what the
+# remote actually holds. That ref is @{push}, or @{upstream} when that fallback
+# is sound — the same order check_clean resolves them in — and git derives both
+# from config alone, so for-each-ref names them even when the ref has never
+# been fetched. Refreshing the upstream regardless would miss every routed
+# configuration (branch.*.pushRemote, remote.pushDefault, push.default=current
+# or upstream, a push refspec): the fetch would land on a ref the check never
+# reads, and published work would still come back unpushed.
+#
+# Under the remote's default fetch refspec the tracking ref is
+# refs/remotes/<remote>/<branch> and one branch is all that needs fetching; a
+# remote with a rewritten refspec gets a full fetch instead, since the tracking
+# name no longer tells us which remote branch feeds it. A URL-tracking branch
+# (fork pull request) has no tracking ref at all and is checked live by
+# url_remote_tip, so there is nothing here to refresh.
 refresh_remote_tracking() {
-  local branch remote merge_ref
-  branch=$(git symbolic-ref --short -q HEAD) || return 1
-  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 1
-  [[ -n "$remote" && "$remote" != "." ]] || return 1
+  local branch tracking remote
+  branch=$(git symbolic-ref -q HEAD) || return 1
+
+  tracking=$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)
+  if [[ -n "$tracking" ]]; then
+    remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
+  elif upstream_fallback_is_safe; then
+    tracking=$(git for-each-ref --format='%(upstream)' "$branch" 2>/dev/null)
+    remote=$(git for-each-ref --format='%(upstream:remotename)' "$branch" 2>/dev/null)
+  else
+    return 1
+  fi
+  [[ -n "$tracking" && -n "$remote" ]] || return 1
   remote_is_named "$remote" || return 1
-  merge_ref=$(git config "branch.${branch}.merge" 2>/dev/null) || merge_ref="refs/heads/${branch}"
-  debug "refreshing ${remote} ${merge_ref} before declaring work unpushed"
-  git fetch --quiet "$remote" "$merge_ref" 2>/dev/null
+
+  if [[ "$tracking" == "refs/remotes/${remote}/"* ]]; then
+    debug "refreshing ${tracking} from ${remote}"
+    git fetch --quiet "$remote" "refs/heads/${tracking#refs/remotes/${remote}/}" 2>/dev/null
+  else
+    debug "refreshing ${remote}"
+    git fetch --quiet "$remote" 2>/dev/null
+  fi
 }
 
 check_clean() {

@@ -2493,6 +2493,60 @@ EOF
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
+@test "signoff still catches unpushed work after refreshing a stale tracking ref" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]] || return 1
+  # The refresh happened (the tracking ref now exists) and the recheck held
+  git rev-parse --verify -q refs/remotes/origin/main >/dev/null || return 1
+}
+
+# The ref to refresh is the one check_clean judges: @{push}, which routing
+# config can point at a remote other than the upstream. Refreshing the
+# upstream there would land on a ref the check never reads.
+@test "signoff refreshes the effective push remote, not the upstream" {
+  make_pushed_repo
+  git init -q --bare "$TEST_DIR/pushes.git"
+  git remote add pushes "$TEST_DIR/pushes.git"
+  git config branch.main.pushRemote pushes
+  git config push.default current
+  git commit --no-gpg-sign --allow-empty -m "Pushed to the push remote" >/dev/null
+  # The push remote holds the commit; neither tracking ref knows yet, and
+  # the upstream (origin) never will
+  git push -q "$TEST_DIR/pushes.git" HEAD:main
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/pushes/main" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  git rev-parse --verify -q refs/remotes/pushes/main >/dev/null || return 1
+}
+
+# The same runner slot signs off with --commit HEAD, the documented CI form,
+# and must not be refused for the stale tracking ref that plain signoff just
+# looked past
+@test "--commit refreshes a stale tracking ref before refusing the commit" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  sha=$(git rev-parse HEAD)
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  # Still refused when the refresh shows the commit was never pushed
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  run -1 gh-signoff --commit HEAD
+  [[ "$output" == *"is not on any remote"* ]] || return 1
+}
+
 @test "signoff fails with clear message when no push destination or upstream" {
   make_nested_repo
 
