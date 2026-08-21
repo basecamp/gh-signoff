@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.3.0"
+readonly VERSION="0.4.0"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -40,18 +40,18 @@ RESOLVED_COMMIT_IS_LOCAL=true
 
 debug() {
   if [[ -n "$DEBUG" ]]; then
-    echo "Debug: $*" >&2
+    printf 'Debug: %s\n' "$*" >&2
   fi
 }
 
 fail() {
-  echo "Error: $*" >&2
+  printf 'Error: %s\n' "$*" >&2
   exit 1
 }
 
 reject_extra_args() {
   if [[ $# -gt 0 ]]; then
-    fail "unexpected argument: $1"
+    fail "unexpected argument: $(scrub "$1")"
   fi
 }
 
@@ -74,12 +74,12 @@ resolve_commit() {
 
   # We have the object but it doesn't peel to a commit: a tree or a blob
   if git cat-file -e "$rev" 2>/dev/null; then
-    fail "not a commit: $rev"
+    fail "not a commit: $(scrub "$rev")"
   fi
 
   # Unknown to git. A full sha may still name a commit we haven't fetched;
   # anything shorter or non-hex is a typo, not a revision.
-  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $rev"
+  [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || fail "invalid commit: $(scrub "$rev")"
   RESOLVED_COMMIT="$rev"
   RESOLVED_COMMIT_IS_LOCAL=false
 }
@@ -118,28 +118,864 @@ default_branch() {
     }
     DEFAULT_BRANCH=${DEFAULT_BRANCH//$'\r'/}
   fi
-  echo "$DEFAULT_BRANCH"
+  printf '%s\n' "$DEFAULT_BRANCH"
 }
 
-# Get signoff contexts from branch protection, stripping the 'signoff/' prefix.
-# select() drops the bare 'signoff' context, which has no display name.
-get_signoff_contexts() {
-  local branch="${1:-}"
+# Populate the DEFAULT_BRANCH cache in this shell, or die. A
+# $(default_branch) capture caches only inside its subshell, so ruleset
+# identity — which hinges on whether the branch is the default — would
+# re-resolve per call and could flip mid-command on a transient API failure,
+# misnaming the ruleset. Writers call this up front and fail rather than
+# guess; readers warm the cache tolerantly and degrade to "none found".
+require_default_branch() {
+  default_branch >/dev/null || fail "failed to get default branch"
+}
 
-  # If branch not specified, use default branch
-  if [[ -z "$branch" ]]; then
-    branch=$(default_branch) || return 0
+# --- The context record protocol ---
+#
+# Status check contexts are arbitrary strings chosen by whoever configured
+# them, and this script ferries lists of them between API calls through
+# newline-delimited shell variables. Carrying the raw name in that stream is
+# what made two separate bugs possible, so contexts travel as records instead:
+#
+#     folded_key <TAB> json_token <TAB> display
+#
+# Three fields because the name is asked three different questions, and one
+# spelling cannot answer all of them.
+#
+# json_token is the name as a JSON string literal, produced jq-side by
+# tojson. A newline inside a context name arrives as the two characters \n,
+# so one context can never split into two records, and no record can hold a
+# raw newline, tab or CR — the whole class of forged records is gone by
+# construction rather than by detection. The token also splices straight into
+# a request body: {"context":TOKEN} is already escaped exactly as GitHub sent
+# it, so a name round-trips byte for byte through a union or a subtraction.
+#
+# folded_key is tojson of the ascii_downcase'd name, and it is what every
+# identity comparison uses — dedup, subtraction, membership, status lookup.
+# GitHub documents contexts as case-insensitive identifiers, so signoff/Tests
+# and signoff/tests are one requirement; comparing folded keys makes that true
+# everywhere at once, while the token keeps the original spelling for anything
+# sent back.
+#
+# display is the name with every character outside printable ASCII shown as
+# a question mark, and it is the only field that ever reaches a terminal.
+#
+# --- Two rules, for two different jobs ---
+#
+# Names are held to two separate standards; conflating them produced several
+# rounds of findings. Each answers a different question.
+#
+#   JSON/record safety (require_json_safe, and require_context_name which adds
+#   a non-empty check) answers "may this be spliced into a payload or composed
+#   into a record?" It rejects only the quote, the backslash and the C0
+#   controls U+0000–U+001F — the characters a JSON string literal must escape,
+#   which are also the ones that would break the bash-composed token or forge a
+#   record. It governs BOTH branch names and context names the user types.
+#   feature/x, release-1.2, and a migrated legacy context like "qa review" are
+#   all legitimate; only what breaks the request body or the record stream is
+#   refused. (An earlier, stricter identifier grammar for context args existed
+#   solely to make shell-completion candidates injection-safe; completion has
+#   been removed, nothing shell-evaluates a context, so that armor is gone and
+#   record/JSON safety is the boundary.)
+#
+#   The display alphabet (scrub, and the display field below) answers "how do
+#   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else as
+#   a question mark. It applies to every name we did not author, however it is
+#   spelled, because anything can be shown even when it carries bytes JSON
+#   safety allowed (a C1 control, say).
+#
+# Enforcement sits outside both. Whatever a repo admin put in our ruleset is
+# carried and written back byte for byte, whatever it is named. We do not edit
+# a requirement we merely adopted, and no display or input rule ever reaches a
+# payload.
+#
+# Display is lossy, and deliberately NOT injective. Two different names
+# outside the display alphabet can show identically — one holding U+202E and
+# one holding a C1 control both read as ?, and status will show two rows that
+# read the same. Their keys, tokens and enforcement stay entirely distinct;
+# only the rendering collides. Telling them apart on screen would take a Unicode
+# escaping engine written in bash, to distinguish names this tool refuses to
+# create in the first place. The lossy spelling is the honest one: it says
+# "something here is outside what I can show you".
+#
+# What this buys is that no name can act on the terminal it prints to. tojson
+# escapes what JSON requires and nothing more, so a token still carries C1
+# controls and format characters verbatim, and U+202E RIGHT-TO-LEFT OVERRIDE
+# in an adopted name would reorder the line it printed on — an adopted
+# requirement made to read as a different one. Tab and newline are outside
+# the alphabet too, so the display field cannot forge a record either.
+#
+# Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
+#
+# Bash composes records in exactly one place — contexts named on the command
+# line — where require_context_name has already refused the quote, backslash
+# and C0 controls JSON would need to escape. So wrapping the name in quotes is
+# all the serialization the token needs. Bash folds the key with tr, because
+# Bash 3 has no ${var,,}, and it never unescapes a token: nothing downstream
+# wants the raw bytes back, and a half-written unescaper would hand this class
+# of bug straight back.
+CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[^\\x20-\\x7e]"; "?"))"'
+
+# The same charset rule for everything else this script prints that it did
+# not author: a branch name from the API, a rejected argument, the request
+# JSON in a debug line. Records get their display field from jq; these have
+# no jq to reach, so they get a scrubber instead, and it is deliberately the
+# duller of the two — one pass of tr, no parsing.
+#
+# LC_ALL=C makes ' -~' mean exactly bytes 0x20 to 0x7E, so a UTF-8 character
+# scrubs to one ? per byte where jq's would give one ? per character. The two
+# spellings do not have to agree: neither is reversible, and both say the
+# same thing, which is that something unprintable was there. Values here are
+# single-line by nature; a newline would scrub to ? like anything else.
+scrub() {
+  printf '%s' "$1" | LC_ALL=C tr -c ' -~' '?'
+}
+
+# Percent-encode a branch name for use as a REST path segment. `gh api` treats
+# the path as a URL, so a valid git ref containing '#' or '%' would otherwise
+# be read as a fragment or a stray escape — the request would target the wrong
+# branch, and a migration read or an uninstall could report success while the
+# real branch stayed enforced. Everything outside the RFC 3986 unreserved set
+# is encoded, EXCEPT '/': GitHub's branch-protection routes match embedded
+# slashes literally, so feature/x must stay feature/x. LC_ALL=C makes ${#s}
+# and the slice count bytes, so a multibyte character encodes byte by byte.
+urlencode_branch() {
+  local s="$1" out="" i c n
+  local LC_ALL=C
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9._~/-]) out="$out$c" ;;
+      *)
+        # "'$c" is the byte's value; mask to 0-255 because printf reads a high
+        # byte as a signed char (negative) on some bash builds, which would
+        # otherwise mis-encode a multibyte character
+        n=$(printf '%d' "'$c")
+        out="$out$(printf '%%%02X' "$(( n & 255 ))")"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Fail if the branch does not exist on the repository. install writes a
+# ruleset by ref-name pattern, which GitHub accepts with or without a matching
+# branch, so a typo'd --branch would otherwise silently install an unused
+# policy (the old branch-protection PUT failed on an absent branch). A 404 is
+# "not found"; any other API failure is surfaced rather than swallowed. gh
+# prints the error body to stdout, so the capture distinguishes the two.
+require_branch_exists() {
+  local branch="$1" response
+  response=$(gh api "repos/:owner/:repo/branches/$(urlencode_branch "$branch")" --jq .name 2>/dev/null) || {
+    if [[ "$response" == *'"status":"404"'* ]]; then
+      fail "branch $(scrub "$branch") not found on this repository"
+    fi
+    fail "failed to check whether branch $(scrub "$branch") exists"
+  }
+}
+
+# LC_ALL=C so the fold is exactly A-Z, matching jq's ascii_downcase. Left to
+# the ambient locale, tr's [:upper:] can take in a single-byte locale's
+# accented letters and rewrite bytes that are really half of a UTF-8
+# character — a key that no longer matches the one jq computed, which would
+# show up as a subtraction that silently removes nothing.
+context_key() {
+  printf '"%s"' "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+}
+
+context_record() {
+  printf '%s\t"%s"\t%s' "$(context_key "$1")" "$1" "$1"
+}
+
+# --- Rulesets ---
+#
+# Signoff requirements live in a repository ruleset that this extension owns
+# outright: exactly one per branch, named deterministically from the branch,
+# created by install, tweaked only by install/uninstall, deleted by a bare
+# uninstall. Other rulesets — the repo's, the org's — layer alongside and are
+# none of our business in either direction. The only reason to list rulesets
+# at all is to find our own id by name, because the API has no upsert.
+#
+# Repos protected by an older gh-signoff carry legacy branch protection
+# instead. Reads merge its signoff contexts in so they keep working, and
+# install migrates it: the union of both worlds lands in the ruleset, then
+# the legacy protection is deleted when it holds nothing but what old
+# gh-signoff installs wrote.
+
+# Results of the last find_signoff_ruleset_id call (empty = no ruleset)
+SIGNOFF_RULESET_ID=""
+
+# Results of the last fetch_required_signoff_contexts call
+SIGNOFF_CONTEXTS=""
+SIGNOFF_LEGACY_PRESENT=false
+
+# Results of the last legacy_protection_disposition call
+LEGACY_PROTECTION="none"
+LEGACY_SIGNOFF_CONTEXTS=""
+
+# Results of the last merge_contexts call
+MERGED_CONTEXTS=""
+
+# The default branch's ruleset is named plain 'signoff' and targets
+# ~DEFAULT_BRANCH, so it survives a default-branch rename. Any other branch
+# gets its name in the ruleset name and an explicit ref.
+signoff_ruleset_name() {
+  local branch="$1"
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    echo "signoff"
+  else
+    printf '%s\n' "signoff (${branch})"
+  fi
+}
+
+signoff_ruleset_ref() {
+  local branch="$1"
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    echo "~DEFAULT_BRANCH"
+  else
+    printf '%s\n' "refs/heads/${branch}"
+  fi
+}
+
+# Find our ruleset by its deterministic name, reporting via SIGNOFF_RULESET_ID
+# (empty = none). The list endpoint answers 200 [] when no rulesets exist, so
+# "none" is an empty id, not an error; nonzero means the API call itself
+# failed, which writers treat as fatal and readers as "none".
+#
+# includes_parents=false keeps org-level rulesets out: the list includes them
+# by default, and an org policy that happens to be named "signoff" is another
+# tenant's artifact, not ours to read or write. targets=branch likewise
+# excludes tag and push rulesets. Within this repo's branch rulesets, though,
+# the name IS the identity claim: a repo admin who creates a ruleset named
+# exactly "signoff" is claiming signoff semantics, and install adopting it
+# (managing its signoff contexts, preserving everything else) is the intended
+# behavior, not a collision to defend against.
+#
+# Two rulesets sharing our name is a different matter: which one we adopt
+# would be arbitrary, reads would report one while the other still enforced,
+# and a bare uninstall would delete one and leave the other. So fail closed
+# on a conflict — everywhere, readers and writers alike — rather than act on
+# a guess. Resolving it means removing the duplicate in repo settings.
+#
+# The default branch accepts a second spelling. If signoff was installed on a
+# then-non-default branch (say develop, ruleset "signoff (develop)") and
+# develop later became the default, its canonical name is now the bare
+# "signoff" — so identity resolution for the default branch matches EITHER
+# "signoff" or "signoff (<default-branch-name>)", adopting whichever exists so
+# reads still see it and uninstall/install can still manage it (install
+# renames it to the canonical shape). If BOTH exist, that is the same conflict
+# as any duplicate and fails closed. Non-default branches match one name only.
+find_signoff_ruleset_id() {
+  local branch="$1" name alt="" rows id rname count=0
+  SIGNOFF_RULESET_ID=""
+
+  name=$(signoff_ruleset_name "$branch")
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    alt="signoff (${branch})"
   fi
 
-  local contexts
-  contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(startswith("signoff/")) | ltrimstr("signoff/")' \
-    2>/dev/null) || return 0
-  contexts=${contexts//$'\r'/}
+  rows=$(gh api "repos/:owner/:repo/rulesets?includes_parents=false&targets=branch" --paginate \
+    --jq '.[] | [.id, .name] | @tsv' 2>/dev/null) || return 1
+  rows=${rows//$'\r'/}
 
-  if [[ -n "$contexts" ]]; then
-    echo "$contexts"
+  while IFS=$'\t' read -r id rname; do
+    if [[ "$rname" == "$name" || ( -n "$alt" && "$rname" == "$alt" ) ]]; then
+      count=$((count + 1))
+      [[ -z "$SIGNOFF_RULESET_ID" ]] && SIGNOFF_RULESET_ID="$id"
+    fi
+  done <<<"$rows"
+
+  if [[ "$count" -gt 1 ]]; then
+    SIGNOFF_RULESET_ID=""
+    fail "multiple signoff rulesets on $(scrub "$branch"); remove the duplicate in repo settings"
   fi
+}
+
+# The signoff contexts a ruleset requires, one record per line on stdout.
+# Only the signoff namespace — context exactly 'signoff' or 'signoff/…',
+# case-folded — is returned: an admin may have added a foreign check (say
+# 'other-ci') to a ruleset named 'signoff', and that is not a signoff
+# requirement, so reads never surface it and the write path never counts it
+# when computing what to add or remove. The foreign check is still preserved
+# on every write (see build_reconcile_filter); it is simply not ours to
+# report. The record protocol carries a signoff name faithfully — an embedded
+# newline stays one record and is written back exactly as it arrived.
+#
+# A non-empty second argument gates on enforcement: a ruleset whose
+# .enforcement is not "active" (i.e. "disabled" or "evaluate", GitHub's
+# dry-run mode) contributes NO contexts. This is for READS only — check,
+# status and their basis — because a disabled ruleset is not being enforced,
+# so reporting its contexts as required would be a lie. WRITES pass no second
+# argument and see the contexts regardless: install must preserve a disabled
+# ruleset's contexts (and re-activate it), and uninstall must still be able to
+# subtract from or delete one.
+#
+# Nonzero on API failure: readers may shrug that off as empty, but writers
+# must treat it as fatal — computing a union or remainder from contexts that
+# merely failed to load would silently drop requirements.
+signoff_ruleset_contexts() {
+  local id="$1" active_only="${2:-}" branch="${3:-}" gate="" refs_json contexts
+  if [[ -n "$active_only" ]]; then
+    # A read gate: the ruleset must be actively enforced AND actually target
+    # the requested branch. A real GET always carries .enforcement and
+    # .conditions, so the // defaults only cover a response that omits them
+    # (never a live one), not a real disabled or retargeted ruleset.
+    #
+    # "Targets the branch" is a membership test against our canonical refs —
+    # for the default branch either ~DEFAULT_BRANCH or refs/heads/<default>
+    # (a promoted ruleset may carry the explicit spelling), for a non-default
+    # branch refs/heads/<branch>: the include list must contain one and the
+    # exclude list none. LIMITATION: this does NOT evaluate ref-name patterns.
+    # A wildcard include an admin hand-set (refs/heads/*, ~ALL) that happens to
+    # cover the branch reads as not-targeted, so reads under-report ("not
+    # required"). That is the safe direction — we never falsely claim required
+    # — and our own rulesets always use canonical single-branch targeting, so
+    # only a hand-retargeted ruleset is affected. Writes are NOT gated:
+    # install must still read a retargeted ruleset's contexts to preserve them
+    # and re-normalize its conditions (reclaiming it), so writers pass no
+    # active_only and skip this entirely.
+    if [[ "$branch" == "$(default_branch)" ]]; then
+      refs_json='["~DEFAULT_BRANCH","refs/heads/'"$branch"'"]'
+    else
+      refs_json='["refs/heads/'"$branch"'"]'
+    fi
+    gate='select((.enforcement // "active") == "active") | select( (.conditions == null) or ( (.conditions.ref_name.include // []) as $inc | (.conditions.ref_name.exclude // []) as $exc | ('"$refs_json"' | map(. as $r | ($inc | index($r)) != null) | any) and (('"$refs_json"' | map(. as $r | ($exc | index($r)) != null) | any) | not) ) ) | '
+  fi
+  contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
+    --jq "${gate}.rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]? | ((.context // \"\") | ascii_downcase) as \$k | select((\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) and (.integration_id == null or .integration_id == -1)) | .context | ${CONTEXT_RECORD_JQ}" \
+    2>/dev/null) || return 1
+  printf '%s\n' "${contexts//$'\r'/}"
+}
+
+# The one definition of "a legacy status check that is ours": named exactly
+# 'signoff' or 'signoff/…' — the only names this tool has ever written — in
+# that exact case, and bound to no particular GitHub App, because old
+# installs never bound one. A 'signoff-security' context, a lone 'SignOff',
+# or a signoff check pinned to an app_id is someone else's configuration:
+# never claimed, migrated, removed, or counted by reads. Ownership is the one
+# comparison that stays case-sensitive and exact.
+#
+# A check is also only ours if it is record/JSON-safe — no quote, backslash,
+# or C0 control (U+0000–U+001F) — the same class require_context_name enforces
+# on a typed context. 0.3.0 passed context arguments to the API unvalidated,
+# so a legacy check may carry any of those; but recognition must match what
+# the CLI can operate. If we claimed a legacy `signoff/qa"review`, we would
+# migrate it yet reject `check`/`uninstall 'qa"review'`, trapping a
+# requirement that can be neither signed nor removed. So an unsafe legacy
+# check is NOT ours: not migrated, not counted, not removed — left in the
+# legacy protection for manual management.
+#
+# This deliberately reverses an earlier "recognizing a control-bearing name
+# costs nothing" note. It does cost something — a migrate-but-unsignable trap
+# — once context input is held to record/JSON safety. Recognition now equals
+# operation: we claim only contexts we can safely serialize as a bash token.
+# (The ruleset side needs no such filter: it carries arbitrary names as
+# jq-escaped tojson tokens, which the CLI never hand-composes.)
+#
+# Reads from `checks` (the modern view carrying app identity), normalizing
+# the deprecated `contexts` list when a response has only that.
+LEGACY_CHECKS='(.required_status_checks.checks // [.required_status_checks.contexts[]? | {context: ., app_id: null}])'
+LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1) and ((.context | test("[\\x00-\\x1f\"\\\\]")) | not))'
+
+# The stream of our context records, with one more guard: a name shared with
+# an app-bound check is not ours either. The removal endpoint matches by
+# name alone, so claiming the unbound twin would strip the app-bound foreign
+# requirement along with it — fail closed by disowning the shared name. The
+# comparison folds case, because GitHub's context identity does and the
+# removal endpoint's own case matching is undocumented: an app-bound SignOff
+# disowns an unbound signoff too.
+LEGACY_OUR_CONTEXTS="${LEGACY_CHECKS}"' as $checks | $checks[]? | '"select(${LEGACY_CHECK_IS_OURS})"' | .context as $name | ($name | ascii_downcase) as $key | select(([$checks[]? | select((((.context // "") | ascii_downcase) == $key) and ((.app_id == null or .app_id == -1) | not))] | length) == 0) | $name | '"${CONTEXT_RECORD_JQ}"
+
+# The branch's legacy signoff contexts, one record per line on stdout. A 404
+# (no protection) reads as empty, matching the old unprotected signal.
+legacy_signoff_contexts() {
+  local branch="$1" contexts branch_path
+  branch_path=$(urlencode_branch "$branch")
+  contexts=$(gh api "repos/:owner/:repo/branches/${branch_path}/protection" \
+    --jq "${LEGACY_OUR_CONTEXTS}" \
+    2>/dev/null) || contexts=""
+  printf '%s\n' "${contexts//$'\r'/}"
+}
+
+# Merge newline-separated context record lists, preserving order and dropping
+# blanks and duplicates. Reports via MERGED_CONTEXTS. Two records are the same
+# requirement when their folded keys match, and the first spelling seen is the
+# one kept. Membership is the whole-line substring check used throughout,
+# against a parallel list of the keys already taken; Bash 3 has no
+# associative arrays.
+merge_contexts() {
+  local list key token display seen=""
+  MERGED_CONTEXTS=""
+  for list in "$@"; do
+    while IFS=$'\t' read -r key token display; do
+      [[ -n "$key" ]] || continue
+      if [[ $'\n'"$seen"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+        MERGED_CONTEXTS="${MERGED_CONTEXTS:+$MERGED_CONTEXTS$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        seen="${seen:+$seen$'\n'}$key"
+      fi
+    done <<<"$list"
+  done
+}
+
+# Every signoff context the branch requires: our ruleset's, merged with any
+# legacy branch protection still in place. Reports via SIGNOFF_CONTEXTS (one
+# record per line) and SIGNOFF_LEGACY_PRESENT rather than stdout — a $(...)
+# capture would strand the flag in a subshell (the RESOLVED_COMMIT pattern).
+# API failures read as "none", matching the old 404 handling.
+fetch_required_signoff_contexts() {
+  local branch="$1" ruleset_contexts legacy
+  SIGNOFF_CONTEXTS=""
+  SIGNOFF_LEGACY_PRESENT=false
+
+  # The active read splices the branch's ref into a jq conditions gate, so a
+  # branch name carrying a quote or backslash would build an invalid filter
+  # whose failure would be swallowed as "not required". Reject it here, the
+  # same names the write path refuses — gh-signoff cannot represent such a
+  # branch in a ruleset anyway, so check and status decline it rather than
+  # misreport.
+  require_json_safe "branch name" "$branch"
+
+  # Warm the default-branch cache in this shell so the identity lookups below
+  # resolve consistently and without refetching; when it's unavailable, the
+  # ruleset simply won't be found, matching how reads treat API failures
+  default_branch >/dev/null 2>&1 || true
+
+  # A read: gate on enforcement, so a disabled or evaluate-mode signoff
+  # ruleset contributes nothing and check/status report not-required
+  ruleset_contexts=""
+  if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID" active "$branch") || ruleset_contexts=""
+  fi
+
+  legacy=$(legacy_signoff_contexts "$branch")
+  if [[ -n "$legacy" ]]; then
+    SIGNOFF_LEGACY_PRESENT=true
+  fi
+
+  merge_contexts "$ruleset_contexts" "$legacy"
+  SIGNOFF_CONTEXTS="$MERGED_CONTEXTS"
+}
+
+# One-line nudge for repos still carrying legacy signoff branch protection
+legacy_upgrade_hint() {
+  echo "Note: signoff is enforced via legacy branch protection; run 'gh signoff install' to migrate it to a ruleset" >&2
+}
+
+# The ruleset payload is assembled as a JSON string and a branch name is
+# spliced into it raw, so refuse the characters that would break out of a
+# string literal rather than escape arbitrary input. Branches are held to
+# this and no more: git allows more than printable ASCII in a ref name, that
+# is git's business, and a branch is named by the repository rather than by
+# us. Its display is scrubbed instead.
+#
+# "Unsafe for JSON" means exactly the quote, the backslash, and the C0
+# controls U+0000–U+001F — the only characters a JSON string literal must
+# escape. Deliberately NOT [[:cntrl:]], which in a UTF-8 locale also matches
+# the C1 controls (U+0080–U+009F, e.g. U+0085 NEL) whose bytes are legal both
+# in a git ref and, unescaped, in a JSON string — rejecting them would refuse
+# a valid branch. LC_ALL=C keeps the range a byte range, and the record-
+# forging characters newline (0x0A) and tab (0x09) are within C0, so the
+# record protocol stays safe. C1 controls pass and are display-scrubbed, as
+# the branch contract says.
+require_json_safe() {
+  local what="$1" value="$2"
+  local LC_ALL=C
+  case "$value" in
+    *[\"\\]* | *[$'\x01'-$'\x1f']*)
+      fail "${what} contains characters unsafe for JSON: $(scrub "$value")"
+      ;;
+  esac
+}
+
+# A context name the user typed. Held to the same record/JSON safety as a
+# branch name — no unescaped quote, backslash or C0 control — and non-empty.
+#
+# This used to be a strict identifier grammar (letters, digits, . _ / - ). That
+# grammar was armor for one thing: shell-completion candidates, which get
+# inserted onto a Readline line where a space or a $() would be shell-active.
+# Completion has since been removed entirely, and nothing else shell-evaluates
+# a context: create passes it as a `gh api -f` field, reads carry it as a JSON
+# token, and messages and status scrub it. So the grammar guarded a threat
+# that no longer exists — and it trapped legitimate migrated legacy contexts
+# like "signoff/qa review", which could then be neither signed nor removed.
+# Record/JSON safety is the right boundary now: it keeps the bash-composed
+# token valid (that is what the quote/backslash/C0 rejection buys) while
+# letting an inert space, $ or ; live in a context name.
+require_context_name() {
+  local what="$1" value="$2"
+  [[ -n "$value" ]] || fail "${what} cannot be empty"
+  require_json_safe "$what" "$value"
+}
+
+# bypass_actors grants repository admins an always-on bypass, preserving the
+# legacy enforce_admins=null semantics: actor_id 5 is the Admin repository
+# role, per GitHub's own UI-exported rulesets.
+#
+# deletion and non_fast_forward ride along with the status checks because
+# legacy branch protection blocked branch deletion and force pushes by
+# default — every 0.3.0 install had that side effect, so a ruleset without
+# these rules would quietly weaken a migrated (or fresh) install.
+#
+# The contexts arrive as JSON tokens — already quoted and escaped, by jq for
+# anything read back from GitHub and by require_json_safe plus quoting for
+# anything named on the command line — so they splice in as they are.
+build_signoff_ruleset_json() {
+  local branch="$1" guards="$2"
+  shift 2
+  local name ref checks="" token guard_rules=""
+
+  require_json_safe "branch name" "$branch"
+  name=$(signoff_ruleset_name "$branch")
+  ref=$(signoff_ruleset_ref "$branch")
+
+  for token in "$@"; do
+    checks="${checks:+$checks,}{\"context\":${token}}"
+  done
+
+  # The force-push and deletion guards are omitted when we are leaving
+  # customized legacy protection intact to govern them (see cmd_install)
+  if [[ "$guards" == "guards" ]]; then
+    guard_rules='{"type":"deletion"},{"type":"non_fast_forward"},'
+  fi
+
+  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[${guard_rules}{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
+}
+
+# Create a fresh ruleset requiring exactly the given signoff contexts. This is
+# the only path that authors our shape from scratch — active enforcement, the
+# admin bypass, and the deletion/non_fast_forward guards — because nothing
+# exists yet to preserve. gh prints the API error body to stdout; forward it
+# to stderr on failure so a plan-tier or permission error is diagnosable.
+create_signoff_ruleset() {
+  local branch="$1" guards="$2"
+  shift 2
+  local json response
+
+  json=$(build_signoff_ruleset_json "$branch" "$guards" "$@")
+  debug "creating signoff ruleset for $(scrub "$branch"): $(scrub "$json")"
+
+  response=$(printf '%s' "$json" | gh api "repos/:owner/:repo/rulesets" \
+    --method POST \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --input - 2>/dev/null) || {
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
+    fail "failed to create signoff ruleset"
+  }
+}
+
+# PUT a pre-built ruleset body (produced by build_reconcile_filter) back to an
+# existing ruleset.
+put_signoff_ruleset() {
+  local id="$1" body="$2" response
+  debug "updating signoff ruleset ${id}: $(scrub "$body")"
+  response=$(printf '%s' "$body" | gh api "repos/:owner/:repo/rulesets/${id}" \
+    --method PUT \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --input - 2>/dev/null) || {
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
+    fail "failed to update signoff ruleset"
+  }
+}
+
+# A JSON array literal of the given context tokens. Each token is already a
+# JSON string literal (the record protocol's token field), so joining with
+# commas and wrapping in brackets yields valid JSON — [] for no tokens.
+json_array_of_tokens() {
+  local out="" t
+  for t in "$@"; do
+    out="${out:+$out,}$t"
+  done
+  printf '[%s]' "$out"
+}
+
+# The jq program that reconciles an ADOPTED ruleset's signoff namespace to the
+# desired set while preserving everything else verbatim. We own only the
+# signoff contexts; a foreign check keeps its full object (integration_id and
+# all), foreign rules stay, and so do bypass_actors. Only the signoff-namespace
+# membership of required_status_checks changes: signoff entries whose folded
+# context is not wanted are dropped, wanted contexts not already present are
+# appended as bare {"context":X}, and a signoff entry that IS wanted keeps its
+# own object (so an integration_id on a signoff check survives too).
+#
+# It emits two lines: a verdict, then the PUT body as one line via tojson.
+# tojson makes the body single-line and identical enough across jq and gojq;
+# GitHub ignores key order, and the tests assert against the mock's jq output.
+#
+# The verdict is "delete" only when the desired set is empty AND the ruleset is
+# PRISTINE — nothing but the canonical shape this tool creates, so a bare
+# uninstall is removing nothing but its own artifact. Pristine is one holistic
+# test, not a list of foreign-content flags, so it needs no new selector each
+# time an admin can customize another field: every rule is one of our three
+# types, every status check is signoff-namespace, bypass_actors is exactly our
+# admin bypass, and conditions is exactly our canonical targeting. Any
+# deviation — a foreign check or rule, an extra bypass actor, a narrowed
+# condition — makes it non-pristine, so the ruleset is rewritten (signoff
+# checks removed, everything else kept) rather than deleted.
+#
+# The two guard rules (deletion, non_fast_forward) are OPTIONAL to pristine:
+# present or absent both count as ours, because install adds them only when it
+# is the sole enforcement and omits them when it leaves customized legacy
+# protection in place (see cmd_install). They are additive protection we may
+# or may not have written, so their absence must not block deleting our own
+# ruleset — but a NON-standard rule type still does. Enforcement and name are
+# excluded for the same "our own toggle/identity, not admin content" reason, so
+# a disabled or branch-specifically-named ruleset is still ours to delete. The
+# rule check is by TYPE, not deep equality, because a GET adds server-side
+# parameters (e.g. do_not_enforce_on_create) we never wrote.
+#
+# mode shapes what is written. "activate" (install) normalizes to canonical:
+# name, canonical ref conditions, and active enforcement — installing signoff
+# means asserting the canonical enforcing shape, which also renames a
+# promoted-default "signoff (<branch>)" to "signoff"/~DEFAULT_BRANCH.
+# "preserve" (uninstall) keeps the existing name, conditions and enforcement —
+# removing a context is no reason to re-target or re-enforce, and it must not
+# discard the admin conditions/bypass the pristine test just protected.
+# bypass_actors is preserved in both modes: it is admin policy, and install has
+# no opinion beyond supplying the default when none exists.
+#
+# $want is embedded as a JSON array of tokens. The empty required_status_checks
+# rule is dropped rather than left behind, and if the desired set is non-empty
+# but the adopted ruleset had no required_status_checks rule at all, one is
+# appended.
+build_reconcile_filter() {
+  local branch="$1" want_array="$2" mode="$3" guards="$4"
+  local name_json ref_json pristine_conditions name_expr conditions_expr enforcement_expr
+
+  require_json_safe "branch name" "$branch"
+  name_json="\"$(signoff_ruleset_name "$branch")\""
+  ref_json="\"$(signoff_ruleset_ref "$branch")\""
+
+  # Pristine conditions: our canonical targeting for this branch. The default
+  # branch accepts either spelling — ~DEFAULT_BRANCH or the explicit
+  # refs/heads/<name> a pre-promotion install left — so a promoted ruleset is
+  # still recognized as ours and deletable.
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    pristine_conditions='(.conditions == {ref_name:{include:["~DEFAULT_BRANCH"],exclude:[]}} or .conditions == {ref_name:{include:["refs/heads/'"$branch"'"],exclude:[]}})'
+  else
+    pristine_conditions='(.conditions == {ref_name:{include:['"$ref_json"'],exclude:[]}})'
+  fi
+
+  # Install (activate) normalizes the enforcement skeleton — name, ref
+  # conditions, active enforcement — while preserving additive foreign content.
+  # Uninstall (preserve) keeps the skeleton it finds: trimming a context is no
+  # reason to re-target or re-enforce.
+  local ensure_guards=""
+  if [[ "$mode" == "activate" ]]; then
+    name_expr="$name_json"
+    conditions_expr='{ref_name:{include:['"$ref_json"'],exclude:[]}}'
+    enforcement_expr='"active"'
+  else
+    name_expr='(.name // '"$name_json"')'
+    conditions_expr='(.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}})'
+    enforcement_expr='(.enforcement // "active")'
+  fi
+
+  # The force-push and deletion guards are added only when install is the sole
+  # enforcement — the guards flag is "noguards" when we leave customized legacy
+  # protection intact to govern force pushes and deletions itself. Legacy
+  # protection blocked both by default, and a fresh install carries the two
+  # rules to match; an adopted ruleset may lack them, so add whichever is
+  # missing (never duplicating) before migration deletes the legacy protection,
+  # so the branch is never left unguarded. Uninstall never adds guards.
+  if [[ "$guards" == "guards" ]]; then
+    ensure_guards='
+      | . as $rg | (if ([$rg[] | select(.type=="deletion")] | length) == 0 then $rg + [{type:"deletion"}] else $rg end)
+      | . as $rg | (if ([$rg[] | select(.type=="non_fast_forward")] | length) == 0 then $rg + [{type:"non_fast_forward"}] else $rg end)'
+  fi
+
+  printf '%s' 'def is_signoff($k): $k == "signoff" or ($k | startswith("signoff/"));
+def ours_check: (is_signoff((.context // "")|ascii_downcase)) and (.integration_id == null or .integration_id == -1);
+'"$want_array"' as $want
+| ($want | map(ascii_downcase)) as $wantkeys
+| ( ([.rules[]? | .type | select(. as $t | (["deletion","non_fast_forward","required_status_checks"] | index($t)) | not)] | length == 0)
+    and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | ours_check] | all)
+    and ([.rules[]? | select(.type=="required_status_checks") | (.parameters.strict_required_status_checks_policy // false)] | all(. == false))
+    and ([.rules[]? | select(.type=="required_status_checks") | (.parameters.do_not_enforce_on_create // false)] | all(. == false))
+    and ((.target // "branch") == "branch")
+    and (.bypass_actors == [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}])
+    and '"$pristine_conditions"'
+  ) as $pristine
+| (if (($want|length)==0) and $pristine then "delete" else "keep" end),
+  ({
+    name: '"$name_expr"',
+    target: (.target // "branch"),
+    enforcement: '"$enforcement_expr"',
+    bypass_actors: (.bypass_actors // [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}]),
+    conditions: '"$conditions_expr"',
+    rules: (
+      [ .rules[]?
+        | if .type=="required_status_checks" then
+            (.parameters.required_status_checks // []) as $ex
+            # Dedup additions against OUR existing checks only, not every check:
+            # an app-pinned signoff twin is foreign (not ours_check), so it must
+            # not suppress adding our unpinned signoff — the keep clause below
+            # still preserves the pinned object verbatim.
+            | ($ex | map(select(ours_check) | ((.context // "")|ascii_downcase))) as $ourk
+            | .parameters.required_status_checks =
+                ( [ $ex[] | ((.context // "")|ascii_downcase) as $k | select( (ours_check and (($wantkeys | index($k)) | not)) | not ) ]
+                  + [ $want[] | ascii_downcase as $wk | select( ($ourk | index($wk)) | not ) | {context: .} ] )
+          else . end
+      ]
+      | map(select( (.type=="required_status_checks" and ((.parameters.required_status_checks|length)==0)) | not ))
+      | . as $r
+      | if (($want|length) > 0) and (([$r[] | select(.type=="required_status_checks")] | length)==0)
+        then $r + [ {type:"required_status_checks", parameters:{strict_required_status_checks_policy:false, required_status_checks:[ $want[] | {context: .} ]}} ]
+        else $r end'"$ensure_guards"'
+    )
+  } | tojson)'
+}
+
+# Reconcile our ruleset to require exactly the given signoff contexts,
+# preserving anything foreign. No existing ruleset (empty id) means create a
+# fresh one from our shape — but only if there is something to require;
+# reconciling to nothing when nothing exists is a no-op. An existing ruleset
+# is read once and transformed jq-side: the verdict says whether to delete it
+# (pristine, nothing left to require) or PUT the preserved remainder. mode
+# ("activate" for install, "preserve" for uninstall) and guards ("guards" to
+# arm the force-push/deletion rules, "noguards" to leave them to intact
+# customized legacy protection) are handed to the filter.
+apply_signoff_ruleset() {
+  local branch="$1" id="$2" mode="$3" guards="$4"
+  shift 4
+  local want_array filter result verdict body
+
+  if [[ -z "$id" ]]; then
+    if [[ $# -gt 0 ]]; then
+      create_signoff_ruleset "$branch" "$guards" "$@"
+    fi
+    return
+  fi
+
+  want_array=$(json_array_of_tokens "$@")
+  filter=$(build_reconcile_filter "$branch" "$want_array" "$mode" "$guards")
+  result=$(gh api "repos/:owner/:repo/rulesets/${id}" --jq "$filter" 2>/dev/null) ||
+    fail "failed to read signoff ruleset"
+  result=${result//$'\r'/}
+
+  verdict="${result%%$'\n'*}"
+  body="${result#*$'\n'}"
+
+  if [[ "$verdict" == "delete" ]]; then
+    debug "deleting signoff ruleset ${id} for branch: $(scrub "$branch")"
+    delete_signoff_ruleset "$id"
+  else
+    put_signoff_ruleset "$id" "$body"
+  fi
+}
+
+delete_signoff_ruleset() {
+  local id="$1" response
+  response=$(gh api --method DELETE "repos/:owner/:repo/rulesets/${id}" 2>/dev/null) || {
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
+    fail "failed to remove signoff ruleset"
+  }
+}
+
+# Classify the branch's legacy branch protection via LEGACY_PROTECTION:
+#   none    — confirmed no protection (the API 404s)
+#   signoff — exactly what old gh-signoff install wrote: at least one
+#             signoff check that is ours (see LEGACY_CHECK_IS_OURS) and
+#             nothing else — no other checks, strict false, no reviews, no
+#             restrictions, and no enabled flag anywhere, since old installs
+#             left enforce_admins, linear history, signatures, and every
+#             other {enabled} toggle at their false defaults. Safe to delete
+#             wholesale. An otherwise-empty protection is NOT ours: it still
+#             blocks force pushes and deletions, and this tool never wrote a
+#             protection without a signoff check.
+#   other   — someone else's configuration, never deleted wholesale
+# LEGACY_SIGNOFF_CONTEXTS collects our signoff contexts either way. One API
+# call: the first line summarizes the shape, the rest are the contexts.
+#
+# The enabled-flag sweep is recursive ([.. | objects]) rather than a field
+# list, so a protection feature GitHub adds later reads as "other" instead of
+# silently passing as ours.
+#
+# Nonzero only on a non-404 failure: "no protection" is an answer, but a
+# 403/500/timeout is not, and a writer acting on it could migrate from or
+# delete protection it never actually saw. gh prints the API error body to
+# stdout, so the captured response distinguishes the two.
+legacy_protection_disposition() {
+  local branch="$1" response summary non_signoff strict flags reviews restrictions branch_path
+  LEGACY_PROTECTION="none"
+  LEGACY_SIGNOFF_CONTEXTS=""
+
+  branch_path=$(urlencode_branch "$branch")
+  response=$(gh api "repos/:owner/:repo/branches/${branch_path}/protection" \
+    --jq "([([${LEGACY_CHECKS}[]? | select(${LEGACY_CHECK_IS_OURS} | not)] | length), (.required_status_checks.strict // false), ([.. | objects | select(has(\"enabled\")) | .enabled] | any), (.required_pull_request_reviews != null), (.restrictions != null)] | @tsv), (${LEGACY_OUR_CONTEXTS})" \
+    2>/dev/null) || {
+    if [[ "$response" == *'"status":"404"'* ]]; then
+      return 0
+    fi
+    return 1
+  }
+  response=${response//$'\r'/}
+
+  summary="${response%%$'\n'*}"
+  if [[ "$response" == *$'\n'* ]]; then
+    LEGACY_SIGNOFF_CONTEXTS="${response#*$'\n'}"
+  fi
+
+  IFS=$'\t' read -r non_signoff strict flags reviews restrictions <<<"$summary"
+  if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" && "$non_signoff" == "0" && "$strict" == "false" &&
+    "$flags" == "false" && "$reviews" == "false" && "$restrictions" == "false" ]]; then
+    LEGACY_PROTECTION="signoff"
+  else
+    LEGACY_PROTECTION="other"
+  fi
+}
+
+# Surgically remove the given context records from the branch's protection via
+# the remove-status-check-contexts endpoint, leaving every other protection
+# setting untouched. The records are newline-delimited (empty removes nothing);
+# a bare uninstall passes all of LEGACY_SIGNOFF_CONTEXTS, a contextual one
+# passes only the requested contexts that actually live in the protection.
+# Nonzero when they could not be removed.
+#
+# The tokens go back exactly as the protection spelled them. Whether that
+# endpoint matches contexts case-insensitively is undocumented, and asking it
+# to remove a spelling nobody configured is a question worth not asking.
+remove_legacy_contexts() {
+  local branch="$1" records="$2" json="" key token display response branch_path
+  branch_path=$(urlencode_branch "$branch")
+
+  while IFS=$'\t' read -r key token display; do
+    [[ -n "$token" ]] || continue
+    json="${json:+$json,}${token}"
+  done <<<"$records"
+  [[ -n "$json" ]] || return 0
+
+  response=$(printf '{"contexts":[%s]}' "$json" | gh api \
+    "repos/:owner/:repo/branches/${branch_path}/protection/required_status_checks/contexts" \
+    --method DELETE \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --input - 2>/dev/null) || {
+    if [[ -n "$response" ]]; then printf '%s\n' "$(scrub "$response")" >&2; fi
+    return 1
+  }
+}
+
+# Retire what legacy protection required for signoff: signoff-shaped
+# protection is wholly ours and is deleted; protection carrying anything
+# else keeps every other setting, with only the signoff contexts surgically
+# removed. Nonzero when any of that failed — install may shrug it off (the
+# ruleset already enforces the contexts, so a leftover is a harmless
+# duplicate), but uninstall must fail rather than report signoff removed
+# while legacy protection still enforces it.
+retire_legacy_signoff() {
+  local branch="$1" branch_path
+  branch_path=$(urlencode_branch "$branch")
+  case "$LEGACY_PROTECTION" in
+    signoff)
+      gh api --method DELETE "repos/:owner/:repo/branches/${branch_path}/protection" >/dev/null 2>&1
+      ;;
+    other)
+      remove_legacy_contexts "$branch" "$LEGACY_SIGNOFF_CONTEXTS"
+      ;;
+  esac
 }
 
 # @{upstream} is a sound stand-in for an unresolvable @{push} only in the
@@ -246,14 +1082,14 @@ url_remote_tip() {
 
   if [[ -z "$merge_ref" || "$push_default" != "simple" || "$push_remote" != "$remote" ]] ||
     git config --get-regexp '^url\..*\.pushinsteadof$' >/dev/null 2>&1; then
-    debug "branch ${branch} tracks the URL ${remote} but its push destination is not provably that URL"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and its push destination is not provably that URL; add a named remote for it, or -f to override)"
+    debug "branch $(scrub "$branch") tracks the URL $(scrub "$remote") but its push destination is not provably that URL"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch $(scrub "$branch") tracks $(scrub "$remote") as a URL, so there is no tracking ref, and its push destination is not provably that URL; add a named remote for it, or -f to override)"
     return 1
   fi
 
   advertised=$(git ls-remote "$remote" "$merge_ref" 2>/dev/null) || {
-    debug "could not reach ${remote} to look up ${merge_ref}"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (branch ${branch} tracks ${remote} as a URL, so there is no tracking ref, and that remote could not be reached; -f to override)"
+    debug "could not reach $(scrub "$remote") to look up $(scrub "$merge_ref")"
+    UNCLEAN_REASON="cannot verify the current branch is pushed (branch $(scrub "$branch") tracks $(scrub "$remote") as a URL, so there is no tracking ref, and that remote could not be reached; -f to override)"
     return 1
   }
 
@@ -266,14 +1102,14 @@ url_remote_tip() {
   done <<<"$advertised"
 
   if [[ -z "$URL_REMOTE_TIP" ]]; then
-    debug "${merge_ref} is not advertised by ${remote}"
-    UNCLEAN_REASON="repository has unpushed changes (${merge_ref} does not exist on ${remote})"
+    debug "$(scrub "$merge_ref") is not advertised by $(scrub "$remote")"
+    UNCLEAN_REASON="repository has unpushed changes ($(scrub "$merge_ref") does not exist on $(scrub "$remote"))"
     return 1
   fi
 
   if ! git cat-file -e "${URL_REMOTE_TIP}^{commit}" 2>/dev/null; then
-    debug "${remote} advertises ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository"
-    UNCLEAN_REASON="cannot verify the current branch is pushed (${remote} has ${merge_ref} at ${URL_REMOTE_TIP}, which is not in this repository; git fetch ${remote} ${merge_ref}, or -f to override)"
+    debug "$(scrub "$remote") advertises $(scrub "$merge_ref") at $(scrub "$URL_REMOTE_TIP"), which is not in this repository"
+    UNCLEAN_REASON="cannot verify the current branch is pushed ($(scrub "$remote") has $(scrub "$merge_ref") at $(scrub "$URL_REMOTE_TIP"), which is not in this repository; git fetch $(scrub "$remote") $(scrub "$merge_ref"), or -f to override)"
     return 1
   fi
 
@@ -345,11 +1181,23 @@ cmd_create() {
         shift 2
         ;;
 
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # Non-option argument is treated as context
+        # Non-option argument is treated as context. Held to record/JSON
+        # safety like install and check — inert but valid as a token.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -391,7 +1239,7 @@ cmd_create() {
       context_name="signoff/${context}"
     fi
 
-    debug "creating status for commit ${commit} by ${user} with context ${context_name}"
+    debug "creating status for commit ${commit} by $(scrub "$user") with context $(scrub "$context_name")"
 
     if gh api \
       --method POST \
@@ -404,14 +1252,14 @@ cmd_create() {
       if [[ -z "$context" ]]; then
         success_messages+=("${STATUS_SUCCESS} Signed off on ${commit}")
       else
-        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for ${context}")
+        success_messages+=("${STATUS_SUCCESS} Signed off on ${commit} for $(scrub "$context")")
       fi
     else
       success=false
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
+        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit}" >&2
       else
-        echo "${STATUS_FAILURE} Failed to sign off on ${commit} for ${context}" >&2
+        printf '%s\n' "${STATUS_FAILURE} Failed to sign off on ${commit} for $(scrub "$context")" >&2
       fi
     fi
   done
@@ -445,64 +1293,143 @@ cmd_install() {
       --commit)
         fail "--commit is only valid for create and status"
         ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # All positional arguments are contexts
+        # All positional arguments are contexts. This is where bash composes a
+        # token by quoting, so refuse the characters JSON would have to escape;
+        # everything else — spaces, $, ; — is inert and allowed.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
     esac
   done
 
-  # If branch not specified, use default branch
+  # Ruleset identity hinges on whether the branch is the default, so resolve
+  # the default branch in this shell before deriving anything from it — even
+  # when --branch was given
+  require_default_branch
   if [[ -z "$branch" ]]; then
-    branch=$(default_branch) ||
-      fail "failed to get default branch"
+    branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
+
+  # A targeted branch must exist, or install would silently write a ruleset
+  # for a typo. The default branch came from default_branch, so it is known to
+  # exist and needs no round-trip.
+  if [[ "$branch" != "$DEFAULT_BRANCH" ]]; then
+    require_branch_exists "$branch"
+  fi
 
   # Default to standard signoff if no contexts specified
   if [ ${#contexts[@]} -eq 0 ]; then
     contexts=("")
   fi
 
-  # Build API fields for all contexts
-  local api_fields=()
-  api_fields+=("--field" "required_status_checks[strict]=false")
-  api_fields+=("--field" "enforce_admins=null")
-  api_fields+=("--field" "required_pull_request_reviews=null")
-  api_fields+=("--field" "restrictions=null")
-
+  # The requested contexts as records, by their full status-check names
+  local requested="" context context_name
   for context in "${contexts[@]}"; do
-    local context_name="signoff"
+    context_name="signoff"
     if [[ -n "$context" ]]; then
       context_name="signoff/${context}"
     fi
-    api_fields+=("--field" "required_status_checks[contexts][]=${context_name}")
+    requested="${requested:+$requested$'\n'}$(context_record "$context_name")"
   done
 
-  debug "installing protection on branch: ${branch} with ${#contexts[@]} contexts"
+  # A failed listing must be fatal here: proceeding would POST a duplicate of
+  # a ruleset the listing merely failed to see
+  find_signoff_ruleset_id "$branch" || fail "failed to list rulesets"
 
-  gh api "/repos/:owner/:repo/branches/${branch}/protection" \
-    --method PUT \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${api_fields[@]}" >/dev/null || fail "failed to set branch protection"
+  local existing=""
+  if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+    existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+      fail "failed to read signoff ruleset"
+  fi
+
+  # Fatal on an indeterminate read: migrating from protection we never
+  # actually saw could drop its contexts from the union
+  legacy_protection_disposition "$branch" || fail "failed to read branch protection"
+
+  # Additive union: what our ruleset already requires, what legacy protection
+  # still requires, and what this invocation asks for
+  merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS" "$requested"
+
+  local union=() key token display
+  while IFS=$'\t' read -r key token display; do
+    if [[ -n "$token" ]]; then
+      union+=("$token")
+    fi
+  done <<<"$MERGED_CONTEXTS"
+
+  debug "installing signoff ruleset on branch: $(scrub "$branch") with ${#union[@]} contexts"
+
+  # Guards (force-push/deletion) replace the default blocking we remove when we
+  # DELETE signoff-shaped legacy protection. When legacy is CUSTOMIZED ("other")
+  # we leave it intact — it keeps governing force pushes and deletions with the
+  # admin's own settings — so we must not impose our guards on top.
+  local guards="guards"
+  if [[ "$LEGACY_PROTECTION" == "other" ]]; then
+    guards="noguards"
+  fi
+
+  apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" activate "$guards" "${union[@]}"
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch now requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff on $(scrub "$context")"
       fi
     done
   fi
+
+  # Legacy branch protection is retired only when it is signoff-shaped — wholly
+  # ours, so deleting it whole is safe and our guards replace its default
+  # blocking. CUSTOMIZED ("other") protection is left completely intact: it may
+  # bind admins, be strict, carry reviews/restrictions or explicit force-push
+  # allowances, and surgically stripping our contexts or overriding it would
+  # lose that fidelity. The ruleset now enforces signoff too — a harmless
+  # duplicate, most-restrictive layering — so we only warn.
+  case "$LEGACY_PROTECTION" in
+    signoff)
+      if retire_legacy_signoff "$branch"; then
+        echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+      else
+        printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch_shown}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
+      fi
+      ;;
+    other)
+      # Only warn about a signoff duplicate when the customized protection
+      # actually enforces signoff. Protection that carries no signoff context
+      # (only reviews, or a foreign check) is unrelated — our ruleset is then
+      # the sole signoff enforcement and there is nothing to remove.
+      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+        printf '%s\n' "Warning: ${branch_shown} also enforces signoff via customized branch protection, which gh-signoff leaves untouched; the ruleset now enforces it too (a harmless duplicate). Remove the legacy signoff contexts in repo settings if you want a single source." >&2
+      fi
+      ;;
+  esac
 }
 
 cmd_uninstall() {
@@ -526,46 +1453,198 @@ cmd_uninstall() {
       --commit)
         fail "--commit is only valid for create and status"
         ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          [[ -n "$1" ]] || fail "context name cannot be empty"
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # All positional arguments are contexts
+        # All positional arguments are contexts. An empty one would slip past
+        # the bare-vs-contextual split below and quietly subtract nothing while
+        # claiming the whole requirement removed, so require_context_name
+        # rejects it; the subtraction key is composed here by quoting, so the
+        # quote/backslash/C0 rejection keeps it valid.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
     esac
   done
 
+  # As in install: ruleset identity needs the default branch known, even when
+  # --branch was given
+  require_default_branch
   if [[ -z "$branch" ]]; then
-    branch=$(default_branch) || fail "failed to get default branch"
+    branch="$DEFAULT_BRANCH"
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
-  # TODO: Implement context-specific uninstall that preserves other contexts
-  # For now we just remove all branch protection which is the current behavior
-  debug "removing protection from branch: ${branch}"
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
 
-  gh api \
-    --method DELETE \
-    "repos/:owner/:repo/branches/${branch}/protection" >/dev/null || fail "failed to remove branch protection"
-
-  # Default to standard signoff if no contexts specified
+  # Bare uninstall removes the whole requirement; contextual subtracts
+  local bare=false
   if [ ${#contexts[@]} -eq 0 ]; then
+    bare=true
     contexts=("")
+  fi
+
+  # As in install: acting on a listing that failed could orphan or duplicate
+  # the ruleset, so bail instead
+  find_signoff_ruleset_id "$branch" || fail "failed to list rulesets"
+
+  # Fatal on an indeterminate read: "removed" claims below hinge on knowing
+  # what legacy protection enforces, and a 403/500 is not "nothing"
+  legacy_protection_disposition "$branch" || fail "failed to read branch protection"
+
+  local migration_note=""
+
+  if $bare; then
+    local removed=false
+    # A reserved-name ruleset that holds only foreign or app-pinned checks is
+    # not a signoff requirement we can remove: reconciling it would be a
+    # needless PUT that drops nothing, and reporting "no longer requires
+    # signoff" would be false. So key removal on the ruleset actually carrying
+    # signoff contexts of ours, matching the no-ruleset path's honesty.
+    local ruleset_signoff=""
+    if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+      ruleset_signoff=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+        fail "failed to read signoff ruleset"
+    fi
+    if [[ -n "$ruleset_signoff" ]]; then
+      # Empty want: the reconcile deletes the ruleset when it is pristine, or
+      # preserves it (dropping only our signoff checks) when it also holds
+      # foreign checks or rules an admin added
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards
+      removed=true
+    fi
+    if [[ "$LEGACY_PROTECTION" == "signoff" || -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+      removed=true
+    fi
+    # Unlike install, a failed legacy cleanup here is fatal: reporting the
+    # requirement removed while legacy protection still enforces it would be
+    # a lie, and rerunning uninstall retries idempotently
+    retire_legacy_signoff "$branch" ||
+      fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
+    $removed || fail "no signoff requirement installed on ${branch_shown}"
+  else
+    # Everything currently required, from our ruleset and legacy protection
+    local existing=""
+    if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+      existing=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+        fail "failed to read signoff ruleset"
+    fi
+    merge_contexts "$existing" "$LEGACY_SIGNOFF_CONTEXTS"
+    local available="$MERGED_CONTEXTS"
+
+    if [[ -z "$available" ]]; then
+      fail "no signoff requirement installed on ${branch_shown}"
+    fi
+
+    # The requested contexts as folded keys. Subtract by folded key:
+    # signoff/Tests is the tests requirement as far as GitHub is concerned, so
+    # `uninstall tests` has to remove it.
+    local requested="" context key token display
+    for context in "${contexts[@]}"; do
+      requested="${requested:+$requested$'\n'}$(context_key "signoff/${context}")"
+    done
+
+    if [[ "$LEGACY_PROTECTION" == "other" ]]; then
+      # Customized legacy protection is left intact, exactly as install leaves
+      # it: remove ONLY the requested contexts from it, surgically, and keep
+      # the remaining signoff contexts under it (with the admin's strict,
+      # enforce_admins and other settings). They are NOT migrated into a
+      # canonical ruleset — that would drop the admin's policy. The ruleset,
+      # if any, subtracts only its own contexts.
+      local ruleset_remaining="" legacy_to_remove=""
+      while IFS=$'\t' read -r key token display; do
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+          ruleset_remaining="${ruleset_remaining:+$ruleset_remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$existing"
+
+      if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+        local keep=()
+        while IFS=$'\t' read -r key token display; do
+          [[ -n "$token" ]] && keep+=("$token")
+        done <<<"$ruleset_remaining"
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards ${keep[@]+"${keep[@]}"}
+      fi
+
+      # Only the requested contexts that actually live in the protection
+      while IFS=$'\t' read -r key token display; do
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' == *$'\n'"${key}"$'\n'* ]]; then
+          legacy_to_remove="${legacy_to_remove:+$legacy_to_remove$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$LEGACY_SIGNOFF_CONTEXTS"
+      remove_legacy_contexts "$branch" "$legacy_to_remove" ||
+        fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
+    else
+      # none or signoff-shaped: subtract from the union and migrate the
+      # remainder into the ruleset. A signoff-shaped legacy is then deleted, so
+      # the ruleset must carry the force-push/deletion guards that protection
+      # provided by default — same as the install-migrate path.
+      local guards="noguards" remaining=""
+      [[ "$LEGACY_PROTECTION" == "signoff" ]] && guards="guards"
+
+      while IFS=$'\t' read -r key token display; do
+        [[ -n "$key" ]] || continue
+        if [[ $'\n'"$requested"$'\n' != *$'\n'"${key}"$'\n'* ]]; then
+          remaining="${remaining:+$remaining$'\n'}${key}"$'\t'"${token}"$'\t'"${display}"
+        fi
+      done <<<"$available"
+
+      if [[ -n "$remaining" ]]; then
+        local keep=()
+        while IFS=$'\t' read -r key token display; do
+          keep+=("$token")
+        done <<<"$remaining"
+        debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "$guards" "${keep[@]}"
+        if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
+          migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+        fi
+      elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
+        # The last signoff context is going away: delete the ruleset if it is
+        # pristine, or keep it (foreign checks/rules preserved) otherwise
+        apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "$guards"
+      fi
+      # Fatal, as in the bare case: the contexts just uninstalled may live in
+      # legacy protection too, and a failed removal there keeps enforcing them
+      retire_legacy_signoff "$branch" ||
+        fail "failed to remove signoff from legacy branch protection on ${branch_shown}"
+    fi
   fi
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
-    echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+    printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff"
   else
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch no longer requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff on $(scrub "$context")"
       fi
     done
+  fi
+
+  if [[ -n "$migration_note" ]]; then
+    printf '%s\n' "$migration_note"
   fi
 }
 
@@ -590,11 +1669,24 @@ cmd_check() {
       --commit)
         fail "--commit is only valid for create and status"
         ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # All positional arguments are contexts
+        # All positional arguments are contexts, on the same terms as install
+        # and uninstall. A read composes a lookup key by quoting too, so the
+        # quote/backslash/C0 rejection keeps that key valid.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -606,25 +1698,34 @@ cmd_check() {
   fi
   [[ -z "$branch" ]] && fail "branch name cannot be empty"
 
+  # Messages show the scrubbed branch name; every path that talks to GitHub
+  # keeps the raw one. A branch is named by the repository, not by us, so it
+  # is only held to the JSON rule — but it still prints to a terminal.
+  local branch_shown
+  branch_shown=$(scrub "$branch")
+
   # Default to standard signoff if no contexts specified
   if [ ${#contexts[@]} -eq 0 ]; then
     contexts=("")
   fi
 
   # Fetch the required contexts once, one per line
-  local protection_contexts
-  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]?' 2>/dev/null) || {
+  fetch_required_signoff_contexts "$branch"
+
+  if [[ -z "$SIGNOFF_CONTEXTS" ]]; then
     for context in "${contexts[@]}"; do
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on $(scrub "$context")"
       fi
     done
     exit 1
-  }
-  protection_contexts=${protection_contexts//$'\r'/}
+  fi
+
+  if $SIGNOFF_LEGACY_PRESENT; then
+    legacy_upgrade_hint
+  fi
 
   # Check each context
   for context in "${contexts[@]}"; do
@@ -633,20 +1734,21 @@ cmd_check() {
       context_name="signoff/${context}"
     fi
 
-    debug "checking protection for branch: ${branch} with context: ${context_name}"
+    debug "checking protection for branch: $(scrub "$branch") with context: ${context_name}"
 
-    # Whole-line match, so 'signoff' isn't satisfied by 'signoff/tests'
-    if [[ $'\n'"$protection_contexts"$'\n' == *$'\n'"${context_name}"$'\n'* ]]; then
+    # Whole-key match — the key runs to the record's tab — so 'signoff' isn't
+    # satisfied by 'signoff/tests', while 'signoff/Tests' does satisfy it
+    if [[ $'\n'"$SIGNOFF_CONTEXTS" == *$'\n'"$(context_key "$context_name")"$'\t'* ]]; then
       if [[ -z "$context" ]]; then
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff"
       else
-        echo "${STATUS_SUCCESS} GitHub ${branch} branch requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff on $(scrub "$context")"
       fi
     else
       if [[ -z "$context" ]]; then
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        echo "${STATUS_FAILURE} GitHub ${branch} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on $(scrub "$context")"
       fi
     fi
   done
@@ -675,11 +1777,11 @@ cmd_status() {
         fail "-f is only valid for create"
         ;;
       -*)
-        fail "unknown option: $1"
+        fail "unknown option: $(scrub "$1")"
         ;;
       *)
         # For now we don't support filtering by context
-        fail "unexpected argument: $1"
+        fail "unexpected argument: $(scrub "$1")"
         ;;
     esac
   done
@@ -695,61 +1797,73 @@ cmd_status() {
     commit=$(git rev-parse HEAD) || fail "failed to get current commit"
   fi
 
-  # Get the signoff statuses on this commit as context/state pairs. A filter
-  # error surfaces here rather than silently rendering every context as failed.
+  # Get the signoff statuses on this commit as context records with their
+  # state appended. A state rides along raw rather than as a token of its
+  # own, so it is held to GitHub's documented closed enum first and anything
+  # else becomes "unknown" — a state is not a name, and one carrying a tab or
+  # a newline could otherwise spell a record of its own making. Mapping
+  # rather than dropping keeps a context with a strange state visible, as the
+  # failure it is. A filter error surfaces here rather than silently
+  # rendering every context as failed. The namespace test folds case, so a
+  # SignOff status is recognized as the signoff it is.
   local statuses
   statuses=$(gh api "repos/:owner/:repo/commits/${commit}/status" \
-    --jq '.statuses[]? | select(.context? | startswith("signoff")) | [.context, .state] | @tsv' \
+    --jq ".statuses[]? | select(((.context? // \"\") | ascii_downcase) | (. == \"signoff\" or startswith(\"signoff/\"))) | (if (.state == \"error\" or .state == \"failure\" or .state == \"pending\" or .state == \"success\") then .state else \"unknown\" end) as \$state | .context | ${CONTEXT_RECORD_JQ} + \"\t\" + \$state" \
     2>/dev/null) || {
-    echo "${STATUS_FAILURE} Could not get status for commit ${commit}"
+    printf '%s\n' "${STATUS_FAILURE} Could not get status for commit ${commit}"
     exit 1
   }
   statuses=${statuses//$'\r'/}
 
   # Create required contexts list - always start with "signoff"
-  local required=("signoff")
+  local required
+  required=("$(context_record "signoff")")
 
-  # Add any additional contexts from branch protection
-  local protection_contexts
-  protection_contexts=$(gh api "repos/:owner/:repo/branches/${branch}/protection" \
-    --jq '.required_status_checks.contexts[]? | select(startswith("signoff"))' \
-    2>/dev/null) || {
-    debug "No branch protection found"
-    protection_contexts=""
-  }
-  protection_contexts=${protection_contexts//$'\r'/}
+  # Add any additional required contexts from our ruleset and legacy protection
+  fetch_required_signoff_contexts "$branch"
 
-  local ctx
-  while read -r ctx; do
-    [[ -z "$ctx" || "$ctx" == "signoff" ]] && continue  # Skip empty or default signoff (already included)
-    required+=("$ctx")
-  done <<< "$protection_contexts"
+  if $SIGNOFF_LEGACY_PRESENT; then
+    legacy_upgrade_hint
+  fi
 
-  # Map contexts to states as "context1=state1;context2=state2;..."
-  # A lightweight stand-in for associative arrays, which Bash 3 lacks
-  local context_map="" context state found req
-  while IFS=$'\t' read -r context state; do
-    [[ -z "$context" ]] && continue
-    context_map="${context_map}${context}=${state};"
+  local key token display
+  while IFS=$'\t' read -r key token display; do
+    # Skip empty or default signoff, however spelled: already included
+    [[ -z "$key" || "$key" == '"signoff"' ]] && continue
+    required+=("${key}"$'\t'"${token}"$'\t'"${display}")
+  done <<< "$SIGNOFF_CONTEXTS"
+
+  # Map contexts to states as newline-delimited "key=state" records.
+  # A lightweight stand-in for associative arrays, which Bash 3 lacks.
+  # Records are matched whole-line below: a delimiter-free concatenation
+  # would let 'signoff/foo-signoff=success' satisfy a lookup for plain
+  # 'signoff=success' by substring.
+  local context_map="" state found req
+  while IFS=$'\t' read -r key token display state; do
+    [[ -z "$key" ]] && continue
+    context_map="${context_map}${key}=${state}"$'\n'
 
     # Show contexts that were signed off even if protection doesn't require them
     found=false
     for req in "${required[@]}"; do
-      [[ "$req" == "$context" ]] && { found=true; break; }
+      [[ "${req%%$'\t'*}" == "$key" ]] && { found=true; break; }
     done
-    $found || required+=("$context")
+    $found || required+=("${key}"$'\t'"${token}"$'\t'"${display}")
   done <<< "$statuses"
 
-  # Generate status output for all contexts (required + actual)
-  local all_results=()
-  for context in "${required[@]}"; do
-    local display_name="$context"
-    [[ "$context" == "signoff/"* ]] && display_name="${context#signoff/}"
-    [[ "$context" == "signoff" ]] && display_name="signoff"
+  # Generate status output for all contexts (required + actual). What prints
+  # is the record's display field: the name in the display alphabet, with
+  # everything outside printable ASCII shown as a question mark, so an adopted
+  # context cannot reorder or repaint the line it appears on.
+  local all_results=() display_name
+  for req in "${required[@]}"; do
+    key="${req%%$'\t'*}"
+    display_name="${req##*$'\t'}"
+    [[ "$key" == '"signoff/'* ]] && display_name="${display_name:8}"
 
-    # Check if we have a successful status for this context
-    # by looking for "context=success;" in our map
-    if [[ "$context_map" == *"${context}=success;"* ]]; then
+    # Check if we have a successful status for this context: whole-record
+    # match, so no other context's record can stand in for it
+    if [[ $'\n'"$context_map" == *$'\n'"${key}=success"$'\n'* ]]; then
       all_results+=("${STATUS_SUCCESS} $display_name")
     else
       all_results+=("${STATUS_FAILURE} $display_name")
@@ -758,129 +1872,6 @@ cmd_status() {
 
   # Print all results
   printf "%s\n" "${all_results[@]}"
-}
-
-cmd_completion() {
-  # Check if --contexts flag is passed
-  if [[ "${1:-}" == "--contexts" ]]; then
-    shift
-    reject_extra_args "$@"
-    get_signoff_contexts
-    return
-  fi
-  reject_extra_args "$@"
-
-  cat <<'EOF'
-# bash completion for gh signoff
-
-_gh_signoff_contexts() {
-  # Get dynamic contexts from branch protection
-  contexts=$(gh signoff completion --contexts 2>/dev/null)
-  echo "$contexts"
-}
-
-# The first word that is neither a global option nor its argument. -f and
-# --commit may precede the command, so COMP_WORDS[1] is not it. Stops short of
-# the word being completed: that one is what the user is still typing, not a
-# command they have settled on, and echoing it back would suppress the very
-# list they are typing towards. Empty means the cursor is at the command.
-_gh_signoff_command() {
-  local i=1
-  while [[ $i -lt $COMP_CWORD ]]; do
-    case "${COMP_WORDS[$i]}" in
-      -f)       i=$((i+1)) ;;
-      --commit) i=$((i+2)) ;;
-      *)        echo "${COMP_WORDS[$i]}"; return ;;
-    esac
-  done
-}
-
-_gh_signoff() {
-  local cur prev command
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-  case "$prev" in
-    signoff)
-      # Include dynamic contexts in top-level completion
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
-      return 0
-      ;;
-    --commit)
-      # A revision. Nothing worth guessing at.
-      return 0
-      ;;
-    -f)
-      # A leading -f may be followed by the create command, --commit or a
-      # context; elsewhere only contexts remain
-      local contexts=$(_gh_signoff_contexts)
-      if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W "create --commit $contexts" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
-      fi
-      return 0
-      ;;
-    create)
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "-f --commit $contexts" -- "$cur") )
-      return 0
-      ;;
-    status)
-      COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
-      return 0
-      ;;
-    install|uninstall|check)
-      local contexts=$(_gh_signoff_contexts)
-      COMPREPLY=( $(compgen -W "--branch $contexts" -- "$cur") )
-      return 0
-      ;;
-  esac
-
-  command=$(_gh_signoff_command)
-
-  # If we are halfway through typing an option
-  if [[ $cur == --* ]]; then
-    case "$command" in
-      install|uninstall|check)
-        COMPREPLY=( $(compgen -W "--branch" -- "$cur") )
-        ;;
-      status)
-        COMPREPLY=( $(compgen -W "--branch --commit" -- "$cur") )
-        ;;
-      *)
-        COMPREPLY=( $(compgen -W "--commit" -- "$cur") )
-        ;;
-    esac
-    return 0
-  fi
-
-  # No command yet, so the cursor is where one goes: offer the same list as
-  # directly after `signoff`, which a leading -f or --commit would otherwise
-  # push out of reach
-  if [[ -z "$command" ]]; then
-    local contexts=$(_gh_signoff_contexts)
-    COMPREPLY=( $(compgen -W "create install uninstall check status version -f --commit --help $contexts" -- "$cur") )
-    return 0
-  fi
-
-  # For partial signoffs, suggest context names
-  if [[ $COMP_CWORD -gt 1 && "$command" != "install" &&
-        "$command" != "uninstall" && "$command" != "check" &&
-        "$command" != "status" && "$command" != "version" &&
-        "$command" != "completion" && "$command" != "--help" &&
-        "$command" != "-h" ]]; then
-    local contexts=$(_gh_signoff_contexts)
-    COMPREPLY=( $(compgen -W "$contexts" -- "$cur") )
-    return 0
-  fi
-
-  return 0
-}
-
-complete -F _gh_signoff gh-signoff
-EOF
 }
 
 cmd_version() {
@@ -896,12 +1887,14 @@ USAGE
 
 COMMANDS
   create (default) Sign off on the current commit or a specific commit
-  install          Install signoff requirement
-  uninstall        Uninstall signoff requirement
+  install          Require signoff via a repository ruleset. Adds the given
+                   contexts to whatever is already required, and migrates any
+                   legacy signoff branch protection into the ruleset
+  uninstall        Remove the signoff requirement — or, given contexts, remove
+                   just those and keep the rest
   check            Check if signoff is required
   status           Show signoff status for the current commit or a specific commit
   version          Show gh-signoff version
-  completion       Output shell completion code
 
 FLAGS
   -f  Force sign off (ignore uncommitted/unpushed changes)
@@ -918,14 +1911,12 @@ EXAMPLES
   gh signoff create -f                 # Force signoff
   gh signoff install                   # Require signoff on default branch
   gh signoff install --branch other    # Require signoff on a specific branch
+  gh signoff install tests lint        # Also require signoff on tests and lint
+  gh signoff uninstall tests           # Stop requiring signoff on tests only
   gh signoff check                     # Check if signoff is required
   gh signoff check --branch other      # Check if signoff is required on branch
   gh signoff status                    # Show completed/pending signoff status
   gh signoff status --commit abc1234   # Show status for a specific commit
-
-COMPLETION
-  # Add to ~/.bashrc:
-  eval "$(gh signoff completion)"
 EOF
 }
 
@@ -966,18 +1957,53 @@ reject_commit() {
   fi
 }
 
+# No positional at all is the bare default signoff; an explicitly-passed
+# first positional, even an empty string, is a context to validate. Matching
+# on "${1:-}" alone conflated the two, so `gh signoff -f '' good` took the
+# bare-default path and silently dropped both arguments. Split on $# instead:
+# only a truly empty argument list defaults, and everything else — the empty
+# string included — reaches cmd_create, whose grammar check rejects it.
+if [[ $# -eq 0 ]]; then
+  cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"}
+  exit 0
+fi
+
 # ${commit_opt[@]+"${commit_opt[@]}"} is the Bash 3 set -u safe expansion of a
 # possibly-empty array. ${commit_opt:+...} would word-split the revision.
-case "${1:-}" in
-  "")               cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ;;
+case "$1" in
   "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
   "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
   "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
   "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
-  "completion")     reject_force; reject_commit; shift; cmd_completion "$@" ;;
+  "completion")
+    # Tombstone for a removed command. Completion never worked through
+    # `gh signoff` (see the removal commit), but the setup line we published,
+    # `eval "$(gh signoff completion)"`, lives on in users' shell startup
+    # files. With the command gone, `completion` is just a context name and
+    # would fall through to direct signoff below — so that stale eval line
+    # would POST a false signoff/completion status in any clean, pushed repo,
+    # then try to run the "✓ Signed off" sentence it captured as a command.
+    #
+    # Intercept it ahead of the fallback: make no API call, say NOTHING on
+    # stdout (eval runs whatever stdout carries, and empty is a safe no-op, so
+    # no "✓: command not found"), explain on stderr, and exit nonzero. This
+    # fires whatever leading -f/--commit was parsed, which is why it does not
+    # bother with reject_force/reject_commit. `gh signoff create completion`
+    # still reaches the create arm above and signs off the literal context,
+    # for anyone who truly wants it.
+    printf '%s\n' "gh-signoff: shell completion has been removed; it never worked through 'gh signoff'." >&2
+    printf '%s\n' "Remove this line from your shell startup file (e.g. ~/.bashrc): eval \"\$(gh signoff completion)\"" >&2
+    exit 1
+    ;;
   "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
+  "--")
+    # End of options routes to implicit create, so `gh signoff -- -qa` signs
+    # off a leading-dash context directly. The -- is passed through (no shift):
+    # cmd_create's own end-of-options handler consumes it and treats the rest
+    # as contexts.
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   -*)
     # Unknown option
     cmd_help; exit 1

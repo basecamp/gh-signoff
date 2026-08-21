@@ -19,12 +19,29 @@ fi
 : ${MOCK_COMMIT_STATUS_JSON:='{"statuses":[]}'}
 : ${MOCK_COMMIT_STATUS_EXIT:=0}
 
-: ${MOCK_BRANCH_PROTECTION_JSON:=''} # Empty means no protection found
-: ${MOCK_BRANCH_PROTECTION_EXIT:=1}  # Default to exit 1 (like 404 Not Found)
+: ${MOCK_BRANCH_EXISTS:=1}                   # 1 = branch exists (install's typo guard)
+: ${MOCK_BRANCH_PROTECTION_JSON:=''}         # Empty means no protection found
+: ${MOCK_BRANCH_PROTECTION_EXIT:=1}          # Default to exit 1 (like 404 Not Found)
+: ${MOCK_BRANCH_PROTECTION_ERROR_STATUS:=404} # HTTP status the error body reports
+: ${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:=0} # Remove-status-check-contexts call
 
 : ${MOCK_POST_STATUS_EXIT:=0}
 : ${MOCK_PUT_PROTECTION_EXIT:=0}
 : ${MOCK_DELETE_PROTECTION_EXIT:=0}
+
+: ${MOCK_RULESETS_LIST_JSON:='[]'} # The API answers 200 [] when no rulesets exist
+: ${MOCK_RULESETS_LIST_EXIT:=0}
+
+: ${MOCK_RULESET_JSON:='{}'} # A single ruleset fetched by id
+: ${MOCK_RULESET_EXIT:=0}
+
+# Lets a test inject a hostile API error body, e.g. one carrying a bidi
+# override, to prove the script scrubs what it forwards to stderr
+: ${MOCK_ERROR_MESSAGE:=}
+
+: ${MOCK_POST_RULESET_EXIT:=0}
+: ${MOCK_PUT_RULESET_EXIT:=0}
+: ${MOCK_DELETE_RULESET_EXIT:=0}
 
 # --- Debugging ---
 if [[ -n "${GH_MOCK_DEBUG:-}" ]]; then
@@ -37,18 +54,12 @@ if [[ -n "${GH_MOCK_DEBUG:-}" ]]; then
   echo "----------------------" >&2
 fi
 
-# --- Extension Proxy ---
-# gh runs extensions as subcommands: proxy 'gh signoff ...' to the
-# gh-signoff under test (used by completion's context lookup)
-if [[ "${1:-}" == "signoff" ]]; then
-  shift
-  exec gh-signoff "$@"
-fi
-
 # --- Argument Parsing & Mock Logic ---
 api_method="GET" # Default method
 api_path=""
 jq_filter=""
+input_src=""
+request_body=""
 
 # Simple argument parsing loop
 while [[ $# -gt 0 ]]; do
@@ -64,11 +75,18 @@ while [[ $# -gt 0 ]]; do
       jq_filter="$2"
       shift 2
       ;;
+    --input)
+      input_src="$2"
+      shift 2
+      ;;
+    --paginate)
+      shift
+      ;;
     # Assume the first non-flag argument after 'api' is the path
     -*)
       # Ignore other flags for now (like -f, -H)
       shift
-      if [[ "$1" != -* && $# -gt 0 ]]; then
+      if [[ $# -gt 0 && "$1" != -* ]]; then
          shift # Consume flag argument
       fi
       ;;
@@ -81,6 +99,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Drain stdin before routing: the script feeds --input - through a pipe, and
+# a mock that exits without reading it hands the writer an EPIPE, which the
+# script's pipefail/ERR trap reports as an unexpected error.
+if [[ "$input_src" == "-" ]]; then
+  request_body=$(cat)
+elif [[ -n "$input_src" ]]; then
+  request_body=$(cat "$input_src")
+fi
+
+# Optional call/body logs so tests can assert which requests were made and
+# with what payloads
+if [[ -n "${MOCK_CALL_LOG:-}" ]]; then
+  echo "$api_method $api_path" >>"$MOCK_CALL_LOG"
+fi
+if [[ -n "${MOCK_BODY_LOG:-}" ]]; then
+  echo "$api_method $api_path $request_body" >>"$MOCK_BODY_LOG"
+fi
+
 # --- Response Helpers ---
 
 # Apply --jq to the response body the way gh's built-in jq does
@@ -92,10 +128,26 @@ emit() {
   fi
 }
 
+# A ruleset write body has to be JSON of the shape the rules API documents.
+# Validate the parsed JSON rather than its spelling, as the remove-contexts
+# route does: a payload that is malformed, or that lost a key to a bad splice,
+# must fail the test loudly instead of globbing its way past an assertion.
+require_ruleset_body() {
+  if ! printf '%s\n' "$request_body" | jq -e '(type == "object")
+      and (has("name") and has("target") and has("enforcement") and has("conditions") and has("rules"))
+      and (.rules | type == "array")
+      and (.conditions | type == "object")' >/dev/null 2>&1; then
+    echo "Error: ruleset write expects a JSON object with name/target/enforcement/conditions/rules, got: $request_body" >&2
+    exit 99
+  fi
+}
+
 # gh prints the API error body to stdout and exits nonzero, so callers have to
-# reset their capture rather than treat the body as a response
+# reset their capture rather than treat the body as a response. The optional
+# second argument sets the HTTP status the body reports (default 404), for
+# callers that distinguish a confirmed 404 from other failures.
 emit_error() {
-  echo "{\"message\":\"$1\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"404\"}"
+  echo "{\"message\":\"${MOCK_ERROR_MESSAGE:-$1}\",\"documentation_url\":\"https://docs.github.com/rest\",\"status\":\"${2:-404}\"}"
 }
 
 # --- Determine Response Based on API Call ---
@@ -130,9 +182,25 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]];
   if [[ "$MOCK_BRANCH_PROTECTION_EXIT" -eq 0 ]]; then
     emit "$MOCK_BRANCH_PROTECTION_JSON"
   else
-    emit_error "Branch not protected"
+    # Status configurable so tests can present a non-404 failure, which
+    # writers must treat differently from "no protection"
+    emit_error "Branch not protected" "${MOCK_BRANCH_PROTECTION_ERROR_STATUS:-404}"
   fi
   exit "$MOCK_BRANCH_PROTECTION_EXIT"
+
+# Branch Existence Call (GET, non-protection) — install's typo guard. Ordered
+# after the protection route so a .../protection path never reaches here.
+elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Branch" >&2
+  if [[ "$MOCK_BRANCH_EXISTS" -eq 1 ]]; then
+    emit '{"name":"branch"}'
+    exit 0
+  else
+    # Status configurable so a test can present a non-404 failure the typo
+    # guard must surface rather than read as "not found"
+    emit_error "Branch not found" "${MOCK_BRANCH_EXISTS_ERROR_STATUS:-404}"
+    exit 1
+  fi
 
 # Create Status Call (POST)
 elif [[ "$api_method" == "POST" && "$api_path" == *"statuses/"* ]]; then
@@ -149,17 +217,76 @@ elif [[ "$api_method" == "PUT" && "$api_path" == *"branches/"*"/protection"* ]];
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Branch Protection" >&2
   exit "$MOCK_PUT_PROTECTION_EXIT"
 
+# Remove Status Check Contexts Call (DELETE) — before the whole-protection
+# DELETE glob, which would otherwise swallow this path
+elif [[ "$api_method" == "DELETE" && "$api_path" == *"/protection/required_status_checks/contexts" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Protection Contexts" >&2
+  # The documented request body is exactly {"contexts": [strings...]} —
+  # validate the parsed JSON, not its spelling, so malformed payloads can't
+  # glob their way past
+  if ! echo "$request_body" | jq -e '(type == "object") and (keys == ["contexts"]) and (.contexts | (type == "array") and all(type == "string"))' >/dev/null 2>&1; then
+    echo "Error: DELETE contexts expects {\"contexts\":[strings]}, got: $request_body" >&2
+    exit 99
+  fi
+  if [[ "${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:-0}" -ne 0 ]]; then
+    emit_error "Validation Failed" "422"
+  fi
+  exit "${MOCK_DELETE_PROTECTION_CONTEXTS_EXIT:-0}"
+
 # Delete Branch Protection Call (DELETE)
 elif [[ "$api_method" == "DELETE" && "$api_path" == *"branches/"*"/protection"* ]]; then
   [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Branch Protection" >&2
   exit "$MOCK_DELETE_PROTECTION_EXIT"
 
-# Fallback for unhandled calls
+# Single Ruleset Call (GET by id) — before the bare /rulesets list glob
+elif [[ "$api_method" == "GET" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Ruleset" >&2
+  if [[ "$MOCK_RULESET_EXIT" -eq 0 ]]; then
+    emit "$MOCK_RULESET_JSON"
+  else
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_RULESET_EXIT"
+
+# Rulesets List Call (GET) — with or without query parameters
+elif [[ "$api_method" == "GET" && ("$api_path" == *"/rulesets" || "$api_path" == *"/rulesets?"*) ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Rulesets List" >&2
+  if [[ "$MOCK_RULESETS_LIST_EXIT" -eq 0 ]]; then
+    emit "$MOCK_RULESETS_LIST_JSON"
+  else
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_RULESETS_LIST_EXIT"
+
+# Create Ruleset Call (POST)
+elif [[ "$api_method" == "POST" && "$api_path" == *"/rulesets" ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched POST Ruleset" >&2
+  require_ruleset_body
+  if [[ "$MOCK_POST_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Validation Failed"
+  fi
+  exit "$MOCK_POST_RULESET_EXIT"
+
+# Update Ruleset Call (PUT)
+elif [[ "$api_method" == "PUT" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched PUT Ruleset" >&2
+  require_ruleset_body
+  if [[ "$MOCK_PUT_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Validation Failed"
+  fi
+  exit "$MOCK_PUT_RULESET_EXIT"
+
+# Delete Ruleset Call (DELETE)
+elif [[ "$api_method" == "DELETE" && "$api_path" == *"/rulesets/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched DELETE Ruleset" >&2
+  if [[ "$MOCK_DELETE_RULESET_EXIT" -ne 0 ]]; then
+    emit_error "Not Found"
+  fi
+  exit "$MOCK_DELETE_RULESET_EXIT"
+
+# Fallback for unhandled calls. Strict: a silently-succeeding unstubbed call
+# would let a test pass without exercising the request it meant to assert.
 else
-  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: No specific match found for '$api_method $api_path'" >&2
-  # Default success for other potential calls like 'gh auth status' etc.
-  # Or fail if strict matching is desired:
-  # echo "Error: Unhandled mock API call: $api_method $api_path" >&2
-  # exit 99
-  exit 0
+  echo "Error: Unhandled mock API call: $api_method $api_path" >&2
+  exit 99
 fi
