@@ -707,10 +707,24 @@ build_reconcile_filter() {
     pristine_conditions='(.conditions == {ref_name:{include:['"$ref_json"'],exclude:[]}})'
   fi
 
+  # Install normalizes the enforcement skeleton — name, ref conditions,
+  # active enforcement, and (below) the presence of our two guard rules —
+  # while still preserving additive foreign content. Uninstall preserves the
+  # skeleton it finds: trimming a context is no reason to re-target, re-enforce
+  # or re-arm guards.
+  local ensure_guards=""
   if [[ "$mode" == "activate" ]]; then
     name_expr="$name_json"
     conditions_expr='{ref_name:{include:['"$ref_json"'],exclude:[]}}'
     enforcement_expr='"active"'
+    # Legacy branch protection blocked force pushes and deletions by default,
+    # and a fresh install carries deletion + non_fast_forward to match. An
+    # adopted ruleset may lack them; add whichever is missing so migrating
+    # (which then deletes the legacy protection) never leaves the branch
+    # unguarded. Preserves any other rules and never duplicates an existing one.
+    ensure_guards='
+      | . as $rg | (if ([$rg[] | select(.type=="deletion")] | length) == 0 then $rg + [{type:"deletion"}] else $rg end)
+      | . as $rg | (if ([$rg[] | select(.type=="non_fast_forward")] | length) == 0 then $rg + [{type:"non_fast_forward"}] else $rg end)'
   else
     name_expr='(.name // '"$name_json"')'
     conditions_expr='(.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}})'
@@ -747,7 +761,7 @@ build_reconcile_filter() {
       | . as $r
       | if (($want|length) > 0) and (([$r[] | select(.type=="required_status_checks")] | length)==0)
         then $r + [ {type:"required_status_checks", parameters:{strict_required_status_checks_policy:false, required_status_checks:[ $want[] | {context: .} ]}} ]
-        else $r end
+        else $r end'"$ensure_guards"'
     )
   } | tojson)'
 }

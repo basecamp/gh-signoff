@@ -524,6 +524,80 @@ EOF
   [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on tests" ]] || return 1
 }
 
+@test "install arms the force-push and deletion guards on an adopted ruleset" {
+  # Finding 749: an adopted reserved-name ruleset may have only a
+  # required_status_checks rule. A fresh install carries deletion and
+  # non_fast_forward too (legacy protection blocked those by default), so
+  # install must add whichever guard is missing — before it retires the legacy
+  # protection, or migration would leave the branch unguarded.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"type":"deletion"}'* ]] || return 1
+  [[ "$body" == *'{"type":"non_fast_forward"}'* ]] || return 1
+
+  # And the legacy protection is still retired — the ruleset now carries the
+  # guards, so the branch stays protected
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+}
+
+@test "install does not duplicate guards already present on an adopted ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  # exactly one of each guard
+  [[ "$(grep -o '{"type":"deletion"}' <<<"$body" | wc -l)" -eq 1 ]] || return 1
+  [[ "$(grep -o '{"type":"non_fast_forward"}' <<<"$body" | wc -l)" -eq 1 ]] || return 1
+}
+
+@test "uninstall does not add guards to a ruleset lacking them" {
+  # The split: install normalizes the skeleton, uninstall preserves it.
+  # Trimming a context must not arm guards that were not there.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall tests
+  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" != *'{"type":"deletion"}'* ]] || return 1
+  [[ "$body" != *'{"type":"non_fast_forward"}'* ]] || return 1
+}
+
+@test "install normalizes mismatched conditions to target the requested branch" {
+  # Finding null: an admin retargeted the reserved-name ruleset to some other
+  # ref. Our model is one ruleset per branch, so install reclaims it to the
+  # canonical single-branch targeting — otherwise it would report success
+  # while enforcing nothing on the requested branch.
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"main"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/release"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install --branch develop
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"include":["refs/heads/develop"]'* ]] || return 1
+  [[ "$body" != *"refs/heads/release"* ]] || return 1
+  [[ "$body" == *'"enforcement":"active"'* ]] || return 1
+}
+
 @test "install re-activates a disabled ruleset and preserves its contexts" {
   # Installing signoff means enforcing it: a disabled ruleset is flipped back
   # to active, its existing signoff AND foreign checks kept, our new one added.
