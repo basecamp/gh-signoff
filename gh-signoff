@@ -415,12 +415,32 @@ find_signoff_ruleset_id() {
 # must treat it as fatal — computing a union or remainder from contexts that
 # merely failed to load would silently drop requirements.
 signoff_ruleset_contexts() {
-  local id="$1" active_only="${2:-}" gate="" contexts
+  local id="$1" active_only="${2:-}" branch="${3:-}" gate="" refs_json contexts
   if [[ -n "$active_only" ]]; then
-    # A real ruleset GET always carries .enforcement, so the // "active"
-    # default only covers a response that omits it (never a live one) rather
-    # than silently masking a disabled ruleset
-    gate='select((.enforcement // "active") == "active") | '
+    # A read gate: the ruleset must be actively enforced AND actually target
+    # the requested branch. A real GET always carries .enforcement and
+    # .conditions, so the // defaults only cover a response that omits them
+    # (never a live one), not a real disabled or retargeted ruleset.
+    #
+    # "Targets the branch" is a membership test against our canonical refs —
+    # for the default branch either ~DEFAULT_BRANCH or refs/heads/<default>
+    # (a promoted ruleset may carry the explicit spelling), for a non-default
+    # branch refs/heads/<branch>: the include list must contain one and the
+    # exclude list none. LIMITATION: this does NOT evaluate ref-name patterns.
+    # A wildcard include an admin hand-set (refs/heads/*, ~ALL) that happens to
+    # cover the branch reads as not-targeted, so reads under-report ("not
+    # required"). That is the safe direction — we never falsely claim required
+    # — and our own rulesets always use canonical single-branch targeting, so
+    # only a hand-retargeted ruleset is affected. Writes are NOT gated:
+    # install must still read a retargeted ruleset's contexts to preserve them
+    # and re-normalize its conditions (reclaiming it), so writers pass no
+    # active_only and skip this entirely.
+    if [[ "$branch" == "$(default_branch)" ]]; then
+      refs_json='["~DEFAULT_BRANCH","refs/heads/'"$branch"'"]'
+    else
+      refs_json='["refs/heads/'"$branch"'"]'
+    fi
+    gate='select((.enforcement // "active") == "active") | select( (.conditions == null) or ( (.conditions.ref_name.include // []) as $inc | (.conditions.ref_name.exclude // []) as $exc | ('"$refs_json"' | map(. as $r | ($inc | index($r)) != null) | any) and (('"$refs_json"' | map(. as $r | ($exc | index($r)) != null) | any) | not) ) ) | '
   fi
   contexts=$(gh api "repos/:owner/:repo/rulesets/${id}" \
     --jq "${gate}.rules[]? | select(.type == \"required_status_checks\") | .parameters.required_status_checks[]? | ((.context // \"\") | ascii_downcase) as \$k | select((\$k == \"signoff\" or (\$k | startswith(\"signoff/\"))) and (.integration_id == null or .integration_id == -1)) | .context | ${CONTEXT_RECORD_JQ}" \
@@ -517,7 +537,7 @@ fetch_required_signoff_contexts() {
   # ruleset contributes nothing and check/status report not-required
   ruleset_contexts=""
   if find_signoff_ruleset_id "$branch" && [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID" active) || ruleset_contexts=""
+    ruleset_contexts=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID" active "$branch") || ruleset_contexts=""
   fi
 
   legacy=$(legacy_signoff_contexts "$branch")

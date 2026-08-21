@@ -56,7 +56,7 @@ Those ruleset names are reserved: gh-signoff treats a repository branch ruleset 
 
 If you installed signoff on a branch that later *became* your default branch, gh-signoff still recognizes the older `signoff (<branch>)` ruleset as its own; running `install` again rewrites it to the canonical `signoff` shape.
 
-`check` and `status` report a signoff requirement only when the ruleset is actively enforced. If you disable the ruleset or set it to evaluate (dry-run) mode in GitHub settings, `check` reports signoff as not required — because GitHub isn't enforcing it. Running `gh signoff install` again re-activates the ruleset, keeping its existing contexts.
+`check` and `status` report a signoff requirement only when the ruleset is actively enforced **and** actually targets the branch. If you disable the ruleset, set it to evaluate (dry-run) mode, or retarget its conditions away from the branch (say to `refs/heads/release` only) in GitHub settings, `check` reports signoff as not required — because GitHub isn't enforcing it there. Running `gh signoff install` again re-activates the ruleset and reclaims its targeting to the branch, keeping its existing contexts. (The targeting check compares canonical single-branch refs, not wildcard patterns; a ruleset you've hand-retargeted with a wildcard that happens to cover the branch reads as not-required — the safe direction.)
 
 ### Context names
 

@@ -660,6 +660,74 @@ EOF
   [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff on tests" ]] || return 1
 }
 
+@test "a ruleset whose conditions exclude the branch is not counted by reads" {
+  # Reads must honor conditions, not just enforcement. An active ruleset named
+  # signoff (develop) that an admin retargeted to only refs/heads/release does
+  # not apply to develop, so check/status must report not-required there.
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"main"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/release"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  run -1 gh-signoff check --branch develop
+  [[ "$output" == "${STATUS_FAILURE} GitHub develop branch does not require signoff" ]] || return 1
+
+  run -1 gh-signoff check --branch develop tests
+  [[ "$output" == "${STATUS_FAILURE} GitHub develop branch does not require signoff on tests" ]] || return 1
+
+  run -0 gh-signoff status --branch develop
+  [[ "$output" == "${STATUS_FAILURE} signoff" ]] || return 1
+}
+
+@test "a ruleset that lists the branch in exclude is not counted by reads" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":["refs/heads/main"]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+
+  run -1 gh-signoff check
+  [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff" ]] || return 1
+}
+
+@test "the default branch accepts both the ~DEFAULT_BRANCH and refs/heads spellings" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"main"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+
+  # ~DEFAULT_BRANCH spelling
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
+
+  # explicit refs/heads/main spelling (as a pre-promotion install would leave)
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
+}
+
+@test "a non-default ruleset correctly targeting its branch is counted" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"main"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/develop"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+
+  run -0 gh-signoff check --branch develop
+  [[ "$output" == "${STATUS_SUCCESS} GitHub develop branch requires signoff" ]] || return 1
+}
+
+@test "install reclaims a retargeted ruleset: conditions re-normalized, contexts preserved" {
+  # Writes are NOT gated on conditions: install must read a retargeted
+  # ruleset's contexts and re-normalize its targeting back to canonical.
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"main"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/release"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install --branch develop
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  # Targeting reclaimed to the requested branch; existing contexts preserved
+  [[ "$body" == *'"include":["refs/heads/develop"]'* ]] || return 1
+  [[ "$body" != *"refs/heads/release"* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+}
+
 @test "a branch name with a C1 control is accepted and reaches the payload" {
   # Finding B: [[:cntrl:]] over-rejected C1 controls like U+0085 (NEL), whose
   # bytes are legal in a git ref and unescaped in a JSON string. The branch
