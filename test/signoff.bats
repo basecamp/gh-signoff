@@ -717,6 +717,19 @@ EOF
   [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
 }
 
+@test "-- routes to implicit create for a leading-dash context" {
+  # The implicit form must reach cmd_create's end-of-options handler too, so
+  # `gh signoff -- -qa` works without the `create` workaround.
+  run -0 gh-signoff -f -- -qa
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for -qa"* ]] || return 1
+
+  # -- with nothing after is still a plain default signoff
+  run -0 gh-signoff -f --
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! "$output" == *"for"* ]] || return 1
+}
+
 @test "-- ends options so a leading-dash context can be managed" {
   # A record/JSON-safe context may begin with a hyphen (e.g. -qa). The option
   # parser rejects it as an unknown option unless -- ends the options first.

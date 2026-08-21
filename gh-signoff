@@ -1970,6 +1970,12 @@ case "$1" in
     exit 1
     ;;
   "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
+  "--")
+    # End of options routes to implicit create, so `gh signoff -- -qa` signs
+    # off a leading-dash context directly. The -- is passed through (no shift):
+    # cmd_create's own end-of-options handler consumes it and treats the rest
+    # as contexts.
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   -*)
     # Unknown option
     cmd_help; exit 1
