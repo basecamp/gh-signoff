@@ -43,6 +43,20 @@ gh signoff status --commit abc1234
 
 A branch checked out from a cross-repository pull request (`gh pr checkout` on a fork PR) tracks a bare URL rather than a named remote, so it has no tracking ref for either `@{push}` or `@{upstream}` to resolve. Signoff asks that repository directly instead — one `git ls-remote` for the tracked ref — and accepts HEAD when it's contained in the advertised tip. If that tip isn't already in your repository, or a push wouldn't provably land on the same URL, it refuses rather than guess.
 
+### Reporting a failure
+
+When a run fails -- especially one detached on a CI runner, where silence
+is indistinguishable from "never ran" -- leave a visible red mark:
+
+```bash
+gh signoff fail
+gh signoff fail tests                      # a partial context
+gh signoff fail --commit abc1234 --description "suite exploded"
+```
+
+A red status is a warning, not an attestation, so no cleanliness check
+applies: the only requirement is that GitHub knows the commit.
+
 ### To require signoff for PR merges
 
 ```bash

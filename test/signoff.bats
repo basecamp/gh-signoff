@@ -203,6 +203,52 @@ EOF
   [[ "$output" == *"Signed off on $sha"* ]] || return 1
 }
 
+# fail posts a red signoff status so a failed CI run -- especially one
+# detached on a runner -- leaves a visible mark instead of silence. A red
+# status is a warning, not an attestation, so no cleanliness check applies:
+# these tests run in the top-level TEST_DIR repo, which is always dirty with
+# the untracked gh-signoff and gh mock binaries.
+@test "fail reports a CI failure without any cleanliness check" {
+  [[ -n "$(git status --porcelain)" ]] || return 1
+
+  run -0 gh-signoff fail
+  [[ "$output" == *"${STATUS_FAILURE} Reported CI failure on"* ]] || return 1
+}
+
+@test "fail reports a CI failure for each named context" {
+  run -0 gh-signoff fail tests lint
+  [[ "$output" == *"for tests"* ]] || return 1
+  [[ "$output" == *"for lint"* ]] || return 1
+}
+
+@test "fail targets the commit named by --commit" {
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff fail --commit "${sha:0:8}"
+  [[ "$output" == *"Reported CI failure on $sha"* ]] || return 1
+}
+
+@test "fail --description requires an argument" {
+  run -1 gh-signoff fail --description
+  [[ "$output" == *"option --description requires an argument"* ]] || return 1
+}
+
+@test "fail rejects -f" {
+  run -1 gh-signoff fail -f
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
+
+  run -1 gh-signoff -f fail
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
+}
+
+@test "fail propagates a status API failure" {
+  export MOCK_POST_STATUS_EXIT=1
+
+  run -1 gh-signoff fail
+  [[ "$output" == *"Failed to report CI failure"* ]] || return 1
+}
+
 @test "--commit rejects a revision git cannot resolve" {
   run -1 gh-signoff create --commit 'abc/status'
   [[ "$output" == *"invalid commit: abc/status"* ]] || return 1
@@ -2849,7 +2895,7 @@ EOF
               "uninstall --commit nope" "--commit nope uninstall" \
               "check --commit nope" "--commit nope check"; do
     run -1 gh-signoff $args
-    [[ "$output" == *"--commit is only valid for create and status"* ]] || return 1
+    [[ "$output" == *"--commit is only valid for create, fail, and status"* ]] || return 1
     [[ ! "$output" == *"invalid commit"* ]] || return 1
   done
 }

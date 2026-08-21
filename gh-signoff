@@ -1304,6 +1304,98 @@ cmd_create() {
   fi
 }
 
+# Post a failing signoff status, so a CI run that fails — especially one
+# detached on a runner — leaves a visible red mark instead of silence. A red
+# status is a warning, not an attestation, so no cleanliness check applies:
+# the only requirement is that GitHub knows the commit at all.
+cmd_fail() {
+  local commit=""
+  local description=""
+  local contexts=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --commit)
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
+        shift 2
+        ;;
+      --description)
+        if [[ -z "${2:-}" ]]; then
+          fail "option --description requires an argument"
+        fi
+        description="$2"
+        shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      -*)
+        fail "unknown option: $1"
+        ;;
+      *)
+        contexts+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  local user
+  user=$(git config user.name) || fail "failed to get git user name"
+  [[ -z "$user" ]] && fail "git user.name is not set"
+
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
+  fi
+
+  if [[ -z "$description" ]]; then
+    description="${user}: CI failed"
+  fi
+
+  if [ ${#contexts[@]} -eq 0 ]; then
+    contexts=("")
+  fi
+
+  local success=true
+  local messages=()
+
+  for context in "${contexts[@]}"; do
+    local context_name="signoff"
+    if [[ -n "$context" ]]; then
+      context_name="signoff/${context}"
+    fi
+
+    debug "creating failure status for commit ${commit} with context ${context_name}"
+
+    if gh api \
+      --method POST \
+      "repos/:owner/:repo/statuses/${commit}" \
+      -f state=failure \
+      -f context="${context_name}" \
+      -f "description=${description}" >/dev/null; then
+
+      if [[ -z "$context" ]]; then
+        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit}")
+      else
+        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit} for ${context}")
+      fi
+    else
+      success=false
+      if [[ -z "$context" ]]; then
+        echo "Failed to report CI failure on ${commit}" >&2
+      else
+        echo "Failed to report CI failure on ${commit} for ${context}" >&2
+      fi
+    fi
+  done
+
+  if $success; then
+    printf "%s\n" "${messages[@]}"
+  else
+    exit 1
+  fi
+}
+
 cmd_install() {
   local branch=""
   local contexts=()
@@ -1323,7 +1415,7 @@ cmd_install() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1483,7 +1575,7 @@ cmd_uninstall() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1699,7 +1791,7 @@ cmd_check() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1919,6 +2011,7 @@ USAGE
 
 COMMANDS
   create (default) Sign off on the current commit or a specific commit
+  fail             Report a CI failure on the current commit or a specific commit
   install          Require signoff via a repository ruleset. Adds the given
                    contexts to whatever is already required, and migrates any
                    legacy signoff branch protection into the ruleset
@@ -1932,12 +2025,15 @@ FLAGS
   -f  Force sign off (ignore uncommitted/unpushed changes)
 
 OPTIONS
-  --branch <branch>  Branch to operate on (for install, uninstall, check, status)
-  --commit <sha>     Commit to sign off on (for create, status). Any revision
-                     git resolves; must be on a remote unless forced with -f
+  --branch <branch>       Branch to operate on (for install, uninstall, check, status)
+  --commit <sha>          Commit to operate on (for create, fail, status). Any revision
+                          git resolves; for create it must be on a remote unless forced with -f
+  --description <text>    Status description for fail (default: "<user>: CI failed")
 
 EXAMPLES
   gh signoff                           # Sign off on current commit
+  gh signoff fail                      # Report a CI failure on current commit
+  gh signoff fail once                 # Report a partial-context CI failure
   gh signoff --commit abc1234          # Sign off on a specific commit
   gh signoff --commit HEAD~1 tests     # Partial signoff on a specific commit
   gh signoff create -f                 # Force signoff
@@ -1953,7 +2049,7 @@ EOF
 }
 
 # A leading -f applies to create (explicit, implicit, or contextual); a leading
-# --commit to create and status. Both are rejected for every other command.
+# --commit to create, fail, and status. Both are rejected for every other command.
 #
 # The revision stays raw here: resolving it before the command is known would
 # report `gh signoff --commit nope install` as a bad revision, when what's
@@ -1985,7 +2081,7 @@ reject_force() {
 
 reject_commit() {
   if [[ ${#commit_opt[@]} -gt 0 ]]; then
-    fail "--commit is only valid for create and status"
+    fail "--commit is only valid for create, fail, and status"
   fi
 }
 
@@ -2004,6 +2100,7 @@ fi
 # possibly-empty array. ${commit_opt:+...} would word-split the revision.
 case "$1" in
   "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "fail")           reject_force; shift; cmd_fail ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
   "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
   "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
