@@ -497,6 +497,121 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "install preserves a signoff check's integration_id" {
+  # An adopted required check may be pinned to a GitHub App via integration_id
+  # ("only this app may satisfy it"). We manage the signoff namespace but must
+  # not weaken it: a signoff check we keep keeps its integration_id.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff","integration_id":123}]}}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install lint
+  [[ "$output" == *"now requires signoff on lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  # The existing signoff check keeps its integration_id; lint is added bare
+  [[ "$body" == *'"context":"signoff"'*'"integration_id":123'* || "$body" == *'"integration_id":123'*'"context":"signoff"'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "an adopted ruleset's foreign check is never surfaced but always preserved" {
+  # An admin may have added a non-signoff check (other-ci) to a ruleset named
+  # signoff. It is not a signoff requirement, so reads never show it — and it
+  # is preserved verbatim (integration_id and all) on every write.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"other-ci","integration_id":999}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff","state":"success"}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  # status shows only the signoff row, never a spurious failed "other-ci"
+  run -0 gh-signoff status
+  [[ "$output" == "${STATUS_SUCCESS} signoff" ]] || return 1
+
+  # check does not report other-ci as a requirement either
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub main branch requires signoff" ]] || return 1
+
+  # install preserves other-ci (with its integration_id) and adds lint
+  run -0 gh-signoff install lint
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"context":"other-ci"'* ]] || return 1
+  [[ "$body" == *'"integration_id":999'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
+}
+
+@test "bare uninstall keeps a ruleset that still holds a foreign check" {
+  # Deleting the ruleset would drop the admin's other-ci config. So a bare
+  # uninstall removes only our signoff checks and rewrites, keeping other-ci;
+  # it deletes the ruleset only when nothing foreign remains.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"other-ci","integration_id":999}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+
+  # The rewrite drops our signoff check but keeps other-ci verbatim
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"context":"other-ci"'* ]] || return 1
+  [[ "$body" == *'"integration_id":999'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
+}
+
+@test "bare uninstall still deletes a ruleset that is wholly ours" {
+  # The other side: only signoff checks and our own rules means delete it.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"PUT repos/:owner/:repo/rulesets/42"* ]] || return 1
+}
+
+@test "a branch name with a URL metacharacter is percent-encoded in protection paths" {
+  # gh api treats the path as a URL: an unencoded '#' would truncate it and
+  # target the wrong branch. The branch-protection routes must see feat%23123.
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff install --branch 'feat#123'
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"branches/feat%23123/protection"* ]] || return 1
+  [[ "$calls" != *"branches/feat#123/protection"* ]] || return 1
+}
+
+@test "duplicate reserved-name rulesets fail closed everywhere" {
+  # Two rulesets share our name: which we adopt would be arbitrary and a bare
+  # uninstall would delete one while the other kept enforcing. Fail closed on
+  # reads and writes alike, and touch nothing.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"},{"id":43,"name":"signoff"}]'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff check
+  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+
+  run -1 gh-signoff install lint
+  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+
+  # No mutation of any kind was attempted
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"POST "* ]] || return 1
+  [[ "$calls" != *"PUT "* ]] || return 1
+  [[ "$calls" != *"DELETE "* ]] || return 1
+}
+
 @test "install migrates signoff-shaped legacy protection" {
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff","signoff/tests"]},"enforce_admins":{"enabled":false},"required_pull_request_reviews":null,"restrictions":null}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
@@ -875,29 +990,28 @@ EOF
 # and to make `uninstall tests` write back a bare `foreign` requirement
 # nobody asked for. As a JSON token it is one record that compares as itself
 # and is written back byte for byte.
-@test "a ruleset context with an embedded newline stays one context" {
+@test "an adopted check with an embedded newline is foreign and preserved" {
+  # A check named "foreign\nsignoff/tests" (one real newline) is not in the
+  # signoff namespace — it does not start with signoff/ — so it is foreign:
+  # never counted as a signoff requirement, never split into a forged
+  # "foreign" plus "signoff/tests", and preserved verbatim on every write.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"foreign\nsignoff/tests"}]}}]}'
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
-  # The forged half must not satisfy the check
-  run -0 gh-signoff check tests
+  # Not a signoff requirement: reads never surface it
+  run -1 gh-signoff check tests
   [[ "$output" == "${STATUS_FAILURE} GitHub main branch does not require signoff on tests" ]] || return 1
 
-  # ... nor be subtracted by it: the ruleset is rewritten unchanged
-  run -0 gh-signoff uninstall tests
-  [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
-
-  # ... and a union keeps it intact alongside the new context
+  # install adds our lint and preserves the foreign check verbatim alongside it
   run -0 gh-signoff install lint
   [[ "$output" == *"now requires signoff on lint"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ "$calls" != *"DELETE "* ]] || return 1
 
-  # The escaped token round-trips: one context, spelled exactly as it arrived,
-  # and no bare "foreign" requirement ever materializes
+  # One context, spelled exactly as it arrived; no bare "foreign" ever splits out
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'{"context":"foreign\nsignoff/tests"}'* ]] || return 1
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
@@ -1021,7 +1135,7 @@ EOF
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff install lint
-  [[ "$output" == *"writing signoff ruleset"* ]] || return 1
+  [[ "$output" == *"updating signoff ruleset"* ]] || return 1
   [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
   [[ "$output" != *$'\xc2\x9b'* ]] || return 1
 
