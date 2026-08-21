@@ -551,7 +551,7 @@ EOF
   # Enforcement does not gate writes: uninstall finds and removes a disabled
   # ruleset like any other
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"disabled","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -0 gh-signoff uninstall
@@ -653,6 +653,47 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "bare uninstall keeps a ruleset with a custom bypass actor" {
+  # The delete-vs-keep verdict is one holistic pristine test, not a list of
+  # foreign-content flags. An admin-added bypass actor makes the ruleset
+  # non-pristine, so bare uninstall rewrites (dropping our signoff checks) and
+  # preserves the custom bypass rather than deleting the whole thing.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"},{"actor_id":99,"actor_type":"Team","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+
+  # The custom bypass is preserved; our signoff check is gone
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"actor_id":99'* ]] || return 1
+  [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
+}
+
+@test "bare uninstall keeps a ruleset with custom conditions" {
+  # Same holistic test for conditions: an added exclude makes it non-pristine
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":["refs/heads/release/*"]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'refs/heads/release/*'* ]] || return 1
+}
+
 @test "bare uninstall keeps a ruleset that still holds a foreign check" {
   # Deleting the ruleset would drop the admin's other-ci config. So a bare
   # uninstall removes only our signoff checks and rewrites, keeping other-ci;
@@ -679,7 +720,7 @@ EOF
 @test "bare uninstall still deletes a ruleset that is wholly ours" {
   # The other side: only signoff checks and our own rules means delete it.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -0 gh-signoff uninstall
@@ -703,6 +744,82 @@ EOF
   [[ "$calls" != *"branches/feat#123/protection"* ]] || return 1
 }
 
+# Finding 313: signoff was installed on develop while develop was non-default
+# (ruleset "signoff (develop)"), then develop became the default branch. Its
+# canonical name is now the bare "signoff", so default-branch identity must
+# still recognize the old spelling or management is orphaned.
+@test "a promoted default branch still finds its pre-promotion ruleset" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"develop"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/develop"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+
+  # Reads find it under the old spelling
+  run -0 gh-signoff check
+  [[ "$output" == "${STATUS_SUCCESS} GitHub develop branch requires signoff" ]] || return 1
+}
+
+@test "install rewrites a promoted branch-specific ruleset to canonical shape" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"develop"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/develop"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  # Adopted in place (PUT on the found id), renamed to canonical and re-targeted
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"POST repos/:owner/:repo/rulesets"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'"name":"signoff"'* ]] || return 1
+  [[ "$body" != *'"name":"signoff (develop)"'* ]] || return 1
+  [[ "$body" == *'"include":["~DEFAULT_BRANCH"]'* ]] || return 1
+}
+
+@test "uninstall removes a promoted branch-specific ruleset" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"develop"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff (develop)"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff (develop)","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/develop"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  # Pristine (its refs/heads/develop condition is accepted for the default
+  # branch), so it is deleted rather than orphaned
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+}
+
+@test "both default-branch spellings present fails closed" {
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"develop"}'
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"},{"id":43,"name":"signoff (develop)"}]'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff check
+  [[ "$output" == *"multiple signoff rulesets"* ]] || return 1
+
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"multiple signoff rulesets"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"PUT "* ]] || return 1
+  [[ "$calls" != *"DELETE "* ]] || return 1
+  [[ "$calls" != *"POST "* ]] || return 1
+}
+
+# A non-default branch keeps single-name matching: the bare "signoff" (the
+# default branch's ruleset) is not adopted for a non-default branch.
+@test "a non-default branch does not adopt the bare signoff ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+
+  run -1 gh-signoff check --branch other
+  [[ "$output" == "${STATUS_FAILURE} GitHub other branch does not require signoff" ]] || return 1
+}
+
 @test "duplicate reserved-name rulesets fail closed everywhere" {
   # Two rulesets share our name: which we adopt would be arbitrary and a bare
   # uninstall would delete one while the other kept enforcing. Fail closed on
@@ -711,13 +828,13 @@ EOF
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -1 gh-signoff check
-  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+  [[ "$output" == *"multiple signoff rulesets"* ]] || return 1
 
   run -1 gh-signoff install lint
-  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+  [[ "$output" == *"multiple signoff rulesets"* ]] || return 1
 
   run -1 gh-signoff uninstall
-  [[ "$output" == *"multiple rulesets named 'signoff'"* ]] || return 1
+  [[ "$output" == *"multiple signoff rulesets"* ]] || return 1
 
   # No mutation of any kind was attempted
   calls=$(cat "$MOCK_CALL_LOG")
@@ -1340,14 +1457,14 @@ EOF
   # signoff/Tests IS the tests requirement. A case-sensitive subtraction
   # would remove nothing and PUT it straight back while reporting success.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
-  export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/Tests"}]}}]}'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/Tests"}]}}]}'
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff uninstall tests
   [[ "$output" == *"no longer requires signoff on tests"* ]] || return 1
 
-  # Nothing remains, so the ruleset goes rather than being rewritten
+  # Nothing remains and the ruleset is pristine, so it goes rather than being rewritten
   calls=$(cat "$MOCK_CALL_LOG")
   [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
   [[ "$calls" != *"PUT "* ]] || return 1
@@ -1420,6 +1537,7 @@ EOF
 
 @test "uninstall removes ruleset and signoff-shaped legacy protection" {
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
@@ -1441,6 +1559,7 @@ EOF
   # The protection keeps other-ci and all its other settings; only the
   # signoff contexts are removed, so uninstall's claim is actually true
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff","signoff/tests"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"

@@ -340,19 +340,32 @@ signoff_ruleset_ref() {
 # Two rulesets sharing our name is a different matter: which one we adopt
 # would be arbitrary, reads would report one while the other still enforced,
 # and a bare uninstall would delete one and leave the other. So fail closed
-# on a duplicate — everywhere, readers and writers alike — rather than act on
+# on a conflict — everywhere, readers and writers alike — rather than act on
 # a guess. Resolving it means removing the duplicate in repo settings.
+#
+# The default branch accepts a second spelling. If signoff was installed on a
+# then-non-default branch (say develop, ruleset "signoff (develop)") and
+# develop later became the default, its canonical name is now the bare
+# "signoff" — so identity resolution for the default branch matches EITHER
+# "signoff" or "signoff (<default-branch-name>)", adopting whichever exists so
+# reads still see it and uninstall/install can still manage it (install
+# renames it to the canonical shape). If BOTH exist, that is the same conflict
+# as any duplicate and fails closed. Non-default branches match one name only.
 find_signoff_ruleset_id() {
-  local branch="$1" name rows id rname count=0
+  local branch="$1" name alt="" rows id rname count=0
   SIGNOFF_RULESET_ID=""
 
   name=$(signoff_ruleset_name "$branch")
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    alt="signoff (${branch})"
+  fi
+
   rows=$(gh api "repos/:owner/:repo/rulesets?includes_parents=false&targets=branch" --paginate \
     --jq '.[] | [.id, .name] | @tsv' 2>/dev/null) || return 1
   rows=${rows//$'\r'/}
 
   while IFS=$'\t' read -r id rname; do
-    if [[ "$rname" == "$name" ]]; then
+    if [[ "$rname" == "$name" || ( -n "$alt" && "$rname" == "$alt" ) ]]; then
       count=$((count + 1))
       [[ -z "$SIGNOFF_RULESET_ID" ]] && SIGNOFF_RULESET_ID="$id"
     fi
@@ -360,7 +373,7 @@ find_signoff_ruleset_id() {
 
   if [[ "$count" -gt 1 ]]; then
     SIGNOFF_RULESET_ID=""
-    fail "multiple rulesets named '$(scrub "$name")' on $(scrub "$branch"); remove the duplicate in repo settings"
+    fail "multiple signoff rulesets on $(scrub "$branch"); remove the duplicate in repo settings"
   fi
 }
 
@@ -636,44 +649,90 @@ json_array_of_tokens() {
 # The jq program that reconciles an ADOPTED ruleset's signoff namespace to the
 # desired set while preserving everything else verbatim. We own only the
 # signoff contexts; a foreign check keeps its full object (integration_id and
-# all), foreign rules stay, and so do conditions, bypass_actors and
-# enforcement. Only the signoff-namespace membership of required_status_checks
-# changes: signoff entries whose folded context is not wanted are dropped,
-# wanted contexts not already present are appended as bare {"context":X}, and a
-# signoff entry that IS wanted keeps its own object (so an integration_id on a
-# signoff check survives too).
+# all), foreign rules stay, and so do bypass_actors. Only the signoff-namespace
+# membership of required_status_checks changes: signoff entries whose folded
+# context is not wanted are dropped, wanted contexts not already present are
+# appended as bare {"context":X}, and a signoff entry that IS wanted keeps its
+# own object (so an integration_id on a signoff check survives too).
 #
-# It emits two lines: a verdict — "delete" when the desired set is empty and
-# nothing foreign remains (the ruleset is wholly ours, so a bare uninstall
-# should remove it), else "keep" — then the PUT body as one line via tojson.
+# It emits two lines: a verdict, then the PUT body as one line via tojson.
 # tojson makes the body single-line and identical enough across jq and gojq;
 # GitHub ignores key order, and the tests assert against the mock's jq output.
 #
-# $want is embedded as a JSON array of tokens; the name and ref defaults are
-# embedded as JSON string literals and only fill in for a response missing
-# those fields (a real GET always carries them). The empty required_status_
-# checks rule is dropped rather than left behind, and if the desired set is
-# non-empty but the adopted ruleset had no required_status_checks rule at all,
-# one is appended.
+# The verdict is "delete" only when the desired set is empty AND the ruleset is
+# PRISTINE — byte-for-byte the canonical shape this tool creates, so a bare
+# uninstall is removing nothing but its own artifact. Pristine is one holistic
+# test, not a list of foreign-content flags, so it needs no new selector each
+# time an admin can customize another field: the rules are exactly our three
+# types, every status check is signoff-namespace, bypass_actors is exactly our
+# admin bypass, and conditions is exactly our canonical targeting. Any
+# deviation — a foreign check or rule, an extra bypass actor, a narrowed
+# condition — makes it non-pristine, so the ruleset is rewritten (signoff
+# checks removed, everything else kept) rather than deleted. Enforcement and
+# name are deliberately excluded: they are our own toggle and identity, not
+# admin content, so a disabled or branch-specifically-named-but-otherwise-
+# canonical ruleset is still ours to delete. The rule comparison is by TYPE,
+# not deep object equality, because a GET adds server-side parameters (e.g.
+# do_not_enforce_on_create) we never wrote.
+#
+# mode shapes what is written. "activate" (install) normalizes to canonical:
+# name, canonical ref conditions, and active enforcement — installing signoff
+# means asserting the canonical enforcing shape, which also renames a
+# promoted-default "signoff (<branch>)" to "signoff"/~DEFAULT_BRANCH.
+# "preserve" (uninstall) keeps the existing name, conditions and enforcement —
+# removing a context is no reason to re-target or re-enforce, and it must not
+# discard the admin conditions/bypass the pristine test just protected.
+# bypass_actors is preserved in both modes: it is admin policy, and install has
+# no opinion beyond supplying the default when none exists.
+#
+# $want is embedded as a JSON array of tokens. The empty required_status_checks
+# rule is dropped rather than left behind, and if the desired set is non-empty
+# but the adopted ruleset had no required_status_checks rule at all, one is
+# appended.
 build_reconcile_filter() {
-  local branch="$1" want_array="$2" enforcement_expr="$3" name_json ref_json
+  local branch="$1" want_array="$2" mode="$3"
+  local name_json ref_json pristine_conditions name_expr conditions_expr enforcement_expr
 
   require_json_safe "branch name" "$branch"
   name_json="\"$(signoff_ruleset_name "$branch")\""
   ref_json="\"$(signoff_ruleset_ref "$branch")\""
 
+  # Pristine conditions: our canonical targeting for this branch. The default
+  # branch accepts either spelling — ~DEFAULT_BRANCH or the explicit
+  # refs/heads/<name> a pre-promotion install left — so a promoted ruleset is
+  # still recognized as ours and deletable.
+  if [[ "$branch" == "$(default_branch)" ]]; then
+    pristine_conditions='(.conditions == {ref_name:{include:["~DEFAULT_BRANCH"],exclude:[]}} or .conditions == {ref_name:{include:["refs/heads/'"$branch"'"],exclude:[]}})'
+  else
+    pristine_conditions='(.conditions == {ref_name:{include:['"$ref_json"'],exclude:[]}})'
+  fi
+
+  if [[ "$mode" == "activate" ]]; then
+    name_expr="$name_json"
+    conditions_expr='{ref_name:{include:['"$ref_json"'],exclude:[]}}'
+    enforcement_expr='"active"'
+  else
+    name_expr='(.name // '"$name_json"')'
+    conditions_expr='(.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}})'
+    enforcement_expr='(.enforcement // "active")'
+  fi
+
   printf '%s' 'def is_signoff($k): $k == "signoff" or ($k | startswith("signoff/"));
 '"$want_array"' as $want
 | ($want | map(ascii_downcase)) as $wantkeys
-| ([.rules[]? | select((.type=="deletion" or .type=="non_fast_forward" or .type=="required_status_checks")|not)] | length > 0) as $foreign_rules
-| ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | ((.context // "")|ascii_downcase) as $k | select(is_signoff($k)|not)] | length > 0) as $foreign_checks
-| (if (($want|length)==0) and (($foreign_rules or $foreign_checks)|not) then "delete" else "keep" end),
+| ( (([.rules[]? | .type] | sort) == ["deletion","non_fast_forward","required_status_checks"])
+    and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | is_signoff((.context // "")|ascii_downcase)] | all)
+    and ((.target // "branch") == "branch")
+    and (.bypass_actors == [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}])
+    and '"$pristine_conditions"'
+  ) as $pristine
+| (if (($want|length)==0) and $pristine then "delete" else "keep" end),
   ({
-    name: (.name // '"$name_json"'),
+    name: '"$name_expr"',
     target: (.target // "branch"),
     enforcement: '"$enforcement_expr"',
     bypass_actors: (.bypass_actors // [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}]),
-    conditions: (.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}}),
+    conditions: '"$conditions_expr"',
     rules: (
       [ .rules[]?
         | if .type=="required_status_checks" then
@@ -698,17 +757,12 @@ build_reconcile_filter() {
 # fresh one from our shape — but only if there is something to require;
 # reconciling to nothing when nothing exists is a no-op. An existing ruleset
 # is read once and transformed jq-side: the verdict says whether to delete it
-# (wholly ours, nothing left to require) or PUT the preserved remainder.
-#
-# The mode decides the written ruleset's enforcement. "activate" (install)
-# forces "active": installing signoff means enforcing it, so a disabled or
-# evaluate-mode ruleset is flipped back on while its contexts are preserved.
-# "preserve" (uninstall) keeps whatever enforcement the ruleset had — removing
-# a context is no reason to change whether the remainder is enforced.
+# (pristine, nothing left to require) or PUT the preserved remainder. mode
+# ("activate" for install, "preserve" for uninstall) is handed to the filter.
 apply_signoff_ruleset() {
   local branch="$1" id="$2" mode="$3"
   shift 3
-  local want_array enforcement_expr filter result verdict body
+  local want_array filter result verdict body
 
   if [[ -z "$id" ]]; then
     if [[ $# -gt 0 ]]; then
@@ -717,14 +771,8 @@ apply_signoff_ruleset() {
     return
   fi
 
-  if [[ "$mode" == "activate" ]]; then
-    enforcement_expr='"active"'
-  else
-    enforcement_expr='(.enforcement // "active")'
-  fi
-
   want_array=$(json_array_of_tokens "$@")
-  filter=$(build_reconcile_filter "$branch" "$want_array" "$enforcement_expr")
+  filter=$(build_reconcile_filter "$branch" "$want_array" "$mode")
   result=$(gh api "repos/:owner/:repo/rulesets/${id}" --jq "$filter" 2>/dev/null) ||
     fail "failed to read signoff ruleset"
   result=${result//$'\r'/}
