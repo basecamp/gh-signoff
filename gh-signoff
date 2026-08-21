@@ -765,6 +765,7 @@ def ours_check: (is_signoff((.context // "")|ascii_downcase)) and (.integration_
 | ( ([.rules[]? | .type | select(. as $t | (["deletion","non_fast_forward","required_status_checks"] | index($t)) | not)] | length == 0)
     and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | ours_check] | all)
     and ([.rules[]? | select(.type=="required_status_checks") | (.parameters.strict_required_status_checks_policy // false)] | all(. == false))
+    and ([.rules[]? | select(.type=="required_status_checks") | (.parameters.do_not_enforce_on_create // false)] | all(. == false))
     and ((.target // "branch") == "branch")
     and (.bypass_actors == [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}])
     and '"$pristine_conditions"'
@@ -1152,6 +1153,16 @@ cmd_create() {
         shift 2
         ;;
 
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
       -*)
         fail "unknown option: $(scrub "$1")"
         ;;
@@ -1253,6 +1264,16 @@ cmd_install() {
         ;;
       --commit)
         fail "--commit is only valid for create and status"
+        ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
         ;;
       -*)
         fail "unknown option: $(scrub "$1")"
@@ -1372,7 +1393,13 @@ cmd_install() {
       fi
       ;;
     other)
-      printf '%s\n' "Warning: ${branch_shown} also enforces signoff via customized branch protection, which gh-signoff leaves untouched; the ruleset now enforces it too (a harmless duplicate). Remove the legacy signoff contexts in repo settings if you want a single source." >&2
+      # Only warn about a signoff duplicate when the customized protection
+      # actually enforces signoff. Protection that carries no signoff context
+      # (only reviews, or a foreign check) is unrelated — our ruleset is then
+      # the sole signoff enforcement and there is nothing to remove.
+      if [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
+        printf '%s\n' "Warning: ${branch_shown} also enforces signoff via customized branch protection, which gh-signoff leaves untouched; the ruleset now enforces it too (a harmless duplicate). Remove the legacy signoff contexts in repo settings if you want a single source." >&2
+      fi
       ;;
   esac
 }
@@ -1397,6 +1424,17 @@ cmd_uninstall() {
         ;;
       --commit)
         fail "--commit is only valid for create and status"
+        ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          [[ -n "$1" ]] || fail "context name cannot be empty"
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
         ;;
       -*)
         fail "unknown option: $(scrub "$1")"
@@ -1602,6 +1640,16 @@ cmd_check() {
         ;;
       --commit)
         fail "--commit is only valid for create and status"
+        ;;
+      --)
+        # End of options: the rest are contexts, even a leading-dash name
+        # like -qa (record/JSON-safe names may begin with a hyphen).
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
         ;;
       -*)
         fail "unknown option: $(scrub "$1")"

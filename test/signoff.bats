@@ -703,6 +703,53 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "a ruleset with do_not_enforce_on_create=true is not pristine" {
+  # do_not_enforce_on_create is a mutable required-status-check parameter; an
+  # admin setting it true is a customization, so bare uninstall must preserve
+  # the ruleset (rewrite, drop signoff) rather than delete it.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"id":42,"name":"signoff","enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"do_not_enforce_on_create":true,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"PUT repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets/42"* ]] || return 1
+}
+
+@test "-- ends options so a leading-dash context can be managed" {
+  # A record/JSON-safe context may begin with a hyphen (e.g. -qa). The option
+  # parser rejects it as an unknown option unless -- ends the options first.
+  export MOCK_RULESETS_LIST_JSON='[]'
+  export MOCK_BRANCH_EXISTS=1
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -1 gh-signoff install -qa
+  [[ "$output" == *"unknown option: -qa"* ]] || return 1
+
+  run -0 gh-signoff install -- -qa
+  [[ "$output" == *"now requires signoff on -qa"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff/-qa"}'* ]] || return 1
+
+  run -0 gh-signoff create -f -- -qa
+  [[ "$output" == *"for -qa"* ]] || return 1
+}
+
+@test "customized protection without signoff draws no duplicate warning" {
+  # "other" protection that enforces no signoff (reviews, or a foreign check)
+  # is unrelated: the ruleset is the sole signoff enforcement, so there is no
+  # duplicate to warn about and nothing to remove.
+  export MOCK_RULESETS_LIST_JSON='[]'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":true,"contexts":["other-ci"]},"enforce_admins":{"enabled":true}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+  [[ "$output" != *"also enforces signoff"* ]] || return 1
+  [[ "$output" != *"harmless duplicate"* ]] || return 1
+}
+
 @test "install adds an unpinned signoff beside an app-pinned twin" {
   # When the only signoff check is app-pinned, reads exclude it (foreign), so
   # install wants an unpinned signoff. The pinned twin must not suppress that
@@ -1224,7 +1271,10 @@ EOF
 
   run -0 gh-signoff install lint
   [[ "$output" != *"Migrated"* ]] || return 1
-  [[ "$output" == *"customized branch protection"* ]] || return 1
+  # No recognized signoff context lives in this protection (the unsafe one is
+  # not ours, other-ci is app-bound), so there is no signoff duplicate to warn
+  # about even though the protection is left intact.
+  [[ "$output" != *"also enforces signoff"* ]] || return 1
 
   # Legacy protection is untouched — no removal of any kind
   calls=$(cat "$MOCK_CALL_LOG")
