@@ -528,6 +528,14 @@ fetch_required_signoff_contexts() {
   SIGNOFF_CONTEXTS=""
   SIGNOFF_LEGACY_PRESENT=false
 
+  # The active read splices the branch's ref into a jq conditions gate, so a
+  # branch name carrying a quote or backslash would build an invalid filter
+  # whose failure would be swallowed as "not required". Reject it here, the
+  # same names the write path refuses — gh-signoff cannot represent such a
+  # branch in a ruleset anyway, so check and status decline it rather than
+  # misreport.
+  require_json_safe "branch name" "$branch"
+
   # Warm the default-branch cache in this shell so the identity lookups below
   # resolve consistently and without refetching; when it's unavailable, the
   # ruleset simply won't be found, matching how reads treat API failures

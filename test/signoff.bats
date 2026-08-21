@@ -771,6 +771,31 @@ EOF
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
 }
 
+@test "check and status reject a branch name unsafe for JSON" {
+  # The active read builds a jq conditions gate from the branch ref, so a
+  # branch containing a quote would form an invalid filter whose failure would
+  # be swallowed as "not required". Reject it cleanly, as the write path does,
+  # rather than misreport. A regular branch is unaffected.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"id":42,"name":"signoff","enforcement":"active","target":"branch","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_BRANCH_EXISTS=1
+
+  run -1 gh-signoff check --branch 'a"b'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" != *"does not require signoff"* ]] || return 1
+
+  run -1 gh-signoff status --branch 'a"b'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+
+  # A C0 control (here ESC) is unsafe too, and the error itself is scrubbed
+  run -1 gh-signoff check --branch $'a\x1bb'
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
+  [[ "$output" != *$'\x1b'* ]] || return 1
+
+  run -0 gh-signoff check
+  [[ "$output" == *"requires signoff"* ]] || return 1
+}
+
 @test "a ruleset with do_not_enforce_on_create=true is not pristine" {
   # do_not_enforce_on_create is a mutable required-status-check parameter; an
   # admin setting it true is a customization, so bare uninstall must preserve
@@ -1804,13 +1829,16 @@ EOF
   [[ "$body" == *$'\xc2\x9b'* ]] || return 1
 }
 
-@test "a hostile default branch name prints inert" {
-  # The branch comes from the API, so it is scrubbed wherever it is shown
-  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"ma\u001bin"}'
+@test "a display-hostile default branch name prints inert" {
+  # A JSON-safe but display-hostile branch name (here U+202E, a bidi override)
+  # comes from the API and is scrubbed wherever it is shown. Unlike a
+  # JSON-unsafe name (quote/backslash/C0, which is rejected outright), this one
+  # is representable, so check runs and simply renders it inert.
+  export MOCK_DEFAULT_BRANCH_JSON='{"default_branch":"ma\u202ein"}'
 
   run -1 gh-signoff check
-  [[ "$output" != *$'\x1b'* ]] || return 1
-  [[ "$output" == "${STATUS_FAILURE} GitHub ma?in branch does not require signoff" ]] || return 1
+  [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
+  [[ "$output" == "${STATUS_FAILURE} GitHub ma???in branch does not require signoff" ]] || return 1
 }
 
 @test "a branch name outside the charset still reaches the payload faithfully" {
