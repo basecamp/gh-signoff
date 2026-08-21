@@ -937,7 +937,46 @@ EOF
   [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
 }
 
-@test "install leaves non-signoff protection intact" {
+@test "install on force-push-allowing protection imposes no guards" {
+  # An admin who explicitly allowed force pushes has customized protection
+  # ("other"); leaving it intact means our ruleset must not re-block force
+  # pushes or deletions on top of the admin's allowance.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]},"allow_force_pushes":{"enabled":true}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"customized branch protection"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" != *'{"type":"non_fast_forward"}'* ]] || return 1
+  [[ "$body" != *'{"type":"deletion"}'* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
+}
+
+@test "bare uninstall deletes a guard-less ruleset since guards are optional to pristine" {
+  # An "other"-legacy install leaves our ruleset without the guard rules. A
+  # later bare uninstall must still see it as pristine and delete it, not
+  # rewrite it — guards are optional to the pristine test.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff uninstall
+  [[ "$output" == *"no longer requires signoff"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ $'\n'"$calls"$'\n' == *$'\n'"DELETE repos/:owner/:repo/rulesets/42"$'\n'* ]] || return 1
+  [[ "$calls" != *"PUT repos/:owner/:repo/rulesets/42"* ]] || return 1
+}
+
+@test "install leaves customized (non-signoff) protection intact" {
+  # Customized ("other") legacy protection is left completely untouched: no
+  # surgical removal, no wholesale delete. The ruleset also enforces signoff
+  # (a harmless duplicate) and a warning points at the intact protection.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["other-ci","signoff"]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
@@ -945,50 +984,48 @@ EOF
 
   run -0 gh-signoff install
   [[ "$output" == *"now requires signoff"* ]] || return 1
-  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
-  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
+  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"customized branch protection"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
   [[ $'\n'"$calls"$'\n' == *$'\n'"POST repos/:owner/:repo/rulesets"$'\n'* ]] || return 1
-  # No wholesale protection delete: only the signoff contexts are removed,
-  # surgically, leaving other-ci and every other setting in place
-  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  # Legacy protection is not modified at all — no DELETE of any protection path
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
 
+  # No guards imposed: the intact legacy protection governs force pushes/deletions
   body=$(cat "$MOCK_BODY_LOG")
-  [[ "$body" != *"other-ci"* ]] || return 1
+  [[ "$body" != *'{"type":"deletion"}'* ]] || return 1
+  [[ "$body" != *'{"type":"non_fast_forward"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
 }
 
-@test "install treats admin-enforced protection as not ours to delete" {
-  # Old gh-signoff always wrote enforce_admins=null, so enabled enforcement
-  # means someone tightened it on purpose
+@test "install leaves admin-enforced protection intact" {
+  # enforce_admins=true makes it "other"; leave it entirely alone
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]},"enforce_admins":{"enabled":true}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -0 gh-signoff install
-  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
+  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"customized branch protection"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
-  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
 }
 
-@test "install preserves protection features old installs never wrote" {
-  # The classifier must read any enabled protection flag — linear history,
-  # signatures, whatever GitHub adds next — as someone else's configuration,
-  # never as signoff-shaped
+@test "install leaves protection with extra features intact" {
+  # Any enabled protection flag — linear history, signatures, whatever GitHub
+  # adds next — makes it "other", so install leaves the whole thing untouched
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff"]},"enforce_admins":{"enabled":false},"required_linear_history":{"enabled":true}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -0 gh-signoff install
-  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
-  [[ "$output" != *"Migrated legacy branch protection"* ]] || return 1
+  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"customized branch protection"* ]] || return 1
 
   calls=$(cat "$MOCK_CALL_LOG")
-  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
 }
 
 @test "install migrates only exactly-named signoff contexts" {
@@ -1068,35 +1105,29 @@ EOF
   [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
-@test "legacy checks with control characters are ours and migrate faithfully" {
-  # This expectation is the reverse of what it was. The name was disowned on
-  # the theory that install could not have written it — but 0.3.0 passed
-  # context arguments straight through to the API, so it could have, and
-  # disowning stranded a requirement no later version would migrate or
-  # remove. What the clause was really standing in for was the injection such
-  # a name enabled, and the record protocol has made that structural: one
-  # record, one spliced token, removal by exactly the name it has. The
-  # app-bound other-ci check is untouched either way.
+@test "a control-char signoff check beside an app-bound check leaves protection intact" {
+  # The app-bound other-ci is foreign, so the protection classifies as "other"
+  # and is left completely intact. The control-char signoff check is ours, so
+  # it is unioned into the ruleset (a harmless duplicate of the still-enforcing
+  # legacy contexts), and nothing on the legacy side is touched.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff/tests\nother-ci","app_id":null},{"context":"other-ci","app_id":777}]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
   export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
   run -0 gh-signoff install lint
-  [[ "$output" == *"Migrated legacy signoff contexts to a ruleset"* ]] || return 1
+  [[ "$output" != *"Migrated"* ]] || return 1
+  [[ "$output" == *"customized branch protection"* ]] || return 1
 
-  # Surgically removed, never a wholesale protection delete: other-ci is
-  # someone else's requirement and its protection is not ours to drop
+  # Legacy protection is untouched — no removal of any kind
   calls=$(cat "$MOCK_CALL_LOG")
-  [[ "$calls" == *"DELETE repos/:owner/:repo/branches/main/protection/required_status_checks/contexts"* ]] || return 1
-  [[ $'\n'"$calls"$'\n' != *$'\n'"DELETE repos/:owner/:repo/branches/main/protection"$'\n'* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
 
+  # The ruleset carries our control-char signoff context and the new lint,
+  # never the app-bound other-ci
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'{"context":"signoff/tests\nother-ci"}'* ]] || return 1
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
-  # The removal asks for that one name, whole — never the app-bound other-ci
-  [[ "$body" == *'{"contexts":["signoff/tests\nother-ci"]}'* ]] || return 1
-  [[ "$body" != *'["other-ci"'* ]] || return 1
   [[ "$body" != *'{"context":"other-ci"}'* ]] || return 1
 }
 
@@ -1120,48 +1151,92 @@ EOF
   [[ "$body" != *'{"context":"signoff"}'* ]] || return 1
 }
 
-@test "every command holds a typed context to the identifier grammar" {
-  # The grammar keeps the signoff namespace coherent: a context this tool
-  # creates is one it can install, check and uninstall by name, and one whose
-  # record and payload are built by quoting alone. install, check, uninstall
-  # and create all take a context the user typed, so all four hold it to the
-  # same rule.
+@test "every command refuses a context with a quote, backslash or control char" {
+  # Contexts are held to record/JSON safety, not the old identifier grammar
+  # (which was completion-injection armor, removed with completion). Only the
+  # characters that would break the bash-composed token or forge a record —
+  # quote, backslash, C0 controls — are refused. install, check, uninstall
+  # and create all apply it, before touching the API.
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  for bad in '$(printf PWNED)' 'foo;touch /tmp/pwned' '`id`' 'foo bar' \
-             '.hidden' 'has"quote' 'back\slash' 'a|b' 'a&b' \
-             'star*' '~home' $'nl\nhere' $'esc\x1bhere' $'caf\xc3\xa9'; do
+  for bad in 'has"quote' 'back\slash' $'nl\nhere' $'tab\there' $'esc\x1bhere'; do
     run -1 gh-signoff install "$bad"
-    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+    [[ "$output" == *"unsafe for JSON"* ]] || return 1
 
     run -1 gh-signoff check "$bad"
-    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+    [[ "$output" == *"unsafe for JSON"* ]] || return 1
 
     run -1 gh-signoff uninstall "$bad"
-    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+    [[ "$output" == *"unsafe for JSON"* ]] || return 1
 
     run -1 gh-signoff create "$bad"
-    [[ "$output" == *"may contain letters, digits"* ]] || return 1
+    [[ "$output" == *"unsafe for JSON"* ]] || return 1
   done
 
-  # A leading dash never reaches the grammar: every command reads it as an
-  # option first. Refused all the same, which is the point.
+  # A leading dash is read as an option before validation
   for cmd in install check uninstall create; do
     run -1 gh-signoff "$cmd" -danger
     [[ "$output" == *"unknown option: -danger"* ]] || return 1
   done
 
-  # Refused before anything is asked of the API
   [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
 }
 
-@test "the identifier grammar accepts the names people actually use" {
+@test "context names with spaces, symbols and non-ASCII are accepted" {
+  # The loosening: a space, shell metacharacters and non-ASCII are inert in a
+  # context name — never shell-evaluated, carried as JSON tokens — so they are
+  # allowed. A migrated legacy context like "qa review" must stay usable.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  for ok in 'qa review' 'a;b' 'a|b' 'a&b' 'star*' '~home' '$(printf X)' $'caf\xc3\xa9'; do
+    run -0 gh-signoff install "$ok"
+    [[ "$output" == *"now requires signoff"* ]] || return 1
+  done
+}
+
+@test "ordinary context names are accepted" {
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
 
   for good in foo foo-bar foo.bar foo/bar foo_bar Lint bash-3 9lives; do
     run -0 gh-signoff install "$good"
     [[ "$output" == *"now requires signoff on ${good}"* ]] || return 1
   done
+}
+
+@test "a legacy context outside the old grammar round-trips" {
+  # Finding D: a migrated legacy context like "qa review" must be signable,
+  # checkable and removable — not trapped by a grammar that once rejected it.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"},{"context":"signoff/qa review"}]}}]}'
+  export MOCK_COMMIT_STATUS_JSON='{"statuses":[{"context":"signoff/qa review","state":"success"}]}'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  # check finds it
+  run -0 gh-signoff check 'qa review'
+  [[ "$output" == *"requires signoff on qa review"* ]] || return 1
+
+  # status shows it satisfied
+  run -0 gh-signoff status
+  [[ "$output" == *"${STATUS_SUCCESS} qa review"* ]] || return 1
+
+  # uninstall removes just it, keeping the bare signoff
+  run -0 gh-signoff uninstall 'qa review'
+  [[ "$output" == *"no longer requires signoff on qa review"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *'{"context":"signoff"}'* ]] || return 1
+  [[ "$body" != *"qa review"* ]] || return 1
+}
+
+@test "a context that looks like a command substitution is an inert name" {
+  # The crux of why loosening is safe: a context is never shell-evaluated.
+  # `$(touch FILE)` is accepted as a NAME and signed, and no file appears.
+  make_pushed_repo
+  rm -f "$TEST_DIR/PWNED"
+
+  run -0 gh-signoff "\$(touch $TEST_DIR/PWNED)"
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ ! -e "$TEST_DIR/PWNED" ]] || return 1
 }
 
 @test "reads do not claim foreign signoff-prefixed contexts" {
@@ -1334,12 +1409,12 @@ EOF
   export MOCK_RULESET_JSON='{"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff/foo"},{"context":"signoff/bar"}]}}]}'
 
   run -1 gh-signoff check $'foo"\t"signoff/foo"\n"signoff/bar'
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
   [[ "$output" != *"requires signoff"* ]] || return 1
 
   # A plain quote is refused too, rather than quietly matching nothing
   run -1 gh-signoff check 'bad"context'
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
 }
 
 @test "an empty ruleset context round-trips rather than vanishing" {
@@ -1414,21 +1489,26 @@ EOF
   # The value we refuse still gets echoed back, so it is scrubbed on the way
   # out: an ESC here would clear the screen and take the error with it
   run -1 gh-signoff install $'bad\x1b[2Jclear'
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"unsafe for JSON"* ]] || return 1
   [[ "$output" != *$'\x1b'* ]] || return 1
   [[ "$output" == *"bad?[2Jclear"* ]] || return 1
 }
 
-@test "install refuses a bidi override in a context argument" {
-  # A name we would be creating has to be one we can show back. Refused
-  # before any request, and the refusal itself carries no raw override.
-  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+@test "a bidi override in a context is accepted but scrubbed for display" {
+  # U+202E is a format character, not a C0 control, so record/JSON safety
+  # allows it (like a branch name). It rides into the payload as a token but
+  # is scrubbed wherever it reaches the terminal.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
 
-  run -1 gh-signoff install $'ev\xe2\x80\xaeil'
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  run -0 gh-signoff install $'ev\xe2\x80\xaeil'
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+  # The success message scrubs the override rather than printing it raw
   [[ "$output" != *$'\xe2\x80\xae'* ]] || return 1
 
-  [[ ! -s "$MOCK_CALL_LOG" ]] || return 1
+  # The payload keeps the original bytes (as a token)
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *$'\xe2\x80\xae'* ]] || return 1
 }
 
 @test "debug shows an adopted name scrubbed while the payload keeps it" {
@@ -2249,16 +2329,16 @@ EOF
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run -1 gh-signoff -f '' good
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"cannot be empty"* ]] || return 1
 
   run -1 gh-signoff '' good
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"cannot be empty"* ]] || return 1
 
   run -1 gh-signoff create -f '' good
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"cannot be empty"* ]] || return 1
 
   run -1 gh-signoff -f ''
-  [[ "$output" == *"may contain letters, digits"* ]] || return 1
+  [[ "$output" == *"cannot be empty"* ]] || return 1
 
   # None of those reached the status API
   [[ ! -s "$MOCK_CALL_LOG" ]] || return 1

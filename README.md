@@ -60,16 +60,14 @@ If you installed signoff on a branch that later *became* your default branch, gh
 
 ### Context names
 
-A context name you give gh-signoff — the part after `signoff/` — must be an **identifier**: letters, digits, `.` `_` `/` `-`, starting with a letter or a digit. `tests`, `bash-3`, `build/linux` and `Lint` are all fine; `foo bar`, `-danger` and `café` are not.
+A context name you give gh-signoff — the part after `signoff/` — may contain anything except an unescaped quote, backslash, or control character. `tests`, `build/linux`, `qa review` and `déploiement` are all fine; only names that would break the request body or a record are refused, and an empty name is rejected. A space, `$` or `;` is allowed: a context name is never run by a shell — `create` sends it as an API field, and reads carry it as a data token — so it is inert. (An earlier release held context names to a strict identifier grammar; that existed only to make shell-completion candidates safe, and completion has since been removed, so the boundary is now simply record/JSON safety — which also keeps a migrated legacy context like `signoff/qa review` signable and removable.)
 
-The grammar is narrow on purpose. It keeps the signoff namespace coherent — a context you create is one you can also `install`, `check` and `uninstall` by exactly that name — and it keeps names free of the shell metacharacters and quoting hazards that have no place in a status-check context. The same grammar governs `install`, `check`, `uninstall` and `gh signoff <context>` alike.
+Two rules sit alongside naming, and they are deliberately different:
 
-Two other rules sit alongside it, and they are deliberately different:
+- **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them. gh-signoff does not edit a requirement it merely adopted.
+- **Display is lossy.** Anything outside printable ASCII is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different names can display identically while staying entirely distinct in what they enforce.
 
-- **Enforcement is faithful, whatever the name.** Contexts already in an adopted ruleset are carried along untouched and written back exactly as GitHub spells them, identifier or not. gh-signoff does not edit a requirement it merely adopted.
-- **Display is lossy.** Anything outside printable ASCII is shown as `?`, so a name can never reorder or repaint the line it appears on. This is *not* reversible or unique: two different names can display identically while staying entirely distinct in what they enforce. Distinguishing them on screen would mean a Unicode escaping engine written in bash, for names the tool refuses to create in the first place.
-
-Branch names are held to neither — `feature/x` and worse are legitimate refs, and a branch is named by your repository rather than by gh-signoff. They are only checked for what would break a request body, and shown through the same `?` display.
+Branch names follow the same record/JSON-safety rule — `feature/x` and worse are legitimate refs, named by your repository rather than by gh-signoff — and are shown through the same `?` display.
 
 Installing is additive: running `install` again with new contexts adds them to whatever the ruleset already requires. Uninstalling subtracts:
 
@@ -89,7 +87,7 @@ gh signoff install
 gh signoff install --branch other
 ```
 
-Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted; if you've layered other settings onto it (required reviews, other status checks, linear history, admin enforcement), those all stay — only the signoff status-check contexts are removed from it, since the ruleset enforces them now.
+Existing signoff contexts carry over into the ruleset. If the branch protection held nothing but what old gh-signoff installs wrote, it's deleted and the ruleset takes over (carrying the same force-push and deletion guards the protection blocked by default). If you've customized it in any way — required reviews, other status checks, linear history, admin enforcement, explicit force-push or deletion allowances — install leaves it **completely intact** and does not impose its own guards; the ruleset simply enforces signoff alongside it (a harmless duplicate), and a warning points at the customized protection so you can clean it up by hand if you want a single source.
 
 Only checks gh-signoff itself could have written count as its own: named exactly `signoff` or `signoff/<context>` and bound to no particular GitHub App. A signoff-named check you've pinned to an app is deliberately treated as foreign — it is never migrated, removed, or reported by `check`/`status`, and protection containing one is left alone. An app-bound check disowns its unbound twin as well, and it does so case-insensitively, the way GitHub compares status check contexts: an app-bound `SignOff` makes a plain `signoff` foreign too. The endpoint that removes a context matches by name alone, so a removal aimed at the twin could take the app-bound requirement with it.
 

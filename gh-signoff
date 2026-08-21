@@ -161,35 +161,34 @@ require_default_branch() {
 # display is the name with every character outside printable ASCII shown as
 # a question mark, and it is the only field that ever reaches a terminal.
 #
-# --- Three rules, for three different jobs ---
+# --- Two rules, for two different jobs ---
 #
-# Names are held to three separate standards, and conflating them is what
-# produced two rounds of findings. Each answers a different question.
+# Names are held to two separate standards; conflating them produced several
+# rounds of findings. Each answers a different question.
 #
-#   The identifier grammar (require_identifier) answers "may we create this?"
-#   It is the narrowest: letters, digits, . _ / - and a leading letter or
-#   digit. It governs context names the user types, so that a context this
-#   tool creates is one it can also install, check and uninstall by name and
-#   turn into a record and a payload by quoting alone.
+#   JSON/record safety (require_json_safe, and require_context_name which adds
+#   a non-empty check) answers "may this be spliced into a payload or composed
+#   into a record?" It rejects only the quote, the backslash and the C0
+#   controls U+0000–U+001F — the characters a JSON string literal must escape,
+#   which are also the ones that would break the bash-composed token or forge a
+#   record. It governs BOTH branch names and context names the user types.
+#   feature/x, release-1.2, and a migrated legacy context like "qa review" are
+#   all legitimate; only what breaks the request body or the record stream is
+#   refused. (An earlier, stricter identifier grammar for context args existed
+#   solely to make shell-completion candidates injection-safe; completion has
+#   been removed, nothing shell-evaluates a context, so that armor is gone and
+#   record/JSON safety is the boundary.)
 #
 #   The display alphabet (scrub, and the display field below) answers "how do
-#   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else
-#   as a question mark. It applies to every name we did not author, however
-#   it is spelled, because anything can be shown even when nothing may be
-#   created from it.
+#   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else as
+#   a question mark. It applies to every name we did not author, however it is
+#   spelled, because anything can be shown even when it carries bytes JSON
+#   safety allowed (a C1 control, say).
 #
-#   JSON safety (require_json_safe) answers "may this be spliced into a
-#   payload?" It rejects only the quote, the backslash and control
-#   characters. It governs branch names, which are named by the repository
-#   rather than by us: feature/x, release-1.2 and worse are legitimate refs,
-#   so a branch is not held to the identifier grammar — only to what keeps
-#   the request body well-formed. It is shown through the display alphabet
-#   like anything else.
-#
-# Enforcement sits outside all three. Whatever a repo admin put in our
-# ruleset is carried and written back byte for byte, whatever it is named. We
-# do not edit a requirement we merely adopted, and no display or input rule
-# ever reaches a payload.
+# Enforcement sits outside both. Whatever a repo admin put in our ruleset is
+# carried and written back byte for byte, whatever it is named. We do not edit
+# a requirement we merely adopted, and no display or input rule ever reaches a
+# payload.
 #
 # Display is lossy, and deliberately NOT injective. Two different names
 # outside the display alphabet can show identically — one holding U+202E and
@@ -210,12 +209,12 @@ require_default_branch() {
 # Ownership is deliberately not folded: see LEGACY_CHECK_IS_OURS.
 #
 # Bash composes records in exactly one place — contexts named on the command
-# line — where require_identifier has already established that the name is an
-# identifier. So wrapping it in quotes is all the serialization it needs, and
-# it is its own display form. Bash folds with tr, because Bash 3 has no
-# ${var,,}, and it never unescapes a token: nothing downstream wants the raw
-# bytes back, and a half-written unescaper would hand this class of bug
-# straight back.
+# line — where require_context_name has already refused the quote, backslash
+# and C0 controls JSON would need to escape. So wrapping the name in quotes is
+# all the serialization the token needs. Bash folds the key with tr, because
+# Bash 3 has no ${var,,}, and it never unescapes a token: nothing downstream
+# wants the raw bytes back, and a half-written unescaper would hand this class
+# of bug straight back.
 CONTEXT_RECORD_JQ='"\(ascii_downcase | tojson)\t\(tojson)\t\(gsub("[^\\x20-\\x7e]"; "?"))"'
 
 # The same charset rule for everything else this script prints that it did
@@ -431,8 +430,9 @@ signoff_ruleset_contexts() {
 # was really standing in for the injection it enabled, and the record
 # protocol has since made that structural: such a name is one record, is
 # spliced back as one token, and is removed by exactly the name it has.
-# Recognizing it costs nothing now. require_identifier still refuses to create
-# one, which is a rule about what we write, not about what we recognize.
+# Recognizing it costs nothing now. require_context_name still refuses to
+# create a name with a control character, which is a rule about what we write,
+# not about what we recognize.
 #
 # Reads from `checks` (the modern view carrying app identity), normalizing
 # the deprecated `contexts` list when a response has only that.
@@ -541,32 +541,24 @@ require_json_safe() {
   esac
 }
 
-# The identifier grammar: letters, digits, dot, underscore, slash and dash,
-# starting with a letter or a digit. It is the rule for a context name the
-# user types — the part after signoff/, which this tool then prefixes.
+# A context name the user typed. Held to the same record/JSON safety as a
+# branch name — no unescaped quote, backslash or C0 control — and non-empty.
 #
-# It keeps the signoff namespace coherent: a context this tool creates is one
-# it can also install, check and uninstall by name, and one whose record and
-# JSON payload are built by quoting alone with nothing to escape. Printable
-# ASCII was too generous for that — it admitted spaces, quotes and shell
-# metacharacters that have no business in a status-check context. A leading
-# dash would be read as an option and a leading dot hides the name, so both
-# are excluded from the first character.
-#
-# LC_ALL=C keeps the ranges byte ranges, and the pattern lives in a variable
-# because Bash 3.2 treats a quoted =~ operand as a literal string.
-CONTEXT_IDENTIFIER_RE='^[A-Za-z0-9][A-Za-z0-9._/-]*$'
-
-is_identifier() {
-  local LC_ALL=C
-  [[ $1 =~ $CONTEXT_IDENTIFIER_RE ]]
-}
-
-require_identifier() {
+# This used to be a strict identifier grammar (letters, digits, . _ / - ). That
+# grammar was armor for one thing: shell-completion candidates, which get
+# inserted onto a Readline line where a space or a $() would be shell-active.
+# Completion has since been removed entirely, and nothing else shell-evaluates
+# a context: create passes it as a `gh api -f` field, reads carry it as a JSON
+# token, and messages and status scrub it. So the grammar guarded a threat
+# that no longer exists — and it trapped legitimate migrated legacy contexts
+# like "signoff/qa review", which could then be neither signed nor removed.
+# Record/JSON safety is the right boundary now: it keeps the bash-composed
+# token valid (that is what the quote/backslash/C0 rejection buys) while
+# letting an inert space, $ or ; live in a context name.
+require_context_name() {
   local what="$1" value="$2"
-  if ! is_identifier "$value"; then
-    fail "${what} may contain letters, digits, and . _ / - and must start with a letter or digit: $(scrub "$value")"
-  fi
+  [[ -n "$value" ]] || fail "${what} cannot be empty"
+  require_json_safe "$what" "$value"
 }
 
 # bypass_actors grants repository admins an always-on bypass, preserving the
@@ -582,9 +574,9 @@ require_identifier() {
 # anything read back from GitHub and by require_json_safe plus quoting for
 # anything named on the command line — so they splice in as they are.
 build_signoff_ruleset_json() {
-  local branch="$1"
-  shift
-  local name ref checks="" token
+  local branch="$1" guards="$2"
+  shift 2
+  local name ref checks="" token guard_rules=""
 
   require_json_safe "branch name" "$branch"
   name=$(signoff_ruleset_name "$branch")
@@ -594,7 +586,13 @@ build_signoff_ruleset_json() {
     checks="${checks:+$checks,}{\"context\":${token}}"
   done
 
-  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
+  # The force-push and deletion guards are omitted when we are leaving
+  # customized legacy protection intact to govern them (see cmd_install)
+  if [[ "$guards" == "guards" ]]; then
+    guard_rules='{"type":"deletion"},{"type":"non_fast_forward"},'
+  fi
+
+  printf '%s' "{\"name\":\"${name}\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":[{\"actor_id\":5,\"actor_type\":\"RepositoryRole\",\"bypass_mode\":\"always\"}],\"conditions\":{\"ref_name\":{\"include\":[\"${ref}\"],\"exclude\":[]}},\"rules\":[${guard_rules}{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[${checks}]}}]}"
 }
 
 # Create a fresh ruleset requiring exactly the given signoff contexts. This is
@@ -603,11 +601,11 @@ build_signoff_ruleset_json() {
 # exists yet to preserve. gh prints the API error body to stdout; forward it
 # to stderr on failure so a plan-tier or permission error is diagnosable.
 create_signoff_ruleset() {
-  local branch="$1"
-  shift
+  local branch="$1" guards="$2"
+  shift 2
   local json response
 
-  json=$(build_signoff_ruleset_json "$branch" "$@")
+  json=$(build_signoff_ruleset_json "$branch" "$guards" "$@")
   debug "creating signoff ruleset for $(scrub "$branch"): $(scrub "$json")"
 
   response=$(printf '%s' "$json" | gh api "repos/:owner/:repo/rulesets" \
@@ -660,20 +658,26 @@ json_array_of_tokens() {
 # GitHub ignores key order, and the tests assert against the mock's jq output.
 #
 # The verdict is "delete" only when the desired set is empty AND the ruleset is
-# PRISTINE — byte-for-byte the canonical shape this tool creates, so a bare
+# PRISTINE — nothing but the canonical shape this tool creates, so a bare
 # uninstall is removing nothing but its own artifact. Pristine is one holistic
 # test, not a list of foreign-content flags, so it needs no new selector each
-# time an admin can customize another field: the rules are exactly our three
+# time an admin can customize another field: every rule is one of our three
 # types, every status check is signoff-namespace, bypass_actors is exactly our
 # admin bypass, and conditions is exactly our canonical targeting. Any
 # deviation — a foreign check or rule, an extra bypass actor, a narrowed
 # condition — makes it non-pristine, so the ruleset is rewritten (signoff
-# checks removed, everything else kept) rather than deleted. Enforcement and
-# name are deliberately excluded: they are our own toggle and identity, not
-# admin content, so a disabled or branch-specifically-named-but-otherwise-
-# canonical ruleset is still ours to delete. The rule comparison is by TYPE,
-# not deep object equality, because a GET adds server-side parameters (e.g.
-# do_not_enforce_on_create) we never wrote.
+# checks removed, everything else kept) rather than deleted.
+#
+# The two guard rules (deletion, non_fast_forward) are OPTIONAL to pristine:
+# present or absent both count as ours, because install adds them only when it
+# is the sole enforcement and omits them when it leaves customized legacy
+# protection in place (see cmd_install). They are additive protection we may
+# or may not have written, so their absence must not block deleting our own
+# ruleset — but a NON-standard rule type still does. Enforcement and name are
+# excluded for the same "our own toggle/identity, not admin content" reason, so
+# a disabled or branch-specifically-named ruleset is still ours to delete. The
+# rule check is by TYPE, not deep equality, because a GET adds server-side
+# parameters (e.g. do_not_enforce_on_create) we never wrote.
 #
 # mode shapes what is written. "activate" (install) normalizes to canonical:
 # name, canonical ref conditions, and active enforcement — installing signoff
@@ -690,7 +694,7 @@ json_array_of_tokens() {
 # but the adopted ruleset had no required_status_checks rule at all, one is
 # appended.
 build_reconcile_filter() {
-  local branch="$1" want_array="$2" mode="$3"
+  local branch="$1" want_array="$2" mode="$3" guards="$4"
   local name_json ref_json pristine_conditions name_expr conditions_expr enforcement_expr
 
   require_json_safe "branch name" "$branch"
@@ -707,34 +711,38 @@ build_reconcile_filter() {
     pristine_conditions='(.conditions == {ref_name:{include:['"$ref_json"'],exclude:[]}})'
   fi
 
-  # Install normalizes the enforcement skeleton — name, ref conditions,
-  # active enforcement, and (below) the presence of our two guard rules —
-  # while still preserving additive foreign content. Uninstall preserves the
-  # skeleton it finds: trimming a context is no reason to re-target, re-enforce
-  # or re-arm guards.
+  # Install (activate) normalizes the enforcement skeleton — name, ref
+  # conditions, active enforcement — while preserving additive foreign content.
+  # Uninstall (preserve) keeps the skeleton it finds: trimming a context is no
+  # reason to re-target or re-enforce.
   local ensure_guards=""
   if [[ "$mode" == "activate" ]]; then
     name_expr="$name_json"
     conditions_expr='{ref_name:{include:['"$ref_json"'],exclude:[]}}'
     enforcement_expr='"active"'
-    # Legacy branch protection blocked force pushes and deletions by default,
-    # and a fresh install carries deletion + non_fast_forward to match. An
-    # adopted ruleset may lack them; add whichever is missing so migrating
-    # (which then deletes the legacy protection) never leaves the branch
-    # unguarded. Preserves any other rules and never duplicates an existing one.
-    ensure_guards='
-      | . as $rg | (if ([$rg[] | select(.type=="deletion")] | length) == 0 then $rg + [{type:"deletion"}] else $rg end)
-      | . as $rg | (if ([$rg[] | select(.type=="non_fast_forward")] | length) == 0 then $rg + [{type:"non_fast_forward"}] else $rg end)'
   else
     name_expr='(.name // '"$name_json"')'
     conditions_expr='(.conditions // {ref_name:{include:['"$ref_json"'],exclude:[]}})'
     enforcement_expr='(.enforcement // "active")'
   fi
 
+  # The force-push and deletion guards are added only when install is the sole
+  # enforcement — the guards flag is "noguards" when we leave customized legacy
+  # protection intact to govern force pushes and deletions itself. Legacy
+  # protection blocked both by default, and a fresh install carries the two
+  # rules to match; an adopted ruleset may lack them, so add whichever is
+  # missing (never duplicating) before migration deletes the legacy protection,
+  # so the branch is never left unguarded. Uninstall never adds guards.
+  if [[ "$guards" == "guards" ]]; then
+    ensure_guards='
+      | . as $rg | (if ([$rg[] | select(.type=="deletion")] | length) == 0 then $rg + [{type:"deletion"}] else $rg end)
+      | . as $rg | (if ([$rg[] | select(.type=="non_fast_forward")] | length) == 0 then $rg + [{type:"non_fast_forward"}] else $rg end)'
+  fi
+
   printf '%s' 'def is_signoff($k): $k == "signoff" or ($k | startswith("signoff/"));
 '"$want_array"' as $want
 | ($want | map(ascii_downcase)) as $wantkeys
-| ( (([.rules[]? | .type] | sort) == ["deletion","non_fast_forward","required_status_checks"])
+| ( ([.rules[]? | .type | select(. as $t | (["deletion","non_fast_forward","required_status_checks"] | index($t)) | not)] | length == 0)
     and ([.rules[]? | select(.type=="required_status_checks") | .parameters.required_status_checks[]? | is_signoff((.context // "")|ascii_downcase)] | all)
     and ((.target // "branch") == "branch")
     and (.bypass_actors == [{actor_id:5,actor_type:"RepositoryRole",bypass_mode:"always"}])
@@ -772,21 +780,23 @@ build_reconcile_filter() {
 # reconciling to nothing when nothing exists is a no-op. An existing ruleset
 # is read once and transformed jq-side: the verdict says whether to delete it
 # (pristine, nothing left to require) or PUT the preserved remainder. mode
-# ("activate" for install, "preserve" for uninstall) is handed to the filter.
+# ("activate" for install, "preserve" for uninstall) and guards ("guards" to
+# arm the force-push/deletion rules, "noguards" to leave them to intact
+# customized legacy protection) are handed to the filter.
 apply_signoff_ruleset() {
-  local branch="$1" id="$2" mode="$3"
-  shift 3
+  local branch="$1" id="$2" mode="$3" guards="$4"
+  shift 4
   local want_array filter result verdict body
 
   if [[ -z "$id" ]]; then
     if [[ $# -gt 0 ]]; then
-      create_signoff_ruleset "$branch" "$@"
+      create_signoff_ruleset "$branch" "$guards" "$@"
     fi
     return
   fi
 
   want_array=$(json_array_of_tokens "$@")
-  filter=$(build_reconcile_filter "$branch" "$want_array" "$mode")
+  filter=$(build_reconcile_filter "$branch" "$want_array" "$mode" "$guards")
   result=$(gh api "repos/:owner/:repo/rulesets/${id}" --jq "$filter" 2>/dev/null) ||
     fail "failed to read signoff ruleset"
   result=${result//$'\r'/}
@@ -1118,10 +1128,9 @@ cmd_create() {
         fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # Non-option argument is treated as context. Held to the same grammar
-        # as install and check: a context created as one thing and installable
-        # as another would be a namespace nobody can use.
-        require_identifier "context name" "$1"
+        # Non-option argument is treated as context. Held to record/JSON
+        # safety like install and check — inert but valid as a token.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1221,11 +1230,10 @@ cmd_install() {
         fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # All positional arguments are contexts. This is the one place bash
-        # composes a token itself, by quoting, so refuse the characters JSON
-        # would have to escape before anything touches the API — this tool
-        # would never write such a name anyway.
-        require_identifier "context name" "$1"
+        # All positional arguments are contexts. This is where bash composes a
+        # token by quoting, so refuse the characters JSON would have to escape;
+        # everything else — spaces, $, ; — is inert and allowed.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1289,7 +1297,16 @@ cmd_install() {
 
   debug "installing signoff ruleset on branch: $(scrub "$branch") with ${#union[@]} contexts"
 
-  apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" activate "${union[@]}"
+  # Guards (force-push/deletion) replace the default blocking we remove when we
+  # DELETE signoff-shaped legacy protection. When legacy is CUSTOMIZED ("other")
+  # we leave it intact — it keeps governing force pushes and deletions with the
+  # admin's own settings — so we must not impose our guards on top.
+  local guards="guards"
+  if [[ "$LEGACY_PROTECTION" == "other" ]]; then
+    guards="noguards"
+  fi
+
+  apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" activate "$guards" "${union[@]}"
 
   # Output success messages
   if [ ${#contexts[@]} -eq 1 ] && [ -z "${contexts[0]}" ]; then
@@ -1299,23 +1316,30 @@ cmd_install() {
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch now requires signoff on $(scrub "$context")"
       fi
     done
   fi
 
-  # The ruleset now carries every legacy signoff context, so their legacy
-  # enforcement is redundant and gets retired. Warn rather than fail on a
-  # cleanup error: enforcement already moved, a leftover is a duplicate.
-  if retire_legacy_signoff "$branch"; then
-    if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
-      echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
-    elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
-      echo "${STATUS_SUCCESS} Migrated legacy signoff contexts to a ruleset"
-    fi
-  else
-    printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch_shown}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
-  fi
+  # Legacy branch protection is retired only when it is signoff-shaped — wholly
+  # ours, so deleting it whole is safe and our guards replace its default
+  # blocking. CUSTOMIZED ("other") protection is left completely intact: it may
+  # bind admins, be strict, carry reviews/restrictions or explicit force-push
+  # allowances, and surgically stripping our contexts or overriding it would
+  # lose that fidelity. The ruleset now enforces signoff too — a harmless
+  # duplicate, most-restrictive layering — so we only warn.
+  case "$LEGACY_PROTECTION" in
+    signoff)
+      if retire_legacy_signoff "$branch"; then
+        echo "${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
+      else
+        printf '%s\n' "Warning: could not remove signoff from legacy branch protection on ${branch_shown}; the ruleset now enforces it, so remove the legacy signoff contexts in repo settings" >&2
+      fi
+      ;;
+    other)
+      printf '%s\n' "Warning: ${branch_shown} also enforces signoff via customized branch protection, which gh-signoff leaves untouched; the ruleset now enforces it too (a harmless duplicate). Remove the legacy signoff contexts in repo settings if you want a single source." >&2
+      ;;
+  esac
 }
 
 cmd_uninstall() {
@@ -1344,12 +1368,11 @@ cmd_uninstall() {
         ;;
       *)
         # All positional arguments are contexts. An empty one would slip past
-        # the bare-vs-contextual split below and quietly subtract nothing
-        # while claiming the whole requirement removed; the rest are refused
-        # for the same reason install refuses them, since the subtraction key
-        # is composed here by quoting.
-        [[ -n "$1" ]] || fail "context name cannot be empty"
-        require_identifier "context name" "$1"
+        # the bare-vs-contextual split below and quietly subtract nothing while
+        # claiming the whole requirement removed, so require_context_name
+        # rejects it; the subtraction key is composed here by quoting, so the
+        # quote/backslash/C0 rejection keeps it valid.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1393,7 +1416,7 @@ cmd_uninstall() {
       # Empty want: the reconcile deletes the ruleset when it is wholly ours,
       # or preserves it (dropping only our signoff checks) when it also holds
       # foreign checks or rules an admin added
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards
       removed=true
     fi
     if [[ "$LEGACY_PROTECTION" == "signoff" || -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
@@ -1442,7 +1465,7 @@ cmd_uninstall() {
         keep+=("$token")
       done <<<"$remaining"
       debug "keeping ${#keep[@]} signoff contexts on branch: $(scrub "$branch")"
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve "${keep[@]}"
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards "${keep[@]}"
       if [[ "$LEGACY_PROTECTION" == "signoff" ]]; then
         migration_note="${STATUS_SUCCESS} Migrated legacy branch protection to a ruleset"
       elif [[ -n "$LEGACY_SIGNOFF_CONTEXTS" ]]; then
@@ -1451,7 +1474,7 @@ cmd_uninstall() {
     elif [[ -n "$SIGNOFF_RULESET_ID" ]]; then
       # The last signoff context is going away: delete the ruleset if it is
       # wholly ours, or keep it (foreign checks/rules preserved) otherwise
-      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve
+      apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards
     fi
     # Fatal, as in the bare case: the contexts just uninstalled may live in
     # legacy protection too, and a failed removal there keeps enforcing them
@@ -1467,7 +1490,7 @@ cmd_uninstall() {
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch no longer requires signoff on $(scrub "$context")"
       fi
     done
   fi
@@ -1502,12 +1525,10 @@ cmd_check() {
         fail "unknown option: $(scrub "$1")"
         ;;
       *)
-        # All positional arguments are contexts, refused on the same terms as
-        # install's and uninstall's. A read composes a lookup key by quoting
-        # too, so an argument carrying a quote and a tab could spell a key
-        # that spans two fetched records and report a context as required
-        # that nobody ever required.
-        require_identifier "context name" "$1"
+        # All positional arguments are contexts, on the same terms as install
+        # and uninstall. A read composes a lookup key by quoting too, so the
+        # quote/backslash/C0 rejection keeps that key valid.
+        require_context_name "context name" "$1"
         contexts+=("$1")
         shift
         ;;
@@ -1538,7 +1559,7 @@ cmd_check() {
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on $(scrub "$context")"
       fi
     done
     exit 1
@@ -1563,13 +1584,13 @@ cmd_check() {
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff"
       else
-        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff on ${context}"
+        printf '%s\n' "${STATUS_SUCCESS} GitHub ${branch_shown} branch requires signoff on $(scrub "$context")"
       fi
     else
       if [[ -z "$context" ]]; then
         printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff"
       else
-        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on ${context}"
+        printf '%s\n' "${STATUS_FAILURE} GitHub ${branch_shown} branch does not require signoff on $(scrub "$context")"
       fi
     fi
   done
