@@ -122,6 +122,25 @@ make_pushed_repo() {
   git branch -q --set-upstream-to=origin/main
 }
 
+# Put a `gh` on PATH that routes the extension subcommand form
+# (`gh signoff …`) to the gh-signoff under test, exactly as real gh runs an
+# installed extension, and passes every other call (`gh api …`) through to the
+# mock. Lets a test drive the literal published command — space and all —
+# rather than the gh-signoff binary directly.
+use_gh_subcommand_proxy() {
+  mkdir -p "$TEST_DIR/proxy"
+  cat >"$TEST_DIR/proxy/gh" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == signoff ]]; then
+  shift
+  exec gh-signoff "\$@"
+fi
+exec "$TEST_DIR/gh" "\$@"
+EOF
+  chmod +x "$TEST_DIR/proxy/gh"
+  export PATH="$TEST_DIR/proxy:$PATH"
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -1905,13 +1924,17 @@ make_pushed_repo() {
 }
 
 @test "the exact old initializer line signs nothing and errors cleanly" {
-  # Headline regression: the literal line users were told to add to ~/.bashrc.
-  # In a clean pushed repo it must POST no status, and eval of the (empty)
-  # stdout must not surface a "✓: command not found" or a "Signed off".
+  # Headline regression: the literal line users were told to add to ~/.bashrc,
+  #   eval "$(gh signoff completion)"
+  # driven through a proxy that routes the `gh signoff` subcommand form to the
+  # extension the way real gh does — the space form, not the gh-signoff binary
+  # directly. In a clean pushed repo it must POST no status, and eval of the
+  # (empty) stdout must not surface a "✓: command not found" or a "Signed off".
   make_pushed_repo
+  use_gh_subcommand_proxy
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  run eval "$(gh-signoff completion)"
+  run eval "$(gh signoff completion)"
   [[ "$output" != *"command not found"* ]] || return 1
   [[ "$output" != *"Signed off"* ]] || return 1
 
