@@ -2422,6 +2422,31 @@ EOF
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
+# A CI runner's slot -- or any second machine -- can hold the pushed commit
+# while its remote-tracking ref is stale or absent. Signoff refreshes the
+# branch's tracking ref and rechecks before declaring work unpushed.
+@test "signoff refreshes a stale remote-tracking ref before declaring work unpushed" {
+  make_pushed_repo
+  git commit --no-gpg-sign --allow-empty -m "Pushed from elsewhere" >/dev/null
+  # The remote holds the commit, but origin/main was never updated locally
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "signoff fetches a never-fetched tracking ref before refusing" {
+  make_nested_repo
+  add_bare_remote
+  # Objects reach the remote without creating refs/remotes/origin/main
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
 @test "signoff fails with clear message when no push destination or upstream" {
   make_nested_repo
 

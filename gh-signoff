@@ -1116,7 +1116,39 @@ url_remote_tip() {
   return 0
 }
 
+# check_clean, with one retry after refreshing the branch's remote-tracking
+# ref. A CI runner's slot — or any second machine — can hold the pushed commit
+# while its tracking ref is stale or absent (a freshly created checkout has
+# never fetched), which would misreport published work as unpushed. Only the
+# push-verification reasons warrant the fetch; uncommitted changes can't be
+# fixed by one.
 is_clean() {
+  if check_clean; then
+    return 0
+  fi
+
+  case "$UNCLEAN_REASON" in
+    *unpushed*|*"does not resolve"*)
+      refresh_remote_tracking && check_clean
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+refresh_remote_tracking() {
+  local branch remote merge_ref
+  branch=$(git symbolic-ref --short -q HEAD) || return 1
+  remote=$(git config "branch.${branch}.remote" 2>/dev/null) || return 1
+  [[ -n "$remote" && "$remote" != "." ]] || return 1
+  remote_is_named "$remote" || return 1
+  merge_ref=$(git config "branch.${branch}.merge" 2>/dev/null) || merge_ref="refs/heads/${branch}"
+  debug "refreshing ${remote} ${merge_ref} before declaring work unpushed"
+  git fetch --quiet "$remote" "$merge_ref" 2>/dev/null
+}
+
+check_clean() {
   local git_cmd=$(command -v git)
 
   if [[ -n "$($git_cmd status --porcelain)" ]]; then

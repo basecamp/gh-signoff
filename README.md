@@ -27,7 +27,7 @@ gh extension install basecamp/gh-signoff
 gh signoff
 ```
 
-Without `-f`, signoff requires HEAD to be contained in `@{push}`. When `@{push}` doesn't resolve, signoff falls back to `@{upstream}` only in the narrow centralized case — `push.default` simple (or unset), an upstream on a real remote whose single push URL matches its fetch URL, and no `pushRemote`/`pushDefault`/push-refspec rerouting — and otherwise refuses. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`.
+Without `-f`, signoff requires HEAD to be contained in `@{push}`. When `@{push}` doesn't resolve, signoff falls back to `@{upstream}` only in the narrow centralized case — `push.default` simple (or unset), an upstream on a real remote whose single push URL matches its fetch URL, and no `pushRemote`/`pushDefault`/push-refspec rerouting — and otherwise refuses. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`. When the check would report published work as unpushed only because the tracking ref is stale or absent -- a CI runner's slot, or any second machine -- signoff fetches the branch's tracking ref once and rechecks.
 
 ### Signing off on a specific commit
 
