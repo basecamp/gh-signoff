@@ -1,0 +1,24 @@
+test/signoff.bats
+  s_f8a0c4f2ae5ca3::t_7f31580216b9ad 206-251,2898
+gh-signoff
+  s_f8a0c4f2ae5ca3::t_7f31580216b9ad 1307-1398,1418,1578,1794,2028-2031,2035-2036,2052,2084,2103
+  s_f8a0c4f2ae5ca3::t_e7f5d7059f7590 2014
+README.md
+  s_f8a0c4f2ae5ca3::t_7f31580216b9ad 46-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2ccbfd660e205ebea403c971d612321d6eefd9b6",
+  "prompts": {},
+  "sessions": {
+    "s_f8a0c4f2ae5ca3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1db29003-f6b2-4adc-b540-332e377ccff7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jeremy Daer <jeremy@37signals.com>"
+    }
+  }
+}
