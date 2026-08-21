@@ -259,6 +259,22 @@ urlencode_branch() {
   printf '%s' "$out"
 }
 
+# Fail if the branch does not exist on the repository. install writes a
+# ruleset by ref-name pattern, which GitHub accepts with or without a matching
+# branch, so a typo'd --branch would otherwise silently install an unused
+# policy (the old branch-protection PUT failed on an absent branch). A 404 is
+# "not found"; any other API failure is surfaced rather than swallowed. gh
+# prints the error body to stdout, so the capture distinguishes the two.
+require_branch_exists() {
+  local branch="$1" response
+  response=$(gh api "repos/:owner/:repo/branches/$(urlencode_branch "$branch")" --jq .name 2>/dev/null) || {
+    if [[ "$response" == *'"status":"404"'* ]]; then
+      fail "branch $(scrub "$branch") not found on this repository"
+    fi
+    fail "failed to check whether branch $(scrub "$branch") exists"
+  }
+}
+
 # LC_ALL=C so the fold is exactly A-Z, matching jq's ascii_downcase. Left to
 # the ambient locale, tr's [:upper:] can take in a single-byte locale's
 # accented letters and rewrite bytes that are really half of a UTF-8
@@ -420,24 +436,27 @@ signoff_ruleset_contexts() {
 # never claimed, migrated, removed, or counted by reads. Ownership is the one
 # comparison that stays case-sensitive and exact.
 #
-# There is deliberately no control-character clause. One used to live here,
-# on the reasoning that install refuses to create such a name so a legacy
-# check with one cannot be ours. That premise was wrong about our own
-# history: 0.3.0 passed context arguments straight through to the API, so an
-# old install could and did write whatever it was handed, which makes a
-# control-bearing signoff check plausibly ours after all — and disowning it
-# stranded a requirement no later version would migrate or remove. The clause
-# was really standing in for the injection it enabled, and the record
-# protocol has since made that structural: such a name is one record, is
-# spliced back as one token, and is removed by exactly the name it has.
-# Recognizing it costs nothing now. require_context_name still refuses to
-# create a name with a control character, which is a rule about what we write,
-# not about what we recognize.
+# A check is also only ours if it is record/JSON-safe — no quote, backslash,
+# or C0 control (U+0000–U+001F) — the same class require_context_name enforces
+# on a typed context. 0.3.0 passed context arguments to the API unvalidated,
+# so a legacy check may carry any of those; but recognition must match what
+# the CLI can operate. If we claimed a legacy `signoff/qa"review`, we would
+# migrate it yet reject `check`/`uninstall 'qa"review'`, trapping a
+# requirement that can be neither signed nor removed. So an unsafe legacy
+# check is NOT ours: not migrated, not counted, not removed — left in the
+# legacy protection for manual management.
+#
+# This deliberately reverses an earlier "recognizing a control-bearing name
+# costs nothing" note. It does cost something — a migrate-but-unsignable trap
+# — once context input is held to record/JSON safety. Recognition now equals
+# operation: we claim only contexts we can safely serialize as a bash token.
+# (The ruleset side needs no such filter: it carries arbitrary names as
+# jq-escaped tojson tokens, which the CLI never hand-composes.)
 #
 # Reads from `checks` (the modern view carrying app identity), normalizing
 # the deprecated `contexts` list when a response has only that.
 LEGACY_CHECKS='(.required_status_checks.checks // [.required_status_checks.contexts[]? | {context: ., app_id: null}])'
-LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1))'
+LEGACY_CHECK_IS_OURS='((.context == "signoff" or (.context | startswith("signoff/"))) and (.app_id == null or .app_id == -1) and ((.context | test("[\\x00-\\x1f\"\\\\]")) | not))'
 
 # The stream of our context records, with one more guard: a name shared with
 # an app-bound check is not ours either. The removal endpoint matches by
@@ -1260,6 +1279,13 @@ cmd_install() {
   local branch_shown
   branch_shown=$(scrub "$branch")
 
+  # A targeted branch must exist, or install would silently write a ruleset
+  # for a typo. The default branch came from default_branch, so it is known to
+  # exist and needs no round-trip.
+  if [[ "$branch" != "$DEFAULT_BRANCH" ]]; then
+    require_branch_exists "$branch"
+  fi
+
   # Default to standard signoff if no contexts specified
   if [ ${#contexts[@]} -eq 0 ]; then
     contexts=("")
@@ -1417,9 +1443,19 @@ cmd_uninstall() {
 
   if $bare; then
     local removed=false
+    # A reserved-name ruleset that holds only foreign or app-pinned checks is
+    # not a signoff requirement we can remove: reconciling it would be a
+    # needless PUT that drops nothing, and reporting "no longer requires
+    # signoff" would be false. So key removal on the ruleset actually carrying
+    # signoff contexts of ours, matching the no-ruleset path's honesty.
+    local ruleset_signoff=""
     if [[ -n "$SIGNOFF_RULESET_ID" ]]; then
-      # Empty want: the reconcile deletes the ruleset when it is wholly ours,
-      # or preserves it (dropping only our signoff checks) when it also holds
+      ruleset_signoff=$(signoff_ruleset_contexts "$SIGNOFF_RULESET_ID") ||
+        fail "failed to read signoff ruleset"
+    fi
+    if [[ -n "$ruleset_signoff" ]]; then
+      # Empty want: the reconcile deletes the ruleset when it is pristine, or
+      # preserves it (dropping only our signoff checks) when it also holds
       # foreign checks or rules an admin added
       apply_signoff_ruleset "$branch" "$SIGNOFF_RULESET_ID" preserve noguards
       removed=true

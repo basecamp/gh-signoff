@@ -311,8 +311,9 @@ EOF
 }
 
 @test "uninstall removes the signoff ruleset" {
-  # Our ruleset exists; expect its DELETE to succeed
+  # Our ruleset exists and requires signoff; expect its DELETE to succeed
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"signoff"}]}}]}'
   export MOCK_DELETE_RULESET_EXIT=0
   run -0 gh-signoff uninstall
   [[ "$output" == *"no longer requires signoff"* ]] || return 1
@@ -833,6 +834,23 @@ EOF
   [[ "$body" == *'"integration_id":123'* ]] || return 1
 }
 
+@test "bare uninstall of a ruleset holding only foreign checks reports nothing installed" {
+  # F2: a reserved-name ruleset with only foreign (or app-pinned) checks is
+  # not a signoff requirement we can remove. Bare uninstall must report "no
+  # signoff requirement installed" and make no write — like the no-ruleset
+  # path — not a needless PUT that removes nothing while claiming success.
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"name":"signoff","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"other-ci"}]}}]}'
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff uninstall
+  [[ "$output" == *"no signoff requirement installed on main"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"PUT repos/:owner/:repo/rulesets"* ]] || return 1
+  [[ "$calls" != *"DELETE repos/:owner/:repo/rulesets"* ]] || return 1
+}
+
 @test "bare uninstall still deletes a ruleset that is wholly ours" {
   # The other side: only signoff checks and our own rules means delete it.
   export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
@@ -1147,11 +1165,40 @@ EOF
   [[ "$output" == *"context name cannot be empty"* ]] || return 1
 }
 
-@test "a control-char signoff check beside an app-bound check leaves protection intact" {
-  # The app-bound other-ci is foreign, so the protection classifies as "other"
-  # and is left completely intact. The control-char signoff check is ours, so
-  # it is unioned into the ruleset (a harmless duplicate of the still-enforcing
-  # legacy contexts), and nothing on the legacy side is touched.
+@test "a quote-bearing legacy signoff check is not recognized, but a safe one is" {
+  # F1: legacy recognition matches CLI input safety. signoff/qa"review holds a
+  # quote (record-unsafe), so it is left in the legacy protection untouched;
+  # signoff/tests is migrated as usual. The space case (record-safe) stays
+  # recognized — no regression to the round-5 loosening.
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"contexts":["signoff/tests","signoff/qa\"review","signoff/qa review"]},"enforce_admins":null,"required_pull_request_reviews":null,"restrictions":null}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff install
+  [[ "$output" == *"now requires signoff"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  # The safe contexts are migrated into the ruleset
+  [[ "$body" == *'{"context":"signoff/tests"}'* ]] || return 1
+  [[ "$body" == *'{"context":"signoff/qa review"}'* ]] || return 1
+  # The quote-bearing one is never claimed
+  [[ "$body" != *'qa\"review'* ]] || return 1
+
+  # And it is left in the legacy protection, not surgically removed
+  calls=$(cat "$MOCK_CALL_LOG")
+  if [[ "$calls" == *"required_status_checks/contexts"* ]]; then
+    removed=$(cat "$MOCK_BODY_LOG")
+    [[ "$removed" != *'qa\"review'* ]] || return 1
+  fi
+}
+
+@test "a control-char legacy signoff check is not recognized or migrated" {
+  # A legacy check named "signoff/tests\nother-ci" (embedded newline, a C0
+  # control) is not record/JSON-safe, so it is NOT ours — recognition matches
+  # what the CLI can operate. It is left in the legacy protection untouched;
+  # install neither migrates it nor adds it to the ruleset. The app-bound
+  # other-ci is foreign too, so the protection is "other" and left intact.
   export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"strict":false,"checks":[{"context":"signoff/tests\nother-ci","app_id":null},{"context":"other-ci","app_id":777}]}}'
   export MOCK_BRANCH_PROTECTION_EXIT=0
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
@@ -1165,12 +1212,12 @@ EOF
   calls=$(cat "$MOCK_CALL_LOG")
   [[ "$calls" != *"DELETE repos/:owner/:repo/branches/main/protection"* ]] || return 1
 
-  # The ruleset carries our control-char signoff context and the new lint,
-  # never the app-bound other-ci
+  # The ruleset carries only our new lint; the unsafe legacy context is left
+  # where it is, never migrated
   body=$(cat "$MOCK_BODY_LOG")
-  [[ "$body" == *'{"context":"signoff/tests\nother-ci"}'* ]] || return 1
   [[ "$body" == *'{"context":"signoff/lint"}'* ]] || return 1
-  [[ "$body" != *'{"context":"other-ci"}'* ]] || return 1
+  [[ "$body" != *'other-ci'* ]] || return 1
+  [[ "$body" != *'tests\nother-ci'* ]] || return 1
 }
 
 @test "a signoff check that also exists app-bound is not ours" {
@@ -1351,6 +1398,43 @@ EOF
   body=$(cat "$MOCK_BODY_LOG")
   [[ "$body" == *'"name":"signoff (other)"'* ]] || return 1
   [[ "$body" == *'"include":["refs/heads/other"]'* ]] || return 1
+}
+
+@test "install --branch fails when the branch does not exist" {
+  # F3: a typo'd branch would otherwise silently install an unused ruleset,
+  # because the rulesets API accepts a ref-name pattern with no matching
+  # branch. Verify existence first, and make no write on a 404.
+  export MOCK_BRANCH_EXISTS=0
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff install --branch nonexistent
+  [[ "$output" == *"branch nonexistent not found on this repository"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"POST repos/:owner/:repo/rulesets"* ]] || return 1
+  [[ "$calls" != *"PUT repos/:owner/:repo/rulesets"* ]] || return 1
+}
+
+@test "install --branch surfaces a non-404 branch-check failure" {
+  # A 403/500 is not "not found" — do not silently proceed
+  export MOCK_BRANCH_EXISTS=0
+  export MOCK_BRANCH_EXISTS_ERROR_STATUS=500
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -1 gh-signoff install --branch other
+  [[ "$output" == *"failed to check whether branch other exists"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" != *"POST repos/:owner/:repo/rulesets"* ]] || return 1
+}
+
+@test "default-branch install does not check branch existence" {
+  # The default branch comes from default_branch, so it is known to exist and
+  # never round-tripped — even with the branch-existence mock forced to 404
+  export MOCK_BRANCH_EXISTS=0
+
+  run -0 gh-signoff install
+  [[ "$output" == *"GitHub main branch now requires signoff"* ]] || return 1
 }
 
 @test "an API error body cannot repaint the terminal" {

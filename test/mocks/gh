@@ -19,6 +19,7 @@ fi
 : ${MOCK_COMMIT_STATUS_JSON:='{"statuses":[]}'}
 : ${MOCK_COMMIT_STATUS_EXIT:=0}
 
+: ${MOCK_BRANCH_EXISTS:=1}                   # 1 = branch exists (install's typo guard)
 : ${MOCK_BRANCH_PROTECTION_JSON:=''}         # Empty means no protection found
 : ${MOCK_BRANCH_PROTECTION_EXIT:=1}          # Default to exit 1 (like 404 Not Found)
 : ${MOCK_BRANCH_PROTECTION_ERROR_STATUS:=404} # HTTP status the error body reports
@@ -186,6 +187,20 @@ elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"*"/protection"* ]];
     emit_error "Branch not protected" "${MOCK_BRANCH_PROTECTION_ERROR_STATUS:-404}"
   fi
   exit "$MOCK_BRANCH_PROTECTION_EXIT"
+
+# Branch Existence Call (GET, non-protection) — install's typo guard. Ordered
+# after the protection route so a .../protection path never reaches here.
+elif [[ "$api_method" == "GET" && "$api_path" == *"branches/"* ]]; then
+  [[ -n "${GH_MOCK_DEBUG:-}" ]] && echo "Mock: Matched GET Branch" >&2
+  if [[ "$MOCK_BRANCH_EXISTS" -eq 1 ]]; then
+    emit '{"name":"branch"}'
+    exit 0
+  else
+    # Status configurable so a test can present a non-404 failure the typo
+    # guard must surface rather than read as "not found"
+    emit_error "Branch not found" "${MOCK_BRANCH_EXISTS_ERROR_STATUS:-404}"
+    exit 1
+  fi
 
 # Create Status Call (POST)
 elif [[ "$api_method" == "POST" && "$api_path" == *"statuses/"* ]]; then
