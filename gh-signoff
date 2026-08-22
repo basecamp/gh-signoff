@@ -1198,8 +1198,11 @@ refresh_remote_tracking() {
   fi
   remote_is_named "$remote" || return 1
 
+  # A fetch is not atomic: it can update the judged ref and still exit
+  # nonzero over another refspec (a diverged unforced tag mapping, say), so
+  # the exit says nothing about that ref. Recheck regardless.
   debug "fetching ${remote} to refresh its tracking refs"
-  git fetch --quiet "$remote" 2>/dev/null
+  git fetch --quiet "$remote" 2>/dev/null || true
 }
 
 check_clean() {

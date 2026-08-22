@@ -2637,7 +2637,36 @@ EOF
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
+# A fetch is not atomic: it can update the judged ref and still exit nonzero
+# over something else (a rejected refspec, a submodule that won't fetch --
+# which cases git applies partially varies by version). The recheck must
+# happen regardless, so simulate the contract directly: a git on PATH that
+# does the fetch and then reports failure.
+@test "signoff rechecks after a fetch that updated the tracking ref but failed" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git update-ref -d refs/remotes/origin/main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  cat > "$TEST_DIR/git" <<'SHIM'
+#!/usr/bin/env bash
+# Pass through to the real git; fetch does its work, then reports failure
+PATH="${PATH#*:}"
+if [[ "$1" == fetch ]]; then git "$@"; exit 1; fi
+exec git "$@"
+SHIM
+  chmod +x "$TEST_DIR/git"
+  hash -r
+  ! git fetch --quiet origin || return 1
+  git rev-parse --verify -q refs/remotes/origin/main >/dev/null || return 1
+  git update-ref -d refs/remotes/origin/main
 
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+# A custom fetch mapping puts the tracking ref somewhere the remote branch
 # name cannot be read back from. The refresh fetches the whole remote, so the
 # user's own mapping lands the ref where check_clean looks.
 @test "signoff refreshes through a custom fetch refspec" {
