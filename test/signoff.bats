@@ -254,6 +254,108 @@ EOF
   [[ ${#sent} -eq 140 ]] || return 1
 }
 
+# target_url gives the status's Details link somewhere to go. --url wins,
+# git config signoff.url is the repo-wide default, and with neither set the
+# field is omitted entirely -- no boilerplate link.
+@test "create posts target_url from --url" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff create -f --url https://ci.example.com/run/1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=success context=signoff description=Test User signed off target_url=https://ci.example.com/run/1" ]] || return 1
+}
+
+@test "leading --url applies to direct signoff" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff -f --url https://ci.example.com/run/2
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" target_url=https://ci.example.com/run/2" ]] || return 1
+}
+
+@test "fail posts target_url from --url" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff fail --url https://ci.example.com/run/3
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=failure context=signoff "* ]] || return 1
+  [[ "$body" == *" target_url=https://ci.example.com/run/3" ]] || return 1
+}
+
+@test "create and fail post target_url from git config signoff.url" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  git config signoff.url https://ci.example.com/default
+
+  run -0 gh-signoff create -f
+  run -0 gh-signoff fail
+  [[ $(grep -c " target_url=https://ci.example.com/default$" "$MOCK_BODY_LOG") -eq 2 ]] || return 1
+}
+
+@test "--url overrides git config signoff.url" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  git config signoff.url https://ci.example.com/default
+
+  run -0 gh-signoff fail --url https://ci.example.com/run/4
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" target_url=https://ci.example.com/run/4" ]] || return 1
+  [[ "$body" != *"/default"* ]] || return 1
+}
+
+@test "statuses carry no target_url when neither --url nor signoff.url is set" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff create -f
+  run -0 gh-signoff fail
+  [[ -s "$MOCK_BODY_LOG" ]] || return 1
+  [[ -z "$(grep 'target_url' "$MOCK_BODY_LOG" || true)" ]] || return 1
+}
+
+# GitHub rejects a non-http(s) target_url with an opaque 422; a bad URL --
+# especially a misconfigured signoff.url silently breaking fail's red mark --
+# must be refused up front, before any POST
+@test "a non-http --url is refused before any POST" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  for cmd in "create -f" "fail"; do
+    run -1 gh-signoff $cmd --url ftp://ci.example.com/run
+    [[ "$output" == *"option --url must be an http(s) URL"* ]] || return 1
+  done
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "a non-http signoff.url is refused before any POST" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+  git config signoff.url "not a url"
+
+  for cmd in "create -f" "fail"; do
+    run -1 gh-signoff $cmd
+    [[ "$output" == *"signoff.url must be an http(s) URL"* ]] || return 1
+  done
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "--url requires an argument" {
+  run -1 gh-signoff fail --url
+  [[ "$output" == *"option --url requires an argument"* ]] || return 1
+
+  run -1 gh-signoff --url
+  [[ "$output" == *"option --url requires an argument"* ]] || return 1
+}
+
+@test "--url is rejected for commands that do not post a status" {
+  # Both orders must give the same answer, as for --commit
+  for args in "install --url https://x" "--url https://x install" \
+              "uninstall --url https://x" "--url https://x uninstall" \
+              "check --url https://x" "--url https://x check" \
+              "status --url https://x" "--url https://x status" \
+              "--url https://x version"; do
+    run -1 gh-signoff $args
+    [[ "$output" == *"--url is only valid for create and fail"* ]] || return 1
+  done
+}
+
 # fail is a command word now, like create and check; a context literally
 # named fail is still reachable the way every command-named context is
 @test "create fail still signs off a context named fail" {
