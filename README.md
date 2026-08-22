@@ -41,6 +41,17 @@ gh signoff status --commit abc1234
 
 `--commit` takes anything `git rev-parse` resolves. The commit still has to be on a remote — a commit you haven't fetched can't be checked, so it needs `-f`, same as any other override.
 
+### Giving the Details link somewhere to go
+
+GitHub renders a `Details` link on every commit status. A signoff posted with no `target_url` leaves it inert. To point it somewhere useful — a CI run, a build log, a dashboard:
+
+```bash
+gh signoff --url "$RUN_URL"                        # this signoff's run
+git config signoff.url https://ci.example.com/runs # a repo-wide default
+```
+
+`--url` wins over the config. With neither set, the status carries no `target_url` at all: an inert link beats a boilerplate one that dead-ends people expecting CI results. Only `http(s)` URLs are accepted, and a bad `signoff.url` is refused before anything is posted.
+
 A branch checked out from a cross-repository pull request (`gh pr checkout` on a fork PR) tracks a bare URL rather than a named remote, so it has no tracking ref for either `@{push}` or `@{upstream}` to resolve. Signoff asks that repository directly instead — one `git ls-remote` for the tracked ref — and accepts HEAD when it's contained in the advertised tip. If that tip isn't already in your repository, or a push wouldn't provably land on the same URL, it refuses rather than guess.
 
 ### Reporting a failure
@@ -52,6 +63,7 @@ is indistinguishable from "never ran" — leave a visible red mark:
 gh signoff fail
 gh signoff fail tests                      # a partial context
 gh signoff fail --commit abc1234 --description "suite exploded"
+gh signoff fail --commit "$SHA" --url "$RUN_URL"   # from a CI runner, linking its run
 ```
 
 A red status is a warning, not an attestation, so no cleanliness check
@@ -76,6 +88,8 @@ gh signoff install
 Those ruleset names are reserved: gh-signoff treats a repository branch ruleset named `signoff` or `signoff (<branch>)` as its own. But it manages only the signoff namespace inside it — the `signoff` and `signoff/<context>` checks that aren't pinned to a GitHub App. Anything else (a non-signoff status check, a signoff check pinned to an App via its integration ID, an extra rule, admin-bypass or enforcement settings) is preserved exactly across install and uninstall; only your own signoff checks are added or removed. An App-pinned signoff check is treated the way legacy branch protection treats an App-bound one: preserved on writes, but not counted by `check`/`status` as a requirement a plain `gh signoff` could satisfy. A bare `uninstall` deletes the ruleset only when it is *pristine* — nothing but the shape gh-signoff writes: only unpinned signoff checks, no rule types other than its own, a non-strict policy, its default admin bypass, and its canonical targeting. If you've customized anything — a foreign check or rule, a strict policy, an extra bypass actor, a narrowed condition — it is not pristine, so uninstall keeps the ruleset and removes only the signoff checks. A contextual `uninstall <context>` likewise removes just that context, leaving any customized protection or other checks in place. And if two rulesets somehow share the reserved name, gh-signoff refuses to act until you remove the duplicate, rather than guess which one is real.
 
 If you installed signoff on a branch that later *became* your default branch, gh-signoff still recognizes the older `signoff (<branch>)` ruleset as its own; running `install` again rewrites it to the canonical `signoff` shape.
+
+To let a particular actor merge **without** signing off — a release GitHub App, a merge bot, a team — add it as a bypass actor on the `signoff` ruleset in repo settings (Settings → Rules → Rulesets → signoff → Bypass list). gh-signoff preserves `bypass_actors` across installs and uninstalls, so the grant survives every `gh signoff install`; and since an extra bypass actor makes the ruleset non-pristine, a bare `gh signoff uninstall` removes only the signoff checks and leaves the ruleset (grant included) in place. This is a rulesets-only feature — legacy branch protection had no way to exempt an App from a required status check.
 
 `check` and `status` report a signoff requirement only when the ruleset is actively enforced **and** actually targets the branch. If you disable the ruleset, set it to evaluate (dry-run) mode, or retarget its conditions away from the branch (say to `refs/heads/release` only) in GitHub settings, `check` reports signoff as not required — because GitHub isn't enforcing it there. Running `gh signoff install` again re-activates the ruleset and reclaims its targeting to the branch, keeping its existing contexts. (The targeting check compares canonical single-branch refs, not wildcard patterns; a ruleset you've hand-retargeted with a wildcard that happens to cover the branch reads as not-required — the safe direction.)
 

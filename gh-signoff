@@ -633,6 +633,31 @@ require_context_name() {
   require_json_safe "$what" "$value"
 }
 
+# A target URL rides on a posted status as its Details link. GitHub rejects
+# anything but http(s) with an opaque 422 — and a misconfigured signoff.url
+# must not silently break fail's red mark — so refuse up front, before any
+# POST, naming the source (option --url or signoff.url) in the message.
+require_status_url() {
+  local what="$1" url="$2"
+  case "$url" in
+    http://* | https://*) ;;
+    *) fail "${what} must be an http(s) URL: $(scrub "$url")" ;;
+  esac
+}
+
+# Resolve the status target URL: --url wins, git config signoff.url is the
+# repo-wide default, and neither set means no target_url field at all — the
+# Details link stays inert rather than dead-ending on a boilerplate page.
+# Reports via STATUS_URL.
+STATUS_URL=""
+resolve_status_url() {
+  STATUS_URL="$1"
+  if [[ -z "$STATUS_URL" ]]; then
+    STATUS_URL=$(git config signoff.url 2>/dev/null) || STATUS_URL=""
+    [[ -z "$STATUS_URL" ]] || require_status_url "signoff.url" "$STATUS_URL"
+  fi
+}
+
 # bypass_actors grants repository admins an always-on bypass, preserving the
 # legacy enforce_admins=null semantics: actor_id 5 is the Admin repository
 # role, per GitHub's own UI-exported rulesets.
@@ -1254,6 +1279,7 @@ check_clean() {
 cmd_create() {
   local force=false
   local commit="" commit_is_local=true
+  local url=""
   local contexts=()
 
   # Process arguments
@@ -1267,6 +1293,14 @@ cmd_create() {
         resolve_commit "${2:-}"
         commit="$RESOLVED_COMMIT"
         commit_is_local=$RESOLVED_COMMIT_IS_LOCAL
+        shift 2
+        ;;
+      --url)
+        if [[ -z "${2:-}" ]]; then
+          fail "option --url requires an argument"
+        fi
+        url="$2"
+        require_status_url "option --url" "$url"
         shift 2
         ;;
 
@@ -1292,6 +1326,13 @@ cmd_create() {
         ;;
     esac
   done
+
+  # A bad configured URL fails here, before any cleanliness check or POST
+  resolve_status_url "$url"
+  local url_field=()
+  if [[ -n "$STATUS_URL" ]]; then
+    url_field=(-f "target_url=${STATUS_URL}")
+  fi
 
   # Signing off on a named commit says nothing about the worktree, but the
   # commit itself still has to have made it to a remote
@@ -1335,7 +1376,8 @@ cmd_create() {
       "repos/:owner/:repo/statuses/${commit}" \
       -f state=success \
       -f context="${context_name}" \
-      -f "description=${user} signed off" >/dev/null; then
+      -f "description=${user} signed off" \
+      ${url_field[@]+"${url_field[@]}"} >/dev/null; then
 
       # Build success message
       if [[ -z "$context" ]]; then
@@ -1370,6 +1412,7 @@ cmd_create() {
 cmd_fail() {
   local commit=""
   local description=""
+  local url=""
   local contexts=()
 
   while [[ $# -gt 0 ]]; do
@@ -1384,6 +1427,14 @@ cmd_fail() {
           fail "option --description requires an argument"
         fi
         description="$2"
+        shift 2
+        ;;
+      --url)
+        if [[ -z "${2:-}" ]]; then
+          fail "option --url requires an argument"
+        fi
+        url="$2"
+        require_status_url "option --url" "$url"
         shift 2
         ;;
       -f)
@@ -1408,6 +1459,14 @@ cmd_fail() {
         ;;
     esac
   done
+
+  # A bad configured URL must not silently break the red mark: fail fast,
+  # before any POST
+  resolve_status_url "$url"
+  local url_field=()
+  if [[ -n "$STATUS_URL" ]]; then
+    url_field=(-f "target_url=${STATUS_URL}")
+  fi
 
   if [[ -z "$commit" ]]; then
     commit=$(git rev-parse HEAD) || fail "failed to get current commit"
@@ -1443,7 +1502,8 @@ cmd_fail() {
       "repos/:owner/:repo/statuses/${commit}" \
       -f state=failure \
       -f context="${context_name}" \
-      -f "description=${description}" >/dev/null; then
+      -f "description=${description}" \
+      ${url_field[@]+"${url_field[@]}"} >/dev/null; then
 
       if [[ -z "$context" ]]; then
         messages+=("${STATUS_FAILURE} Reported CI failure on ${commit}")
@@ -1487,6 +1547,9 @@ cmd_install() {
         ;;
       --commit)
         fail "--commit is only valid for create, fail, and status"
+        ;;
+      --url)
+        fail "--url is only valid for create and fail"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1647,6 +1710,9 @@ cmd_uninstall() {
         ;;
       --commit)
         fail "--commit is only valid for create, fail, and status"
+        ;;
+      --url)
+        fail "--url is only valid for create and fail"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1864,6 +1930,9 @@ cmd_check() {
       --commit)
         fail "--commit is only valid for create, fail, and status"
         ;;
+      --url)
+        fail "--url is only valid for create and fail"
+        ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
         # like -qa (record/JSON-safe names may begin with a hyphen).
@@ -1970,6 +2039,9 @@ cmd_status() {
         ;;
       -f)
         fail "-f is only valid for create"
+        ;;
+      --url)
+        fail "--url is only valid for create and fail"
         ;;
       -*)
         fail "unknown option: $(scrub "$1")"
@@ -2101,10 +2173,14 @@ OPTIONS
                           git resolves; for create it must be on a remote unless forced with -f
   --description <text>    Status description for fail (default: "<user>: CI failed";
                           GitHub caps it at 140 characters, longer is cut)
+  --url <url>             Details link for the posted status (for create, fail).
+                          Defaults to git config signoff.url; with neither set,
+                          the status carries no target_url at all
 
 EXAMPLES
   gh signoff                           # Sign off on current commit
   gh signoff fail                      # Report a CI failure on current commit
+  gh signoff fail --url "$RUN_URL"     # Link the red mark to its CI run
   gh signoff fail once                 # Report a partial-context CI failure
   gh signoff --commit abc1234          # Sign off on a specific commit
   gh signoff --commit HEAD~1 tests     # Partial signoff on a specific commit
@@ -2121,13 +2197,15 @@ EOF
 }
 
 # A leading -f applies to create (explicit, implicit, or contextual); a leading
-# --commit to create, fail, and status. Both are rejected for every other command.
+# --commit to create, fail, and status; a leading --url to create and fail.
+# Each is rejected for every other command.
 #
-# The revision stays raw here: resolving it before the command is known would
-# report `gh signoff --commit nope install` as a bad revision, when what's
-# actually wrong is that install takes no --commit at all.
+# The revision and URL stay raw here: resolving or validating them before the
+# command is known would report `gh signoff --commit nope install` as a bad
+# revision, when what's actually wrong is that install takes no --commit at all.
 force=""
 commit_opt=()
+url_opt=()
 while :; do
   case "${1:-}" in
     -f)
@@ -2137,6 +2215,11 @@ while :; do
     --commit)
       [[ -n "${2:-}" && "$2" != -* ]] || fail "option --commit requires an argument"
       commit_opt=(--commit "$2")
+      shift 2
+      ;;
+    --url)
+      [[ -n "${2:-}" ]] || fail "option --url requires an argument"
+      url_opt=(--url "$2")
       shift 2
       ;;
     *)
@@ -2157,6 +2240,12 @@ reject_commit() {
   fi
 }
 
+reject_url() {
+  if [[ ${#url_opt[@]} -gt 0 ]]; then
+    fail "--url is only valid for create and fail"
+  fi
+}
+
 # No positional at all is the bare default signoff; an explicitly-passed
 # first positional, even an empty string, is a context to validate. Matching
 # on "${1:-}" alone conflated the two, so `gh signoff -f '' good` took the
@@ -2164,20 +2253,20 @@ reject_commit() {
 # only a truly empty argument list defaults, and everything else — the empty
 # string included — reaches cmd_create, whose grammar check rejects it.
 if [[ $# -eq 0 ]]; then
-  cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"}
+  cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ${url_opt[@]+"${url_opt[@]}"}
   exit 0
 fi
 
 # ${commit_opt[@]+"${commit_opt[@]}"} is the Bash 3 set -u safe expansion of a
 # possibly-empty array. ${commit_opt:+...} would word-split the revision.
 case "$1" in
-  "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
-  "fail")           reject_force; shift; cmd_fail ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
-  "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
-  "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
-  "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;
-  "status")         reject_force; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
-  "version")        reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_version ;;
+  "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ${url_opt[@]+"${url_opt[@]}"} "$@" ;;
+  "fail")           reject_force; shift; cmd_fail ${commit_opt[@]+"${commit_opt[@]}"} ${url_opt[@]+"${url_opt[@]}"} "$@" ;;
+  "install")        reject_force; reject_commit; reject_url; shift; cmd_install "$@" ;;
+  "uninstall")      reject_force; reject_commit; reject_url; shift; cmd_uninstall "$@" ;;
+  "check")          reject_force; reject_commit; reject_url; shift; cmd_check "$@" ;;
+  "status")         reject_force; reject_url; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "version")        reject_force; reject_commit; reject_url; reject_extra_args "${@:2}"; cmd_version ;;
   "completion")
     # Tombstone for a removed command. Completion never worked through
     # `gh signoff` (see the removal commit), but the setup line we published,
@@ -2198,19 +2287,19 @@ case "$1" in
     printf '%s\n' "Remove this line from your shell startup file (e.g. ~/.bashrc): eval \"\$(gh signoff completion)\"" >&2
     exit 1
     ;;
-  "-h" | "--help")  reject_force; reject_commit; reject_extra_args "${@:2}"; cmd_help ;;
+  "-h" | "--help")  reject_force; reject_commit; reject_url; reject_extra_args "${@:2}"; cmd_help ;;
   "--")
     # End of options routes to implicit create, so `gh signoff -- -qa` signs
     # off a leading-dash context directly. The -- is passed through (no shift):
     # cmd_create's own end-of-options handler consumes it and treats the rest
     # as contexts.
-    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ${url_opt[@]+"${url_opt[@]}"} "$@" ;;
   -*)
     # Unknown option
     cmd_help; exit 1
     ;;
   *)
     # Treat as partial signoff context(s)
-    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@"
+    cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} ${url_opt[@]+"${url_opt[@]}"} "$@"
     ;;
 esac
