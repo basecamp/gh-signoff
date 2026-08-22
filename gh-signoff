@@ -1188,8 +1188,10 @@ refresh_remote_tracking() {
 
   [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
     upstream_fallback_is_safe || return 1
+  # git names the remote only when config picks one explicitly; empty means
+  # its built-in default, origin (push.default=current with no upstream)
   remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
-  remote_is_named "$remote" || return 1
+  remote_is_named "${remote:=origin}" || return 1
 
   debug "fetching ${remote} to refresh its tracking refs"
   git fetch --quiet "$remote" 2>/dev/null

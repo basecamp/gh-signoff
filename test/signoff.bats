@@ -2581,6 +2581,22 @@ EOF
   git rev-parse --verify -q refs/remotes/pushes/main >/dev/null || return 1
 }
 
+# With no upstream, push.default=current still pushes to origin by git's own
+# default -- which for-each-ref reports as an empty remote name, since it
+# names only an explicitly configured one
+@test "signoff refreshes the implicit origin for a branch with no upstream" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git update-ref -d refs/remotes/origin/main
+  git config push.default current
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/origin/main" ]] || return 1
+  [[ -z "$(git for-each-ref --format='%(push:remotename)' refs/heads/main)" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
 # A custom fetch mapping puts the tracking ref somewhere the remote branch
 # name cannot be read back from. The refresh fetches the whole remote, so the
 # user's own mapping lands the ref where check_clean looks.
