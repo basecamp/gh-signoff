@@ -1150,43 +1150,40 @@ is_clean() {
   esac
 }
 
-# Fetch the remote-tracking ref check_clean judges, so a recheck sees what the
-# remote actually holds. That ref is @{push}, or @{upstream} when that fallback
-# is sound — the same order check_clean resolves them in — and git derives both
-# from config alone, so for-each-ref names them even when the ref has never
-# been fetched. Refreshing the upstream regardless would miss every routed
-# configuration (branch.*.pushRemote, remote.pushDefault, push.default=current
-# or upstream, a push refspec): the fetch would land on a ref the check never
-# reads, and published work would still come back unpushed.
+# Fetch the remote whose tracking ref check_clean judges, so a recheck sees
+# what that remote actually holds. The ref is @{push}, or @{upstream} when that
+# fallback is sound — the same order check_clean resolves them in — and git
+# derives both from config alone, so for-each-ref knows which remote serves
+# them even when the ref has never been fetched. Refreshing the upstream
+# regardless would miss every routed configuration (branch.*.pushRemote,
+# remote.pushDefault, push.default=current or upstream): the fetch would land on
+# a ref the check never reads, and published work would still come back
+# unpushed.
 #
-# Under the remote's default fetch refspec the tracking ref is
-# refs/remotes/<remote>/<branch> and one branch is all that needs fetching; a
-# remote with a rewritten refspec gets a full fetch instead, since the tracking
-# name no longer tells us which remote branch feeds it. A URL-tracking branch
-# (fork pull request) has no tracking ref at all and is checked live by
-# url_remote_tip, so there is nothing here to refresh.
+# The whole remote is fetched, not one branch. Inferring which remote branch
+# feeds the tracking ref means re-deriving git's refspec mapping, and a custom
+# remote.<name>.fetch (say +refs/heads/*:refs/remotes/origin/custom/*) breaks
+# any shortcut; a plain fetch applies whatever mapping the user configured, so
+# the judged ref is refreshed by construction. It is the fetch the user would
+# have run themselves, once, on the failure path only.
+#
+# A URL-tracking branch (fork pull request) has no tracking ref at all and is
+# checked live by url_remote_tip, so there is nothing here to refresh. A
+# detached HEAD has no branch to route by; only commit_is_on_a_remote gets
+# here then, and it scans every remote, so fetch them all.
 refresh_remote_tracking() {
-  local branch tracking remote
-  branch=$(git symbolic-ref -q HEAD) || return 1
+  local branch remote
 
-  tracking=$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)
-  if [[ -n "$tracking" ]]; then
+  if branch=$(git symbolic-ref -q HEAD); then
+    [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
+      upstream_fallback_is_safe || return 1
     remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
-  elif upstream_fallback_is_safe; then
-    tracking=$(git for-each-ref --format='%(upstream)' "$branch" 2>/dev/null)
-    remote=$(git for-each-ref --format='%(upstream:remotename)' "$branch" 2>/dev/null)
-  else
-    return 1
-  fi
-  [[ -n "$tracking" && -n "$remote" ]] || return 1
-  remote_is_named "$remote" || return 1
-
-  if [[ "$tracking" == "refs/remotes/${remote}/"* ]]; then
-    debug "refreshing ${tracking} from ${remote}"
-    git fetch --quiet "$remote" "refs/heads/${tracking#refs/remotes/${remote}/}" 2>/dev/null
-  else
-    debug "refreshing ${remote}"
+    remote_is_named "$remote" || return 1
+    debug "fetching ${remote} to refresh its tracking refs"
     git fetch --quiet "$remote" 2>/dev/null
+  else
+    debug "fetching all remotes to refresh their tracking refs"
+    git fetch --quiet --all 2>/dev/null
   fi
 }
 

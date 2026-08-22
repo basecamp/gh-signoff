@@ -2581,6 +2581,23 @@ EOF
   git rev-parse --verify -q refs/remotes/pushes/main >/dev/null || return 1
 }
 
+# A custom fetch mapping puts the tracking ref somewhere the remote branch
+# name cannot be read back from. The refresh fetches the whole remote, so the
+# user's own mapping lands the ref where check_clean looks.
+@test "signoff refreshes through a custom fetch refspec" {
+  make_nested_repo
+  add_bare_remote
+  git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/custom/*'
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/origin/custom/main" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  git rev-parse --verify -q refs/remotes/origin/custom/main >/dev/null || return 1
+}
+
 # The same runner slot signs off with --commit HEAD, the documented CI form,
 # and must not be refused for the stale tracking ref that plain signoff just
 # looked past
@@ -2599,6 +2616,24 @@ EOF
   git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
   run -1 gh-signoff --commit HEAD
   [[ "$output" == *"is not on any remote"* ]] || return 1
+}
+
+# A detached checkout -- the common CI shape -- has no branch to route the
+# refresh by, so every remote is fetched before the commit is refused
+@test "--commit refreshes all remotes on a detached HEAD" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git checkout -q --detach
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r)" ]] || return 1
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  # Plain signoff has no branch to judge and still refuses, as before
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
 }
 
 @test "signoff fails with clear message when no push destination or upstream" {
