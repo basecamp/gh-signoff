@@ -95,7 +95,7 @@ To let a particular actor merge **without** signing off — a release GitHub App
 
 ### Context names
 
-A context name you give gh-signoff — the part after `signoff/` — may contain anything except an unescaped quote, backslash, or control character. `tests`, `build/linux`, `qa review` and `déploiement` are all fine; only names that would break the request body or a record are refused, and an empty name is rejected. A space, `$` or `;` is allowed: a context name is never run by a shell — `create` sends it as an API field, and reads carry it as a data token — so it is inert. (An earlier release held context names to a strict identifier grammar; that existed only to make shell-completion candidates safe, and completion has since been removed, so the boundary is now simply record/JSON safety — which also keeps a migrated legacy context like `signoff/qa review` signable and removable.)
+A context name you give gh-signoff — the part after `signoff/` — may contain anything except an unescaped quote, backslash, or control character. `tests`, `build/linux`, `qa review` and `déploiement` are all fine; only names that would break the request body or a record are refused, and an empty name is rejected. A space, `$` or `;` is allowed: a context name is never run by a shell — `create` sends it as an API field, and reads carry it as a data token — so it is inert. (An earlier release held context names to a strict identifier grammar; that existed only to make shell-completion candidates safe. The armor now lives in the completion adapter itself, which escapes or omits candidates per quote context, so the boundary stays record/JSON safety — which also keeps a migrated legacy context like `signoff/qa review` signable, removable, and completable.)
 
 Two rules sit alongside naming, and they are deliberately different:
 
@@ -126,15 +126,30 @@ Existing signoff contexts carry over into the ruleset. If the branch protection 
 
 Only checks gh-signoff itself could have written count as its own: named exactly `signoff` or `signoff/<context>`, bound to no particular GitHub App, and containing nothing gh-signoff couldn't accept as a typed context (no quote, backslash, or control character). A signoff-named check you've pinned to an app is deliberately treated as foreign — it is never migrated, removed, or reported by `check`/`status`, and protection containing one is left alone. A signoff check whose name carries a quote, backslash, or control character (a 0.3.0 install could write one) is likewise left in place: gh-signoff only claims contexts it could also sign and remove from the command line, so it leaves that one for you to manage in repo settings rather than migrating it into a form you couldn't operate. An app-bound check disowns its unbound twin as well, and it does so case-insensitively, the way GitHub compares status check contexts: an app-bound `SignOff` makes a plain `signoff` foreign too. The endpoint that removes a context matches by name alone, so a removal aimed at the twin could take the app-bound requirement with it.
 
-### Shell completion has been removed
+### Shell completion
 
-0.4.0 removes the `completion` command. It never actually worked through `gh signoff` — `gh` doesn't route tab-completion to extensions — so nothing was lost, but if you followed the old setup instructions you have a stale line to delete. **Remove this from your shell startup file (e.g. `~/.bashrc`):**
+Add to your shell startup file (e.g. `~/.bashrc`):
 
 ```bash
 eval "$(gh signoff completion)"
 ```
 
-Leaving it in is harmless — `gh signoff completion` now just prints a reminder to stderr and exits without signing anything — but it does nothing useful.
+(0.4.0 told you to delete exactly this line, because completion never actually worked — `gh` doesn't route tab-completion to extensions. 0.4.1 takes a different seam: the emitted script wraps `gh`'s own completion, handling `gh signoff …` itself and delegating everything else, so you can put the line back.)
+
+Put it **after** `gh`'s own completion line if you have one — whichever registers last wins, and gh-signoff knows how to delegate to gh (loading gh's completion on demand), while gh doesn't know about gh-signoff. `gh signoff <Tab>` then completes command words, per-command options, local branch names after `--branch`, and — at context positions — the contexts the branch actually requires.
+
+Completion candidates that come from the API or from git are data, not shell: they're inserted escaped, or verbatim only where the quote you're typing inside makes that safe, and a name with no safe spelling in that spot (non-ASCII names among them) is omitted from candidates rather than mis-spelled — `gh signoff contexts` still lists every required name faithfully. Without the `bash-completion` package, bash's default word splitting may break candidates on `:` or `=`; that's a readline limitation, not a gh-signoff one.
+
+bash only for now — that's what the test matrix exercises, and completion that ships untested is how the original shipped broken. zsh and fish adapters can be built on `gh signoff contexts`:
+
+```bash
+gh signoff contexts
+signoff
+signoff/tests
+signoff/qa review
+```
+
+`contexts` lists the branch's required status-check contexts, one exact full name per line on stdout (`--branch` for another branch); everything human — hints, the not-required verdict — goes to stderr. A required name that gh-signoff itself couldn't operate (one carrying a quote, backslash, or control character) is skipped with a count on stderr rather than mis-spelled or silently dropped. `contexts` is a command word now, like `fail`: a context literally named `contexts` is still reachable via `gh signoff create contexts`.
 
 ## Advanced usage: Partial signoff
 

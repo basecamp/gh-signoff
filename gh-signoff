@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x # Keep this commented out unless actively debugging
 
 DEBUG=${SIGNOFF_DEBUG:-}
-readonly VERSION="0.4.0"
+readonly VERSION="0.4.1"
 
 # Status symbols for consistent display - export them for both script and tests
 export STATUS_SUCCESS="✓"
@@ -200,9 +200,11 @@ require_default_branch() {
 #   feature/x, release-1.2, and a migrated legacy context like "qa review" are
 #   all legitimate; only what breaks the request body or the record stream is
 #   refused. (An earlier, stricter identifier grammar for context args existed
-#   solely to make shell-completion candidates injection-safe; completion has
-#   been removed, nothing shell-evaluates a context, so that armor is gone and
-#   record/JSON safety is the boundary.)
+#   solely to make shell-completion candidates injection-safe. That armor now
+#   lives in the completion adapter itself — candidates are escaped or
+#   omitted per readline quote context, see emit_bash_completion — so the
+#   grammar stays record/JSON safety and nothing here shell-evaluates a
+#   context.)
 #
 #   The display alphabet (scrub, and the display field below) answers "how do
 #   we show this?" It is printable ASCII, 0x20 to 0x7E, with everything else as
@@ -619,14 +621,16 @@ require_json_safe() {
 # This used to be a strict identifier grammar (letters, digits, . _ / - ). That
 # grammar was armor for one thing: shell-completion candidates, which get
 # inserted onto a Readline line where a space or a $() would be shell-active.
-# Completion has since been removed entirely, and nothing else shell-evaluates
-# a context: create passes it as a `gh api -f` field, reads carry it as a JSON
-# token, and messages and status scrub it. So the grammar guarded a threat
-# that no longer exists — and it trapped legitimate migrated legacy contexts
-# like "signoff/qa review", which could then be neither signed nor removed.
-# Record/JSON safety is the right boundary now: it keeps the bash-composed
-# token valid (that is what the quote/backslash/C0 rejection buys) while
-# letting an inert space, $ or ; live in a context name.
+# That armor has moved into the completion adapter itself, which escapes or
+# omits candidates per readline quote context (see emit_bash_completion), and
+# nothing else shell-evaluates a context: create passes it as a `gh api -f`
+# field, reads carry it as a JSON token, and messages and status scrub it.
+# So the grammar guarded names when it was the only defense — and it trapped
+# legitimate migrated legacy contexts like "signoff/qa review", which could
+# then be neither signed nor removed. Record/JSON safety is the right
+# boundary: it keeps the bash-composed token valid (that is what the
+# quote/backslash/C0 rejection buys) while letting an inert space, $ or ;
+# live in a context name.
 require_context_name() {
   local what="$1" value="$2"
   [[ -n "$value" ]] || fail "${what} cannot be empty"
@@ -2018,6 +2022,84 @@ cmd_check() {
   done
 }
 
+# The exact status-check contexts the branch requires, one full name per line
+# on stdout: `signoff`, `signoff/qa review`. Data, not prose — the shell-
+# agnostic source behind tab completion, and an answer to "what does this
+# branch require?" that check only gives per named context. Everything human
+# (the legacy hint, the not-required verdict, the skipped-names note) goes to
+# stderr so stdout stays consumable.
+#
+# Printing the name raw is a documented exception to the ?-scrubbed display
+# alphabet: the consumer wants the name as GitHub spells it, and each line is
+# nothing but a name — a record token excludes raw C0 controls by
+# construction (tojson escapes them), so no name can span or forge a line.
+# A token carrying any escape (\", \\, \uXXXX) names a context this CLI
+# cannot type or safely unescape — the same class require_context_name
+# refuses — so it is skipped and counted on stderr rather than mis-spelled
+# or silently dropped.
+cmd_contexts() {
+  local branch=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        if [[ -z "${2:-}" || "$2" == -* ]]; then
+          fail "option --branch requires an argument"
+        fi
+        branch="$2"
+        shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --commit)
+        fail "--commit is only valid for create, fail, and status"
+        ;;
+      --url)
+        fail "--url is only valid for create and fail"
+        ;;
+      -*)
+        fail "unknown option: $(scrub "$1")"
+        ;;
+      *)
+        fail "unexpected argument: $(scrub "$1")"
+        ;;
+    esac
+  done
+
+  if [[ -z "$branch" ]]; then
+    branch=$(default_branch) || fail "failed to get default branch"
+  fi
+  [[ -z "$branch" ]] && fail "branch name cannot be empty"
+
+  fetch_required_signoff_contexts "$branch"
+
+  if [[ -z "$SIGNOFF_CONTEXTS" ]]; then
+    printf '%s\n' "${STATUS_FAILURE} GitHub $(scrub "$branch") branch does not require signoff" >&2
+    exit 1
+  fi
+
+  if $SIGNOFF_LEGACY_PRESENT; then
+    legacy_upgrade_hint
+  fi
+
+  local key token display name skipped=0
+  while IFS=$'\t' read -r key token display; do
+    [[ -n "$token" ]] || continue
+    name="${token#\"}"
+    name="${name%\"}"
+    if [[ "$name" == *\\* ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    printf '%s\n' "$name"
+  done <<<"$SIGNOFF_CONTEXTS"
+
+  if [[ "$skipped" -gt 0 ]]; then
+    printf '%s\n' "note: ${skipped} context(s) not listed (name contains characters this CLI cannot operate)" >&2
+  fi
+}
+
 cmd_status() {
   local branch=""
   local commit=""
@@ -2145,6 +2227,290 @@ cmd_version() {
   echo "gh-signoff ${VERSION}"
 }
 
+# Emit the bash completion adapter for `eval "$(gh signoff completion)"`.
+#
+# INVARIANT: stdout carries a valid shell script or nothing at all — it feeds
+# an eval in the user's shell startup, so every refusal below (an unsupported
+# shell, a stale argument, a stray leading option) speaks on stderr only and
+# exits nonzero. The script itself is a static single-quoted heredoc: nothing
+# interpolated, no API calls to compose it, pinned byte for byte by tests.
+#
+# bash only, deliberately. The test matrix is bash 3/4/5 — a zsh or fish
+# adapter would ship never executed, which is exactly how the original
+# completion shipped broken. Their candidate data is `gh signoff contexts`.
+cmd_completion() {
+  local shell="bash"
+  if [[ $# -gt 0 ]]; then
+    shell="$1"
+    shift
+  fi
+  reject_extra_args "$@"
+
+  case "$shell" in
+    bash)
+      emit_bash_completion
+      ;;
+    zsh | fish)
+      printf '%s\n' "gh-signoff: ${shell} completion is not supported yet; 'gh signoff contexts' lists the candidate data" >&2
+      exit 1
+      ;;
+    *)
+      printf '%s\n' "gh-signoff: unsupported completion argument: $(scrub "$shell")" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The adapter below wraps gh's own completion rather than replacing it: gh
+# does not route tab-completion to extensions (the reason 0.4.0 removed this
+# command), so the only seam is the `gh` command's own completion spec.
+#
+# SAFETY is the reason 0.3.0 had a strict context-name grammar: completion
+# candidates land on a readline line where a space or $() is shell-active.
+# The armor now lives here instead of in the names — candidates are
+# prefix-filtered with quoted patterns, spelled with printf %q or inserted
+# raw only where the quote context makes that safe, and omitted when no safe
+# spelling exists — so the grammar stays record/JSON safety and a context
+# like "qa review" is both signable and completable.
+emit_bash_completion() {
+  cat <<'GH_SIGNOFF_COMPLETION'
+# gh-signoff tab completion for bash.
+# Setup: eval "$(gh signoff completion)" — after gh's own completion line,
+# if you have one; whichever is registered last wins.
+#
+# Wraps whatever completion gh already has: `gh signoff …` is completed
+# here, and everything else is delegated to gh's own completion, loading it
+# on demand. Names that arrive from the API or from git — contexts,
+# branches — are data, never shell: candidates are prefix-filtered with
+# quoted patterns, spelled with printf %q (or inserted raw where the
+# readline quote context makes that safe), and omitted entirely when no
+# safe spelling exists. Nothing here is ever eval'd or fed to compgen -W.
+
+# The function gh's own completion registered, remembered across re-sourcing
+__gh_signoff_delegate="${__gh_signoff_delegate:-}"
+
+# Wrap whatever completion gh currently has: keep its -o options, adopt its
+# -F function as the delegate for non-signoff commands, and point both gh
+# and gh-signoff at the wrapper. Idempotent, so re-sourcing is safe.
+__gh_signoff_register() {
+  local spec="" opts="" delegate=""
+  spec=$(complete -p gh 2>/dev/null) || spec=""
+  if [ -n "$spec" ]; then
+    set -- $spec
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -o) opts="$opts -o $2"; shift 2 ;;
+        -F) delegate="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "$delegate" ] && [ "$delegate" != "__gh_signoff_wrap" ]; then
+      __gh_signoff_delegate="$delegate"
+    fi
+  else
+    # Nothing registered yet: mirror gh's own defaults. -o nospace only
+    # where there is no compopt to manage spacing per call (bash 3.2).
+    opts="-o default"
+    type compopt >/dev/null 2>&1 || opts="$opts -o nospace"
+  fi
+  complete $opts -F __gh_signoff_wrap gh
+  complete $opts -F __gh_signoff_wrap gh-signoff
+}
+
+__gh_signoff_wrap() {
+  if [ "${COMP_WORDS[0]##*/}" = "gh-signoff" ]; then
+    __gh_signoff_complete 1
+    return 0
+  fi
+  if [ "${COMP_WORDS[1]:-}" = "signoff" ]; then
+    __gh_signoff_complete 2
+    return 0
+  fi
+
+  # Not ours: delegate to gh's completion. If it was never loaded — our
+  # registered spec keeps bash-completion's lazy loader from ever firing
+  # for gh — load it now and re-register ourselves on top of it.
+  if [ -z "${__gh_signoff_delegate:-}" ]; then
+    eval "$(gh completion -s bash 2>/dev/null)"
+    __gh_signoff_register
+  fi
+  if [ -n "${__gh_signoff_delegate:-}" ] && type "$__gh_signoff_delegate" >/dev/null 2>&1; then
+    "$__gh_signoff_delegate" "$@"
+  fi
+  return 0
+}
+
+# True when the name is printable ASCII. printf %q is not display armor —
+# bash 3.2 renders non-ASCII as $'…' octal and bash 5 passes bidi overrides
+# raw — so anything outside the printable range is omitted from candidates
+# rather than mis-spelled or smuggled onto the line. The C locale makes the
+# range a byte range.
+__gh_signoff_printable() {
+  local LC_ALL=C
+  case "$1" in
+    *[!\ -~]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Append one candidate when it extends the typed prefix, spelled safely for
+# the readline quote context (dynamic $quote/$plain from the completer).
+# Omission is the safe direction: `gh signoff contexts` still lists every
+# required name faithfully.
+__gh_signoff_add() {
+  local name="$1"
+  # Quoted-pattern prefix filter: a typed * or $( matches only itself
+  case "$name" in
+    "$plain"*) ;;
+    *) return 0 ;;
+  esac
+  __gh_signoff_printable "$name" || return 0
+  case "$quote" in
+    "'")
+      # Single-quoted: everything is literal except the quote itself
+      case "$name" in
+        *"'"*) return 0 ;;
+      esac
+      COMPREPLY[${#COMPREPLY[@]}]="$name"
+      ;;
+    "\"")
+      # Double-quoted: $ ` \ ! stay shell-active — a raw $( executes on
+      # Enter, and escaping it mismatches readline's dequoting — so omit
+      case "$name" in
+        *[\$\`\\!]*) return 0 ;;
+      esac
+      COMPREPLY[${#COMPREPLY[@]}]="$name"
+      ;;
+    *)
+      COMPREPLY[${#COMPREPLY[@]}]=$(printf '%q' "$name")
+      ;;
+  esac
+}
+
+# The branch's required contexts, as the short names the CLI takes
+# (signoff/tests → tests; the bare signoff requirement has no short name).
+# API-derived names enter the candidate stream here and only here.
+__gh_signoff_offer_contexts() {
+  local branch_opt=() names="" line
+  [ -n "$branch" ] && branch_opt=(--branch "$branch")
+  names=$(gh signoff contexts ${branch_opt[@]+"${branch_opt[@]}"} 2>/dev/null) || names=""
+  while IFS= read -r line; do
+    case "$line" in
+      signoff/?*) __gh_signoff_add "${line#signoff/}" ;;
+    esac
+  done <<<"$names"
+}
+
+# Close out one completion call: with compopt (bash ≥ 4), keep an empty
+# COMPREPLY from degrading to -o default's filename fallback; without it
+# (bash 3.2, registered -o nospace), give a lone unquoted candidate the
+# trailing space nospace withheld.
+__gh_signoff_done() {
+  if type compopt >/dev/null 2>&1; then
+    [ ${#COMPREPLY[@]} -eq 0 ] && compopt +o default 2>/dev/null
+  elif [ ${#COMPREPLY[@]} -eq 1 ] && [ -z "$quote" ]; then
+    COMPREPLY[0]="${COMPREPLY[0]} "
+  fi
+  return 0
+}
+
+__gh_signoff_complete() {
+  local base="${1:-1}" cur quote plain
+  local i word cmd="" branch="" expect="" ddash=""
+  COMPREPLY=()
+
+  cur="${COMP_WORDS[COMP_CWORD]:-}"
+  quote="" plain="$cur"
+  case "$cur" in
+    "'"*) quote="'"; plain="${cur#?}" ;;
+    "\""*) quote="\""; plain="${cur#?}" ;;
+  esac
+
+  # Word-walk the line before the cursor: find the command word, remember a
+  # --branch argument (it steers the contexts fetch), and skip option
+  # arguments. An unrecognized first word is an implicit-create context.
+  i=$base
+  while [ "$i" -lt "$COMP_CWORD" ]; do
+    word="${COMP_WORDS[$i]}"
+    if [ -n "$expect" ]; then
+      [ "$expect" = "--branch" ] && branch="$word"
+      expect=""
+    else
+      case "$word" in
+        -f) ;;
+        --commit | --description | --url | --branch) expect="$word" ;;
+        --) ddash=1; [ -n "$cmd" ] || cmd="create" ;;
+        *) [ -n "$cmd" ] || cmd="$word" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  case "$cmd" in
+    "" | create | fail | install | uninstall | check | contexts | status | completion | version) ;;
+    *) cmd="create" ;;
+  esac
+
+  # The word under the cursor is an option's argument
+  case "$expect" in
+    --commit | --description | --url)
+      __gh_signoff_done
+      return 0
+      ;;
+    --branch)
+      local branches
+      branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null) || branches=""
+      while IFS= read -r word; do
+        [ -n "$word" ] && __gh_signoff_add "$word"
+      done <<<"$branches"
+      __gh_signoff_done
+      return 0
+      ;;
+  esac
+
+  # An option is being typed (outside --): the tables are our own literals
+  if [ -z "$ddash" ]; then
+    case "$plain" in
+      -*)
+        local opts=""
+        case "$cmd" in
+          "" | create) opts="-f --commit --url" ;;
+          fail) opts="--commit --description --url" ;;
+          install | uninstall | check | contexts) opts="--branch" ;;
+          status) opts="--branch --commit" ;;
+        esac
+        for word in $opts; do
+          __gh_signoff_add "$word"
+        done
+        __gh_signoff_done
+        return 0
+        ;;
+    esac
+  fi
+
+  # Positional candidates. status and version take none, and cost no API
+  # calls; the contexts command takes only --branch.
+  case "$cmd" in
+    "")
+      for word in create fail install uninstall check contexts status completion version; do
+        __gh_signoff_add "$word"
+      done
+      __gh_signoff_offer_contexts
+      ;;
+    create | fail | install | uninstall | check)
+      __gh_signoff_offer_contexts
+      ;;
+    completion)
+      __gh_signoff_add bash
+      ;;
+  esac
+  __gh_signoff_done
+  return 0
+}
+
+__gh_signoff_register
+GH_SIGNOFF_COMPLETION
+}
+
 cmd_help() {
   cat <<'EOF'
 Sign off on commits without CI infrastructure.
@@ -2161,7 +2527,11 @@ COMMANDS
   uninstall        Remove the signoff requirement — or, given contexts, remove
                    just those and keep the rest
   check            Check if signoff is required
+  contexts         List the exact status-check contexts the branch requires,
+                   one per line on stdout
   status           Show signoff status for the current commit or a specific commit
+  completion       Emit the bash tab-completion script, for
+                   eval "$(gh signoff completion)" in ~/.bashrc
   version          Show gh-signoff version
 
 FLAGS
@@ -2191,6 +2561,7 @@ EXAMPLES
   gh signoff uninstall tests           # Stop requiring signoff on tests only
   gh signoff check                     # Check if signoff is required
   gh signoff check --branch other      # Check if signoff is required on branch
+  gh signoff contexts                  # List required contexts, one per line
   gh signoff status                    # Show completed/pending signoff status
   gh signoff status --commit abc1234   # Show status for a specific commit
 EOF
@@ -2265,27 +2636,21 @@ case "$1" in
   "install")        reject_force; reject_commit; reject_url; shift; cmd_install "$@" ;;
   "uninstall")      reject_force; reject_commit; reject_url; shift; cmd_uninstall "$@" ;;
   "check")          reject_force; reject_commit; reject_url; shift; cmd_check "$@" ;;
+  "contexts")       reject_force; reject_commit; reject_url; shift; cmd_contexts "$@" ;;
   "status")         reject_force; reject_url; shift; cmd_status ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "version")        reject_force; reject_commit; reject_url; reject_extra_args "${@:2}"; cmd_version ;;
   "completion")
-    # Tombstone for a removed command. Completion never worked through
-    # `gh signoff` (see the removal commit), but the setup line we published,
-    # `eval "$(gh signoff completion)"`, lives on in users' shell startup
-    # files. With the command gone, `completion` is just a context name and
-    # would fall through to direct signoff below — so that stale eval line
-    # would POST a false signoff/completion status in any clean, pushed repo,
-    # then try to run the "✓ Signed off" sentence it captured as a command.
-    #
-    # Intercept it ahead of the fallback: make no API call, say NOTHING on
-    # stdout (eval runs whatever stdout carries, and empty is a safe no-op, so
-    # no "✓: command not found"), explain on stderr, and exit nonzero. This
-    # fires whatever leading -f/--commit was parsed, which is why it does not
-    # bother with reject_force/reject_commit. `gh signoff create completion`
-    # still reaches the create arm above and signs off the literal context,
-    # for anyone who truly wants it.
-    printf '%s\n' "gh-signoff: shell completion has been removed; it never worked through 'gh signoff'." >&2
-    printf '%s\n' "Remove this line from your shell startup file (e.g. ~/.bashrc): eval \"\$(gh signoff completion)\"" >&2
-    exit 1
+    # The eval contract this command lives under: its stdout feeds
+    # `eval "$(gh signoff completion)"` in shell startup files — including
+    # the STALE line 0.4.0 told users to delete, possibly with leading
+    # options in front. So every path that is not the emitted adapter must
+    # say NOTHING on stdout, and command-word interception must run ahead
+    # of the implicit-create fallback, which would otherwise POST a false
+    # signoff/completion status and then eval the "✓ Signed off" sentence
+    # it captured. reject_force/reject_commit/reject_url uphold that: they
+    # speak on stderr and exit nonzero. `gh signoff create completion`
+    # still signs off the literal context, as for every command-named one.
+    reject_force; reject_commit; reject_url; shift; cmd_completion "$@"
     ;;
   "-h" | "--help")  reject_force; reject_commit; reject_url; reject_extra_args "${@:2}"; cmd_help ;;
   "--")

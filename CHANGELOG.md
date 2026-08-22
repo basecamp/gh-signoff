@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — 2026-08-22
+
+### Added
+
+- **Statuses can carry a `target_url`**, so the Details link GitHub renders on every status goes somewhere useful. Pass `--url` to `create` or `fail` — a CI runner passes its run URL: `gh signoff fail --commit "$SHA" --url "$RUN_URL"` — or set a repo-wide default with `git config signoff.url`. With neither set, the status carries no `target_url` at all: a boilerplate link would dead-end people expecting CI results. Only `http(s)` URLs are accepted, refused before anything is posted. (#7, #25)
+- **`gh signoff contexts`** lists the exact status-check contexts a branch requires, one full name per line on stdout — the shell-agnostic data source behind tab completion, and an answer to "what does this branch require?" that `check` only gives per named context. Takes `--branch`. A required name this CLI could not itself operate (quote, backslash, control character) is skipped with a count on stderr. `contexts` is a command word now, like `fail`: a context literally named `contexts` is reached with `gh signoff create contexts`. (#26)
+- **Shell completion is back, and works this time.** 0.4.0 removed the `completion` command because `gh` doesn't route tab-completion to extensions; the command now emits a bash adapter that wraps `gh`'s *own* completion instead — so the line 0.4.0 told you to delete is once again the setup line, and you can put it back:
+
+  ```bash
+  eval "$(gh signoff completion)"
+  ```
+
+  Put it after gh's own completion line if you have one. `gh signoff <Tab>` completes commands, options, branches, and the branch's required contexts; everything else still reaches gh's completion, loaded on demand. Names from the API and from git are treated as data: candidates are inserted shell-escaped, or omitted when the quote context you're typing in has no safe spelling (non-ASCII names among them) — nothing API-derived is ever shell-evaluated. bash only for now; zsh and fish can build on `gh signoff contexts`. (#26)
+- The recipe for letting a GitHub App, team, or role merge **without** signoff is documented: add it as a bypass actor on the `signoff` ruleset in repo settings. gh-signoff preserves `bypass_actors` across installs and uninstalls, so the grant sticks. Only possible on rulesets — one more reason for the 0.4.0 migration. (#10, #25)
+
 ## 0.4.0 — 2026-08-21
 
 The first tagged release. Signoff enforcement moves from legacy branch protection to a repository ruleset.
