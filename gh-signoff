@@ -87,7 +87,7 @@ resolve_commit() {
 # Is the commit on a remote we know about? Remote-tracking refs are only as
 # fresh as the last fetch, so this is a local proxy; -f overrides.
 #
-# Stale or absent tracking refs get the same one-time refresh is_clean gives
+# Stale or absent tracking refs get a one-time refresh, as is_clean gives
 # them: a CI runner's slot that just checked out a pushed commit has nothing
 # under refs/remotes yet, and `gh signoff --commit HEAD` (the documented CI
 # form) must not refuse what plain `gh signoff` on the same checkout accepts.
@@ -114,18 +114,16 @@ commit_in_remote_tracking_refs() {
   [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
 }
 
-# On a branch, the refresh is_clean uses: the remote behind the ref it would
-# judge. A detached HEAD — the common CI checkout shape — has no branch to
-# route by, and the scan above covers every remote, so fetch them all. --all
-# keeps going past an unreachable remote and then exits nonzero; what the
-# others delivered is still worth rechecking, so that exit is ignored.
+# The one-time refresh is_clean gives a stale tracking ref, for an explicit
+# commit. The scan above asks whether the commit is on any remote, so every
+# remote is fetched — not just the current branch's, which could miss a commit
+# published elsewhere, and which a detached HEAD (the common CI checkout
+# shape) doesn't have at all. --all keeps going past an unreachable remote and
+# then exits nonzero; what the others delivered is still worth rechecking, so
+# that exit is ignored.
 refresh_remotes_for_commit() {
-  if git symbolic-ref -q HEAD >/dev/null; then
-    refresh_remote_tracking
-  else
-    debug "fetching all remotes to refresh their tracking refs"
-    git fetch --quiet --all 2>/dev/null || true
-  fi
+  debug "fetching all remotes to refresh their tracking refs"
+  git fetch --quiet --all 2>/dev/null || true
 }
 
 # Get default branch with caching

@@ -2618,8 +2618,23 @@ EOF
   [[ "$output" == *"is not on any remote"* ]] || return 1
 }
 
-# A detached checkout -- the common CI shape -- has no branch to route the
-# refresh by, so every remote is fetched before the commit is refused
+# An explicit commit counts as published on any remote, so every remote is
+# refreshed -- not just the current branch's
+@test "--commit refreshes a remote other than the branch's own" {
+  make_pushed_repo
+  git init -q --bare "$TEST_DIR/elsewhere.git"
+  git remote add elsewhere "$TEST_DIR/elsewhere.git"
+  git commit --no-gpg-sign --allow-empty -m "Published elsewhere" >/dev/null
+  git push -q "$TEST_DIR/elsewhere.git" HEAD:refs/heads/topic
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r --contains "$sha")" ]] || return 1
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+# A detached checkout -- the common CI shape -- has no branch at all, and
+# still gets every remote fetched before the commit is refused
 @test "--commit refreshes all remotes on a detached HEAD" {
   make_nested_repo
   add_bare_remote
