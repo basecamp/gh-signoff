@@ -1189,9 +1189,14 @@ refresh_remote_tracking() {
   [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
     upstream_fallback_is_safe || return 1
   # git names the remote only when config picks one explicitly; empty means
-  # its built-in default, origin (push.default=current with no upstream)
+  # its built-in default (push.default=current with no upstream, say), which
+  # is the sole remote when exactly one is configured and origin otherwise
   remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
-  remote_is_named "${remote:=origin}" || return 1
+  if [[ -z "$remote" ]]; then
+    remote=$(git remote)
+    [[ -n "$remote" && "$remote" != *$'\n'* ]] || remote=origin
+  fi
+  remote_is_named "$remote" || return 1
 
   debug "fetching ${remote} to refresh its tracking refs"
   git fetch --quiet "$remote" 2>/dev/null
@@ -1410,6 +1415,10 @@ cmd_fail() {
     user=$(git config user.name 2>/dev/null) || user=""
     description="${user:+${user}: }CI failed"
   fi
+  # GitHub caps a status description at 140 characters and rejects longer
+  # ones outright. A red mark that fails to post defeats the purpose, so cut
+  # rather than refuse; the detail belongs in the run's logs anyway.
+  description="${description:0:140}"
 
   if [ ${#contexts[@]} -eq 0 ]; then
     contexts=("")
@@ -2087,7 +2096,8 @@ OPTIONS
   --branch <branch>       Branch to operate on (for install, uninstall, check, status)
   --commit <sha>          Commit to operate on (for create, fail, status). Any revision
                           git resolves; for create it must be on a remote unless forced with -f
-  --description <text>    Status description for fail (default: "<user>: CI failed")
+  --description <text>    Status description for fail (default: "<user>: CI failed";
+                          GitHub caps it at 140 characters, longer is cut)
 
 EXAMPLES
   gh signoff                           # Sign off on current commit

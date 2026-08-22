@@ -242,6 +242,30 @@ EOF
   [[ "$body" == *" state=failure context=signoff description=suite exploded on bash 3" ]] || return 1
 }
 
+# GitHub rejects a description over 140 characters; a red mark that fails to
+# post is worse than a shortened one
+@test "fail cuts a description to GitHub's 140-character cap" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  long=$(printf 'x%.0s' $(seq 1 150))
+
+  run -0 gh-signoff fail --description "$long"
+  body=$(cat "$MOCK_BODY_LOG")
+  sent=${body##*description=}
+  [[ ${#sent} -eq 140 ]] || return 1
+}
+
+# fail is a command word now, like create and check; a context literally
+# named fail is still reachable the way every command-named context is
+@test "create fail still signs off a context named fail" {
+  make_pushed_repo
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff create fail
+  [[ "$output" == *"Signed off on"*"for fail"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=success context=signoff/fail "* ]] || return 1
+}
+
 # A runner's checkout has no git identity. The only requirement fail states
 # is that GitHub knows the commit, so identity must not be one in practice:
 # it merely drops out of the default description.
@@ -2597,7 +2621,23 @@ EOF
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
-# A custom fetch mapping puts the tracking ref somewhere the remote branch
+# With a single remote that isn't origin, git's implicit default is that
+# remote, not origin
+@test "signoff refreshes the sole remote when it isn't named origin" {
+  make_nested_repo
+  git init -q --bare "$TEST_DIR/upstream.git"
+  git remote add upstream "$TEST_DIR/upstream.git"
+  git push -q upstream HEAD:main
+  git update-ref -d refs/remotes/upstream/main
+  git config push.default current
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/upstream/main" ]] || return 1
+  [[ -z "$(git for-each-ref --format='%(push:remotename)' refs/heads/main)" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+
 # name cannot be read back from. The refresh fetches the whole remote, so the
 # user's own mapping lands the ref where check_clean looks.
 @test "signoff refreshes through a custom fetch refspec" {

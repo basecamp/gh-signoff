@@ -57,7 +57,12 @@ gh signoff fail --commit abc1234 --description "suite exploded"
 A red status is a warning, not an attestation, so no cleanliness check
 applies and no git identity is needed: the only requirement is that GitHub
 knows the commit. The default description is `<user.name>: CI failed`, or
-just `CI failed` on a checkout with no identity configured.
+just `CI failed` on a checkout with no identity configured; GitHub caps
+descriptions at 140 characters, and longer ones are cut to fit.
+
+`fail` is a command word now, like `create` and `check`. A context literally
+named `fail` is still reachable the way every command-named context is:
+`gh signoff create fail`.
 
 ### To require signoff for PR merges
 
