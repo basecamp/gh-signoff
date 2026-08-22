@@ -2631,9 +2631,25 @@ EOF
   run -0 gh-signoff --commit HEAD
   [[ "$output" == *"Signed off on $sha"* ]] || return 1
 
-  # Plain signoff has no branch to judge and still refuses, as before
+  # Plain signoff has no branch to judge and still refuses, as before --
+  # without fetching, since no refresh can make a detached HEAD judgeable
+  git update-ref -d refs/remotes/origin/main
   run -1 gh-signoff
   [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
+  [[ -z "$(git branch -r)" ]] || return 1
+}
+
+# One dead remote must not defeat the refresh for the others
+@test "--commit on a detached HEAD refreshes past an unreachable remote" {
+  make_nested_repo
+  add_bare_remote
+  git remote add gone "$TEST_DIR/no-such-remote.git"
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git checkout -q --detach
+  sha=$(git rev-parse HEAD)
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
 }
 
 @test "signoff fails with clear message when no push destination or upstream" {

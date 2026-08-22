@@ -96,7 +96,7 @@ commit_is_on_a_remote() {
     return 0
   fi
 
-  if refresh_remote_tracking && commit_in_remote_tracking_refs "$1"; then
+  if refresh_remotes_for_commit && commit_in_remote_tracking_refs "$1"; then
     return 0
   fi
 
@@ -112,6 +112,20 @@ commit_is_on_a_remote() {
 
 commit_in_remote_tracking_refs() {
   [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
+}
+
+# On a branch, the refresh is_clean uses: the remote behind the ref it would
+# judge. A detached HEAD — the common CI checkout shape — has no branch to
+# route by, and the scan above covers every remote, so fetch them all. --all
+# keeps going past an unreachable remote and then exits nonzero; what the
+# others delivered is still worth rechecking, so that exit is ignored.
+refresh_remotes_for_commit() {
+  if git symbolic-ref -q HEAD >/dev/null; then
+    refresh_remote_tracking
+  else
+    debug "fetching all remotes to refresh their tracking refs"
+    git fetch --quiet --all 2>/dev/null || true
+  fi
 }
 
 # Get default branch with caching
@@ -1168,23 +1182,19 @@ is_clean() {
 # have run themselves, once, on the failure path only.
 #
 # A URL-tracking branch (fork pull request) has no tracking ref at all and is
-# checked live by url_remote_tip, so there is nothing here to refresh. A
-# detached HEAD has no branch to route by; only commit_is_on_a_remote gets
-# here then, and it scans every remote, so fetch them all.
+# checked live by url_remote_tip, so there is nothing here to refresh; nor is
+# there for a detached HEAD, which check_clean cannot judge at all.
 refresh_remote_tracking() {
   local branch remote
+  branch=$(git symbolic-ref -q HEAD) || return 1
 
-  if branch=$(git symbolic-ref -q HEAD); then
-    [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
-      upstream_fallback_is_safe || return 1
-    remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
-    remote_is_named "$remote" || return 1
-    debug "fetching ${remote} to refresh its tracking refs"
-    git fetch --quiet "$remote" 2>/dev/null
-  else
-    debug "fetching all remotes to refresh their tracking refs"
-    git fetch --quiet --all 2>/dev/null
-  fi
+  [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
+    upstream_fallback_is_safe || return 1
+  remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
+  remote_is_named "$remote" || return 1
+
+  debug "fetching ${remote} to refresh its tracking refs"
+  git fetch --quiet "$remote" 2>/dev/null
 }
 
 check_clean() {
