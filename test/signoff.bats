@@ -141,6 +141,43 @@ EOF
   export PATH="$TEST_DIR/proxy:$PATH"
 }
 
+# Emit the completion adapter to a file and syntax-check it
+emit_completion_adapter() {
+  gh-signoff completion bash >"$TEST_DIR/completion.bash" || return 1
+  bash -n "$TEST_DIR/completion.bash" || return 1
+}
+
+# Simulate one Tab press: in a fresh bash, source the emitted adapter, set
+# COMP_WORDS/COMP_CWORD from the arguments (the last is the word being
+# completed, "" for an empty one), call the registered wrapper the way
+# readline would, and print COMPREPLY one entry per line. A leading --bash3
+# disables the compopt builtin first, standing in for bash 3.2's nospace
+# path; on real bash 3.2 (the docker matrix) compopt is already absent and
+# the disable is a no-op.
+complete_line() {
+  local pre=":"
+  if [[ "${1:-}" == "--bash3" ]]; then
+    pre="enable -n compopt 2>/dev/null || :"
+    shift
+  fi
+  bash -c '
+    '"$pre"'
+    source "$1" || exit 1
+    shift
+    COMP_WORDS=("$@")
+    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+    __gh_signoff_wrap "${COMP_WORDS[0]}" "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]:-}"
+    for r in ${COMPREPLY[@]+"${COMPREPLY[@]}"}; do printf "%s\n" "$r"; done
+  ' bash "$TEST_DIR/completion.bash" "$@"
+}
+
+# A default-branch ruleset requiring an adversarial spread of context names,
+# markers included, for the completion safety tests
+use_hostile_contexts() {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff"},{"context":"signoff/$(touch '"$TEST_DIR"'/pwned)"},{"context":"signoff/`touch '"$TEST_DIR"'/pwned2`"},{"context":"signoff/qa review"},{"context":"signoff/a;b"},{"context":"signoff/déploiement"}]}}]}'
+}
+
 # Basic command tests
 @test "shows help with -h" {
   run -0 gh-signoff -h
@@ -3146,61 +3183,155 @@ SHIM
   [[ ! "$output" == *"for"* ]] || return 1
 }
 
-# The completion command was removed, but `eval "$(gh signoff completion)"`
-# lives in users' shell startup files. With `completion` now an ordinary
-# context word, that stale line would fall through to direct signoff and POST
-# a false signoff/completion status in a clean, pushed repo, then eval the
-# "✓ Signed off" sentence it captured. A tombstone arm intercepts it: no API
-# call, nothing on stdout (so the captured eval is a safe no-op), a message
-# on stderr, nonzero exit.
-@test "the completion tombstone makes no API call and prints nothing on stdout" {
+# --- The contexts command ---
+# The shell-agnostic data source behind completion: one exact full context
+# name per line on stdout, everything human on stderr.
+
+@test "contexts lists ruleset and legacy signoff contexts as full names" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff"},{"context":"signoff/qa review"}]}}]}'
+  export MOCK_BRANCH_PROTECTION_JSON='{"required_status_checks":{"checks":[{"context":"signoff/legacy","app_id":null}]}}'
+  export MOCK_BRANCH_PROTECTION_EXIT=0
+
+  run --separate-stderr -0 gh-signoff contexts
+  [[ "$output" == "signoff
+signoff/qa review
+signoff/legacy" ]] || return 1
+  [[ "$stderr" == *"legacy branch protection"* ]] || return 1
+}
+
+@test "contexts --branch reads the branch's own ruleset" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":8,"name":"signoff (other)"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/other"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff/qa"}]}}]}'
+
+  run --separate-stderr -0 gh-signoff contexts --branch other
+  [[ "$output" == "signoff/qa" ]] || return 1
+}
+
+@test "contexts prints nothing on stdout and exits 1 when signoff is not required" {
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  run --separate-stderr -1 gh-signoff completion
+  run --separate-stderr -1 gh-signoff contexts
   [[ -z "$output" ]] || return 1
-  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ "$stderr" == *"does not require signoff"* ]] || return 1
+  # A read, never a write: the old behavior (an implicit-create context named
+  # contexts) must not resurface as a POST
+  [[ "$(cat "$MOCK_CALL_LOG")" != *"POST"* ]] || return 1
+}
+
+@test "contexts skips a name it cannot operate and says so on stderr" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff/qa\"x"},{"context":"signoff/ctl\u0007bell"},{"context":"signoff/safe"}]}}]}'
+
+  run --separate-stderr -0 gh-signoff contexts
+  [[ "$output" == "signoff/safe" ]] || return 1
+  [[ "$stderr" == *"2 context(s) not listed"* ]] || return 1
+}
+
+@test "contexts prints a hostile name verbatim without executing it" {
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff/$(touch '"$TEST_DIR"'/pwned)"}]}}]}'
+
+  run --separate-stderr -0 gh-signoff contexts
+  [[ "$output" == 'signoff/$(touch '"$TEST_DIR"'/pwned)' ]] || return 1
+  [[ ! -e "$TEST_DIR/pwned" ]] || return 1
+}
+
+@test "contexts strips CRLF from a Windows toolchain" {
+  export MOCK_CRLF=1
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+
+  run --separate-stderr -0 gh-signoff contexts
+  [[ "$output" == "signoff
+signoff/tests" ]] || return 1
+}
+
+@test "contexts rejects -f, --commit, --url and positional arguments" {
+  run -1 gh-signoff -f contexts
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
+
+  run -1 gh-signoff --commit HEAD contexts
+  [[ "$output" == *"--commit is only valid for create, fail, and status"* ]] || return 1
+
+  run -1 gh-signoff contexts --url https://x
+  [[ "$output" == *"--url is only valid for create and fail"* ]] || return 1
+
+  run -1 gh-signoff contexts extra
+  [[ "$output" == *"unexpected argument"* ]] || return 1
+}
+
+# contexts is a command word now, like fail; a context literally named
+# contexts is still reachable the way every command-named context is
+@test "create contexts still signs off the literal context" {
+  make_pushed_repo
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff create contexts
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  [[ "$output" == *"for contexts"* ]] || return 1
+
+  calls=$(cat "$MOCK_CALL_LOG")
+  [[ "$calls" == *"POST repos/:owner/:repo/statuses/"* ]] || return 1
+}
+
+# --- The completion command ---
+# Its stdout feeds `eval "$(gh signoff completion)"` in shell startup files,
+# so the invariant on every path is: a valid shell script, or nothing at all.
+
+@test "completion emits the same parseable adapter bare and for bash" {
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 gh-signoff completion
+  bare="$output"
+  run -0 gh-signoff completion bash
+  [[ "$output" == "$bare" ]] || return 1
+
+  printf '%s\n' "$output" >"$TEST_DIR/completion.bash"
+  bash -n "$TEST_DIR/completion.bash" || return 1
+
   [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
   return 0
 }
 
-@test "the completion tombstone ignores trailing arguments like --contexts" {
+@test "completion refuses other shells and stale arguments with empty stdout" {
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  run --separate-stderr -1 gh-signoff completion --contexts
+  run --separate-stderr -1 gh-signoff completion zsh
   [[ -z "$output" ]] || return 1
-  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+  [[ "$stderr" == *"not supported yet"* && "$stderr" == *"gh signoff contexts"* ]] || return 1
+
+  for arg in fish --contexts nonsense; do
+    run --separate-stderr -1 gh-signoff completion "$arg"
+    [[ -z "$output" ]] || return 1
+    [[ -n "$stderr" ]] || return 1
+  done
+
+  run --separate-stderr -1 gh-signoff completion bash extra
+  [[ -z "$output" ]] || return 1
+
   [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
   return 0
 }
 
-@test "the completion tombstone catches a leading -f in a clean pushed repo" {
-  # The core regression: -f plus a clean pushed repo would otherwise force a
-  # POST. The leading option loop consumes -f, so $1 is still 'completion'
-  # and the tombstone fires before any signoff happens.
+@test "a leading -f or --commit before completion signs nothing and stays silent on stdout" {
+  # Heirs of the 0.4.0 tombstone regression: a stale startup line with a
+  # leading option, in a clean pushed repo where -f would otherwise force a
+  # POST. reject_force/reject_commit speak on stderr only.
   make_pushed_repo
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run --separate-stderr -1 gh-signoff -f completion
   [[ -z "$output" ]] || return 1
-  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
-  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
-  return 0
-}
-
-@test "the completion tombstone catches a leading --commit in a clean pushed repo" {
-  make_pushed_repo
-  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
   run --separate-stderr -1 gh-signoff --commit HEAD completion
   [[ -z "$output" ]] || return 1
-  [[ "$stderr" == *"shell completion has been removed"* ]] || return 1
+
   [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
   return 0
 }
 
 @test "create completion still signs off the literal context" {
-  # The escape hatch: `create` takes its own arm before the tombstone, so a
-  # context genuinely named 'completion' is still reachable
   make_pushed_repo
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
@@ -3212,23 +3343,201 @@ SHIM
   [[ "$calls" == *"POST repos/:owner/:repo/statuses/"* ]] || return 1
 }
 
-@test "the exact old initializer line signs nothing and errors cleanly" {
-  # Headline regression: the literal line users were told to add to ~/.bashrc,
-  #   eval "$(gh signoff completion)"
-  # driven through a proxy that routes the `gh signoff` subcommand form to the
-  # extension the way real gh does — the space form, not the gh-signoff binary
-  # directly. In a clean pushed repo it must POST no status, and eval of the
-  # (empty) stdout must not surface a "✓: command not found" or a "Signed off".
+@test "the published eval line loads working completion through gh" {
+  # The line 0.4.0 told users to delete, driven through the subcommand proxy
+  # the way real gh runs it, now registers the wrapper for gh and gh-signoff
+  # and makes no API calls doing so
   make_pushed_repo
   use_gh_subcommand_proxy
   export MOCK_CALL_LOG="$TEST_DIR/calls.log"
 
-  run eval "$(gh signoff completion)"
-  [[ "$output" != *"command not found"* ]] || return 1
-  [[ "$output" != *"Signed off"* ]] || return 1
+  run -0 bash -c 'eval "$(gh signoff completion)" && complete -p gh && complete -p gh-signoff'
+  [[ "$output" == *"-F __gh_signoff_wrap gh"* ]] || return 1
+  [[ "$output" == *"-F __gh_signoff_wrap gh-signoff"* ]] || return 1
 
   [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
   return 0
+}
+
+# --- The emitted adapter ---
+
+@test "completion offers command words and contexts at the command position" {
+  use_gh_subcommand_proxy
+  export MOCK_RULESETS_LIST_JSON='[{"id":42,"name":"signoff"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff"},{"context":"signoff/tests"}]}}]}'
+  emit_completion_adapter
+
+  run -0 complete_line gh signoff ""
+  for word in create fail install uninstall check contexts status completion version tests; do
+    [[ "$output" == *"$word"* ]] || return 1
+  done
+
+  # Direct gh-signoff invocation completes from base index 1
+  run -0 complete_line gh-signoff ""
+  [[ "$output" == *"create"* && "$output" == *"tests"* ]] || return 1
+}
+
+@test "completion offers per-command option tables without API calls" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 complete_line gh signoff fail "--"
+  [[ "$output" == "--commit
+--description
+--url" ]] || return 1
+
+  run -0 complete_line gh signoff status "--"
+  [[ "$output" == "--branch
+--commit" ]] || return 1
+
+  run -0 complete_line gh signoff install "--"
+  [[ "${output% }" == "--branch" ]] || return 1
+
+  run -0 complete_line gh signoff completion ""
+  [[ "${output% }" == "bash" ]] || return 1
+
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "completion offers nothing after --commit and local branches after --branch" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+  git branch -q feature-x
+
+  run -0 complete_line gh signoff --commit ""
+  [[ -z "$output" ]] || return 1
+
+  run -0 complete_line gh signoff check --branch ""
+  [[ "$output" == *"feature-x"* ]] || return 1
+}
+
+@test "completion prefix-filters literally, so a typed \$( or * matches only itself" {
+  use_gh_subcommand_proxy
+  use_hostile_contexts
+  emit_completion_adapter
+
+  run -0 complete_line gh signoff fail '*'
+  [[ -z "$output" ]] || return 1
+
+  run -0 complete_line gh signoff fail '$('
+  [[ $(printf '%s\n' "$output" | grep -c .) -eq 1 ]] || return 1
+  [[ "$output" == *pwned* ]] || return 1
+  [[ ! -e "$TEST_DIR/pwned" ]] || return 1
+}
+
+@test "a --branch on the line steers the contexts fetch" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+  export MOCK_RULESETS_LIST_JSON='[{"id":8,"name":"signoff (other)"}]'
+  export MOCK_RULESET_JSON='{"enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/other"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"signoff/qa"}]}}]}'
+
+  run -0 complete_line gh signoff check --branch other ""
+  [[ "${output% }" == "qa" ]] || return 1
+
+  # Without the steer, the default branch has no signoff ruleset to offer
+  run -0 complete_line gh signoff check ""
+  [[ -z "$output" ]] || return 1
+}
+
+@test "status and version positions offer nothing and cost no API calls" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+  export MOCK_CALL_LOG="$TEST_DIR/calls.log"
+
+  run -0 complete_line gh signoff status ""
+  [[ -z "$output" ]] || return 1
+
+  run -0 complete_line gh signoff version ""
+  [[ -z "$output" ]] || return 1
+
+  [[ -f "$MOCK_CALL_LOG" && -s "$MOCK_CALL_LOG" ]] && return 1
+  return 0
+}
+
+@test "non-signoff gh completion is delegated to gh's own function" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+
+  run -0 bash -c '
+    __start_gh() { COMPREPLY=(delegated); }
+    complete -o default -F __start_gh gh
+    source "'"$TEST_DIR"'/completion.bash"
+    spec=$(complete -p gh)
+    [[ "$spec" == *"-o default"* && "$spec" == *"-F __gh_signoff_wrap"* ]] || exit 1
+    COMP_WORDS=(gh pr ""); COMP_CWORD=2
+    __gh_signoff_wrap gh "" pr
+    [[ "${COMPREPLY[0]}" == "delegated" ]] || exit 1
+  '
+}
+
+@test "delegation loads gh's completion on demand and re-registers on top" {
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+  # A gh whose `completion -s bash` answers with a registration, standing in
+  # for the lazy-load path our registered spec otherwise starves
+  cat >"$TEST_DIR/proxy/gh" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == signoff ]]; then shift; exec gh-signoff "\$@"; fi
+if [[ "\${1:-}" == completion ]]; then
+  echo '__lazy_gh() { COMPREPLY=(lazy); }; complete -o default -F __lazy_gh gh'
+  exit 0
+fi
+exec "$TEST_DIR/gh" "\$@"
+EOF
+
+  run -0 bash -c '
+    source "'"$TEST_DIR"'/completion.bash"
+    COMP_WORDS=(gh pr ""); COMP_CWORD=2
+    __gh_signoff_wrap gh "" pr
+    [[ "${COMPREPLY[0]}" == "lazy" ]] || exit 1
+    [[ "$(complete -p gh)" == *"-F __gh_signoff_wrap"* ]] || exit 1
+  '
+}
+
+@test "without compopt a lone candidate gets its trailing space" {
+  # The bash 3.2 path: registered -o nospace with no compopt to manage
+  # spacing, so the completer appends the space itself
+  use_gh_subcommand_proxy
+  emit_completion_adapter
+
+  run -0 complete_line --bash3 gh signoff che
+  [[ "$output" == "check " ]] || return 1
+}
+
+@test "hostile context names complete safely in every quote context" {
+  use_gh_subcommand_proxy
+  use_hostile_contexts
+  emit_completion_adapter
+
+  # Unquoted: candidates are printf %q spellings that round-trip through the
+  # shell to the raw name; the non-ASCII name is omitted (no safe spelling
+  # across bash 3-5), and nothing ever executes
+  run -0 complete_line gh signoff fail ""
+  [[ $(printf '%s\n' "$output" | grep -c .) -eq 4 ]] || return 1
+  [[ "$output" != *"déploiement"* ]] || return 1
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    got=$(eval "printf '%s' $candidate") || return 1
+    case "$got" in
+      '$(touch '*'/pwned)' | '`touch '*'/pwned2`' | 'qa review' | 'a;b') ;;
+      *) return 1 ;;
+    esac
+  done <<<"$output"
+
+  # Double-quoted: $ and ` names are omitted (raw would execute on Enter,
+  # escaped mismatches readline), inert names are inserted raw
+  run -0 complete_line gh signoff fail '"'
+  [[ "$output" == "qa review
+a;b" ]] || return 1
+
+  # Single-quoted: everything is literal, so even the $( name rides raw
+  run -0 complete_line gh signoff fail "'"
+  [[ $(printf '%s\n' "$output" | grep -c .) -eq 4 ]] || return 1
+  [[ "$output" == *'$(touch '*'/pwned)'* ]] || return 1
+
+  [[ ! -e "$TEST_DIR/pwned" && ! -e "$TEST_DIR/pwned2" ]] || return 1
 }
 
 @test "leading -f applies to contextual signoff" {
