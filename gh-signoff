@@ -86,8 +86,17 @@ resolve_commit() {
 
 # Is the commit on a remote we know about? Remote-tracking refs are only as
 # fresh as the last fetch, so this is a local proxy; -f overrides.
+#
+# Stale or absent tracking refs get a one-time refresh, as is_clean gives
+# them: a CI runner's slot that just checked out a pushed commit has nothing
+# under refs/remotes yet, and `gh signoff --commit HEAD` (the documented CI
+# form) must not refuse what plain `gh signoff` on the same checkout accepts.
 commit_is_on_a_remote() {
-  if [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]; then
+  if commit_in_remote_tracking_refs "$1"; then
+    return 0
+  fi
+
+  if refresh_remotes_for_commit && commit_in_remote_tracking_refs "$1"; then
     return 0
   fi
 
@@ -99,6 +108,22 @@ commit_is_on_a_remote() {
   # `gh signoff` just proved was published.
   url_remote_tip || return 1
   git merge-base --is-ancestor "$1" "$URL_REMOTE_TIP" 2>/dev/null
+}
+
+commit_in_remote_tracking_refs() {
+  [[ -n "$(git branch -r --contains "$1" 2>/dev/null)" ]]
+}
+
+# The one-time refresh is_clean gives a stale tracking ref, for an explicit
+# commit. The scan above asks whether the commit is on any remote, so every
+# remote is fetched — not just the current branch's, which could miss a commit
+# published elsewhere, and which a detached HEAD (the common CI checkout
+# shape) doesn't have at all. --all keeps going past an unreachable remote and
+# then exits nonzero; what the others delivered is still worth rechecking, so
+# that exit is ignored.
+refresh_remotes_for_commit() {
+  debug "fetching all remotes to refresh their tracking refs"
+  git fetch --quiet --all 2>/dev/null || true
 }
 
 # Get default branch with caching
@@ -1116,7 +1141,71 @@ url_remote_tip() {
   return 0
 }
 
+# check_clean, with one retry after refreshing the remote-tracking ref it
+# judges. A CI runner's slot — or any second machine — can hold the pushed
+# commit while that ref is stale or absent (a freshly created checkout has
+# never fetched), which would misreport published work as unpushed. Only the
+# push-verification reasons warrant the fetch; uncommitted changes can't be
+# fixed by one.
 is_clean() {
+  if check_clean; then
+    return 0
+  fi
+
+  case "$UNCLEAN_REASON" in
+    *unpushed*|*"does not resolve"*)
+      refresh_remote_tracking && check_clean
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Fetch the remote whose tracking ref check_clean judges, so a recheck sees
+# what that remote actually holds. The ref is @{push}, or @{upstream} when that
+# fallback is sound — the same order check_clean resolves them in — and git
+# derives both from config alone, so for-each-ref knows which remote serves
+# them even when the ref has never been fetched. Refreshing the upstream
+# regardless would miss every routed configuration (branch.*.pushRemote,
+# remote.pushDefault, push.default=current or upstream): the fetch would land on
+# a ref the check never reads, and published work would still come back
+# unpushed.
+#
+# The whole remote is fetched, not one branch. Inferring which remote branch
+# feeds the tracking ref means re-deriving git's refspec mapping, and a custom
+# remote.<name>.fetch (say +refs/heads/*:refs/remotes/origin/custom/*) breaks
+# any shortcut; a plain fetch applies whatever mapping the user configured, so
+# the judged ref is refreshed by construction. It is the fetch the user would
+# have run themselves, once, on the failure path only.
+#
+# A URL-tracking branch (fork pull request) has no tracking ref at all and is
+# checked live by url_remote_tip, so there is nothing here to refresh; nor is
+# there for a detached HEAD, which check_clean cannot judge at all.
+refresh_remote_tracking() {
+  local branch remote
+  branch=$(git symbolic-ref -q HEAD) || return 1
+
+  [[ -n "$(git for-each-ref --format='%(push)' "$branch" 2>/dev/null)" ]] ||
+    upstream_fallback_is_safe || return 1
+  # git names the remote only when config picks one explicitly; empty means
+  # its built-in default (push.default=current with no upstream, say), which
+  # is the sole remote when exactly one is configured and origin otherwise
+  remote=$(git for-each-ref --format='%(push:remotename)' "$branch" 2>/dev/null)
+  if [[ -z "$remote" ]]; then
+    remote=$(git remote)
+    [[ -n "$remote" && "$remote" != *$'\n'* ]] || remote=origin
+  fi
+  remote_is_named "$remote" || return 1
+
+  # A fetch is not atomic: it can update the judged ref and still exit
+  # nonzero over another refspec (a diverged unforced tag mapping, say), so
+  # the exit says nothing about that ref. Recheck regardless.
+  debug "fetching ${remote} to refresh its tracking refs"
+  git fetch --quiet "$remote" 2>/dev/null || true
+}
+
+check_clean() {
   local git_cmd=$(command -v git)
 
   if [[ -n "$($git_cmd status --porcelain)" ]]; then
@@ -1272,6 +1361,112 @@ cmd_create() {
   fi
 }
 
+# Post a failing signoff status, so a CI run that fails — especially one
+# detached on a runner — leaves a visible red mark instead of silence. A red
+# status is a warning, not an attestation, so no cleanliness check applies,
+# and no git identity is needed: the only requirement is that GitHub knows the
+# commit at all. A runner's checkout typically has no user.name; it colors the
+# default description when present and is simply absent from it otherwise.
+cmd_fail() {
+  local commit=""
+  local description=""
+  local contexts=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --commit)
+        resolve_commit "${2:-}"
+        commit="$RESOLVED_COMMIT"
+        shift 2
+        ;;
+      --description)
+        if [[ -z "${2:-}" ]]; then
+          fail "option --description requires an argument"
+        fi
+        description="$2"
+        shift 2
+        ;;
+      -f)
+        fail "-f is only valid for create"
+        ;;
+      --)
+        # End of options: the rest are contexts, as for create
+        shift
+        while [[ $# -gt 0 ]]; do
+          require_context_name "context name" "$1"
+          contexts+=("$1")
+          shift
+        done
+        ;;
+      -*)
+        fail "unknown option: $(scrub "$1")"
+        ;;
+      *)
+        require_context_name "context name" "$1"
+        contexts+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$commit" ]]; then
+    commit=$(git rev-parse HEAD) || fail "failed to get current commit"
+  fi
+
+  if [[ -z "$description" ]]; then
+    local user
+    user=$(git config user.name 2>/dev/null) || user=""
+    description="${user:+${user}: }CI failed"
+  fi
+  # GitHub caps a status description at 140 characters and rejects longer
+  # ones outright. A red mark that fails to post defeats the purpose, so cut
+  # rather than refuse; the detail belongs in the run's logs anyway.
+  description="${description:0:140}"
+
+  if [ ${#contexts[@]} -eq 0 ]; then
+    contexts=("")
+  fi
+
+  local success=true
+  local messages=()
+
+  for context in "${contexts[@]}"; do
+    local context_name="signoff"
+    if [[ -n "$context" ]]; then
+      context_name="signoff/${context}"
+    fi
+
+    debug "creating failure status for commit ${commit} with context $(scrub "$context_name")"
+
+    if gh api \
+      --method POST \
+      "repos/:owner/:repo/statuses/${commit}" \
+      -f state=failure \
+      -f context="${context_name}" \
+      -f "description=${description}" >/dev/null; then
+
+      if [[ -z "$context" ]]; then
+        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit}")
+      else
+        messages+=("${STATUS_FAILURE} Reported CI failure on ${commit} for $(scrub "$context")")
+      fi
+    else
+      success=false
+      if [[ -z "$context" ]]; then
+        printf '%s\n' "Failed to report CI failure on ${commit}" >&2
+      else
+        printf '%s\n' "Failed to report CI failure on ${commit} for $(scrub "$context")" >&2
+      fi
+    fi
+  done
+
+  if $success; then
+    printf "%s\n" "${messages[@]}"
+  else
+    exit 1
+  fi
+}
+
 cmd_install() {
   local branch=""
   local contexts=()
@@ -1291,7 +1486,7 @@ cmd_install() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1451,7 +1646,7 @@ cmd_uninstall() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1667,7 +1862,7 @@ cmd_check() {
         fail "-f is only valid for create"
         ;;
       --commit)
-        fail "--commit is only valid for create and status"
+        fail "--commit is only valid for create, fail, and status"
         ;;
       --)
         # End of options: the rest are contexts, even a leading-dash name
@@ -1887,6 +2082,7 @@ USAGE
 
 COMMANDS
   create (default) Sign off on the current commit or a specific commit
+  fail             Report a CI failure on the current commit or a specific commit
   install          Require signoff via a repository ruleset. Adds the given
                    contexts to whatever is already required, and migrates any
                    legacy signoff branch protection into the ruleset
@@ -1900,12 +2096,16 @@ FLAGS
   -f  Force sign off (ignore uncommitted/unpushed changes)
 
 OPTIONS
-  --branch <branch>  Branch to operate on (for install, uninstall, check, status)
-  --commit <sha>     Commit to sign off on (for create, status). Any revision
-                     git resolves; must be on a remote unless forced with -f
+  --branch <branch>       Branch to operate on (for install, uninstall, check, status)
+  --commit <sha>          Commit to operate on (for create, fail, status). Any revision
+                          git resolves; for create it must be on a remote unless forced with -f
+  --description <text>    Status description for fail (default: "<user>: CI failed";
+                          GitHub caps it at 140 characters, longer is cut)
 
 EXAMPLES
   gh signoff                           # Sign off on current commit
+  gh signoff fail                      # Report a CI failure on current commit
+  gh signoff fail once                 # Report a partial-context CI failure
   gh signoff --commit abc1234          # Sign off on a specific commit
   gh signoff --commit HEAD~1 tests     # Partial signoff on a specific commit
   gh signoff create -f                 # Force signoff
@@ -1921,7 +2121,7 @@ EOF
 }
 
 # A leading -f applies to create (explicit, implicit, or contextual); a leading
-# --commit to create and status. Both are rejected for every other command.
+# --commit to create, fail, and status. Both are rejected for every other command.
 #
 # The revision stays raw here: resolving it before the command is known would
 # report `gh signoff --commit nope install` as a bad revision, when what's
@@ -1953,7 +2153,7 @@ reject_force() {
 
 reject_commit() {
   if [[ ${#commit_opt[@]} -gt 0 ]]; then
-    fail "--commit is only valid for create and status"
+    fail "--commit is only valid for create, fail, and status"
   fi
 }
 
@@ -1972,6 +2172,7 @@ fi
 # possibly-empty array. ${commit_opt:+...} would word-split the revision.
 case "$1" in
   "create")         shift; cmd_create ${force:+-f} ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
+  "fail")           reject_force; shift; cmd_fail ${commit_opt[@]+"${commit_opt[@]}"} "$@" ;;
   "install")        reject_force; reject_commit; shift; cmd_install "$@" ;;
   "uninstall")      reject_force; reject_commit; shift; cmd_uninstall "$@" ;;
   "check")          reject_force; reject_commit; shift; cmd_check "$@" ;;

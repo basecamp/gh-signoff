@@ -203,6 +203,130 @@ EOF
   [[ "$output" == *"Signed off on $sha"* ]] || return 1
 }
 
+# fail posts a red signoff status so a failed CI run -- especially one
+# detached on a runner -- leaves a visible mark instead of silence. A red
+# status is a warning, not an attestation, so no cleanliness check applies:
+# these tests run in the top-level TEST_DIR repo, which is always dirty with
+# the untracked gh-signoff and gh mock binaries.
+@test "fail reports a CI failure without any cleanliness check" {
+  [[ -n "$(git status --porcelain)" ]] || return 1
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  sha=$(git rev-parse HEAD)
+
+  run -0 gh-signoff fail
+  [[ "$output" == *"${STATUS_FAILURE} Reported CI failure on $sha"* ]] || return 1
+
+  # The mock accepts any status POST, so prove what this one carried: a red
+  # state on the bare signoff context, described by whoever ran it
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == "POST repos/:owner/:repo/statuses/$sha state=failure context=signoff description=Test User: CI failed" ]] || return 1
+}
+
+@test "fail reports a CI failure for each named context" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff fail tests lint
+  [[ "$output" == *"for tests"* ]] || return 1
+  [[ "$output" == *"for lint"* ]] || return 1
+
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=failure context=signoff/tests description="* ]] || return 1
+  [[ "$body" == *" state=failure context=signoff/lint description="* ]] || return 1
+}
+
+@test "fail sends a custom --description verbatim" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff fail --description "suite exploded on bash 3"
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=failure context=signoff description=suite exploded on bash 3" ]] || return 1
+}
+
+# GitHub rejects a description over 140 characters; a red mark that fails to
+# post is worse than a shortened one
+@test "fail cuts a description to GitHub's 140-character cap" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  long=$(printf 'x%.0s' $(seq 1 150))
+
+  run -0 gh-signoff fail --description "$long"
+  body=$(cat "$MOCK_BODY_LOG")
+  sent=${body##*description=}
+  [[ ${#sent} -eq 140 ]] || return 1
+}
+
+# fail is a command word now, like create and check; a context literally
+# named fail is still reachable the way every command-named context is
+@test "create fail still signs off a context named fail" {
+  make_pushed_repo
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+
+  run -0 gh-signoff create fail
+  [[ "$output" == *"Signed off on"*"for fail"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" state=success context=signoff/fail "* ]] || return 1
+}
+
+# A runner's checkout has no git identity. The only requirement fail states
+# is that GitHub knows the commit, so identity must not be one in practice:
+# it merely drops out of the default description.
+@test "fail needs no git identity" {
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  git config --unset user.name
+  [[ -z "$(git config user.name)" ]] || return 1
+
+  run -0 gh-signoff fail
+  [[ "$output" == *"Reported CI failure on"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" description=CI failed" ]] || return 1
+
+  run -0 gh-signoff fail --description "suite exploded"
+  [[ "$output" == *"Reported CI failure on"* ]] || return 1
+}
+
+@test "fail targets the commit named by --commit" {
+  sha=$(git rev-parse HEAD)
+  export MOCK_EXPECT_COMMIT="$sha"
+
+  run -0 gh-signoff fail --commit "${sha:0:8}"
+  [[ "$output" == *"Reported CI failure on $sha"* ]] || return 1
+}
+
+@test "fail holds context names to the same rule as create" {
+  run -1 gh-signoff fail ""
+  [[ "$output" == *"context name cannot be empty"* ]] || return 1
+
+  run -1 gh-signoff fail 'qa"review'
+  [[ "$output" == *"context name contains characters unsafe for JSON"* ]] || return 1
+
+  # -- ends options, as for create, so a leading-dash name is a context
+  export MOCK_BODY_LOG="$TEST_DIR/bodies.log"
+  run -0 gh-signoff fail -- -qa
+  [[ "$output" == *"for -qa"* ]] || return 1
+  body=$(cat "$MOCK_BODY_LOG")
+  [[ "$body" == *" context=signoff/-qa "* ]] || return 1
+}
+
+@test "fail --description requires an argument" {
+  run -1 gh-signoff fail --description
+  [[ "$output" == *"option --description requires an argument"* ]] || return 1
+}
+
+@test "fail rejects -f" {
+  run -1 gh-signoff fail -f
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
+
+  run -1 gh-signoff -f fail
+  [[ "$output" == *"-f is only valid for create"* ]] || return 1
+}
+
+@test "fail propagates a status API failure" {
+  export MOCK_POST_STATUS_EXIT=1
+
+  run -1 gh-signoff fail
+  [[ "$output" == *"Failed to report CI failure"* ]] || return 1
+}
+
 @test "--commit rejects a revision git cannot resolve" {
   run -1 gh-signoff create --commit 'abc/status'
   [[ "$output" == *"invalid commit: abc/status"* ]] || return 1
@@ -2422,6 +2546,212 @@ EOF
   [[ "$output" == *"Signed off on"* ]] || return 1
 }
 
+# A CI runner's slot -- or any second machine -- can hold the pushed commit
+# while its remote-tracking ref is stale or absent. Signoff refreshes the
+# branch's tracking ref and rechecks before declaring work unpushed.
+@test "signoff refreshes a stale remote-tracking ref before declaring work unpushed" {
+  make_pushed_repo
+  git commit --no-gpg-sign --allow-empty -m "Pushed from elsewhere" >/dev/null
+  # The remote holds the commit, but origin/main was never updated locally
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "signoff fetches a never-fetched tracking ref before refusing" {
+  make_nested_repo
+  add_bare_remote
+  # Objects reach the remote without creating refs/remotes/origin/main
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+@test "signoff still catches unpushed work after refreshing a stale tracking ref" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+
+  run -1 gh-signoff
+  [[ "$output" == *"unpushed changes"* ]] || return 1
+  # The refresh happened (the tracking ref now exists) and the recheck held
+  git rev-parse --verify -q refs/remotes/origin/main >/dev/null || return 1
+}
+
+# The ref to refresh is the one check_clean judges: @{push}, which routing
+# config can point at a remote other than the upstream. Refreshing the
+# upstream there would land on a ref the check never reads.
+@test "signoff refreshes the effective push remote, not the upstream" {
+  make_pushed_repo
+  git init -q --bare "$TEST_DIR/pushes.git"
+  git remote add pushes "$TEST_DIR/pushes.git"
+  git config branch.main.pushRemote pushes
+  git config push.default current
+  git commit --no-gpg-sign --allow-empty -m "Pushed to the push remote" >/dev/null
+  # The push remote holds the commit; neither tracking ref knows yet, and
+  # the upstream (origin) never will
+  git push -q "$TEST_DIR/pushes.git" HEAD:main
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/pushes/main" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  git rev-parse --verify -q refs/remotes/pushes/main >/dev/null || return 1
+}
+
+# With no upstream, push.default=current still pushes to origin by git's own
+# default -- which for-each-ref reports as an empty remote name, since it
+# names only an explicitly configured one
+@test "signoff refreshes the implicit origin for a branch with no upstream" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git update-ref -d refs/remotes/origin/main
+  git config push.default current
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/origin/main" ]] || return 1
+  [[ -z "$(git for-each-ref --format='%(push:remotename)' refs/heads/main)" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+# With a single remote that isn't origin, git's implicit default is that
+# remote, not origin
+@test "signoff refreshes the sole remote when it isn't named origin" {
+  make_nested_repo
+  git init -q --bare "$TEST_DIR/upstream.git"
+  git remote add upstream "$TEST_DIR/upstream.git"
+  git push -q upstream HEAD:main
+  git update-ref -d refs/remotes/upstream/main
+  git config push.default current
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/upstream/main" ]] || return 1
+  [[ -z "$(git for-each-ref --format='%(push:remotename)' refs/heads/main)" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+# A fetch is not atomic: it can update the judged ref and still exit nonzero
+# over something else (a rejected refspec, a submodule that won't fetch --
+# which cases git applies partially varies by version). The recheck must
+# happen regardless, so simulate the contract directly: a git on PATH that
+# does the fetch and then reports failure.
+@test "signoff rechecks after a fetch that updated the tracking ref but failed" {
+  make_nested_repo
+  add_bare_remote
+  git push -q origin HEAD:main
+  git update-ref -d refs/remotes/origin/main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  cat > "$TEST_DIR/git" <<'SHIM'
+#!/usr/bin/env bash
+# Pass through to the real git; fetch does its work, then reports failure
+PATH="${PATH#*:}"
+if [[ "$1" == fetch ]]; then git "$@"; exit 1; fi
+exec git "$@"
+SHIM
+  chmod +x "$TEST_DIR/git"
+  hash -r
+  ! git fetch --quiet origin || return 1
+  git rev-parse --verify -q refs/remotes/origin/main >/dev/null || return 1
+  git update-ref -d refs/remotes/origin/main
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+}
+
+# A custom fetch mapping puts the tracking ref somewhere the remote branch
+# name cannot be read back from. The refresh fetches the whole remote, so the
+# user's own mapping lands the ref where check_clean looks.
+@test "signoff refreshes through a custom fetch refspec" {
+  make_nested_repo
+  add_bare_remote
+  git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/custom/*'
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  [[ "$(git for-each-ref --format='%(push)' refs/heads/main)" == "refs/remotes/origin/custom/main" ]] || return 1
+
+  run -0 gh-signoff
+  [[ "$output" == *"Signed off on"* ]] || return 1
+  git rev-parse --verify -q refs/remotes/origin/custom/main >/dev/null || return 1
+}
+
+# The same runner slot signs off with --commit HEAD, the documented CI form,
+# and must not be refused for the stale tracking ref that plain signoff just
+# looked past
+@test "--commit refreshes a stale tracking ref before refusing the commit" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main
+  sha=$(git rev-parse HEAD)
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  # Still refused when the refresh shows the commit was never pushed
+  git commit --no-gpg-sign --allow-empty -m "Unpushed commit" >/dev/null
+  run -1 gh-signoff --commit HEAD
+  [[ "$output" == *"is not on any remote"* ]] || return 1
+}
+
+# An explicit commit counts as published on any remote, so every remote is
+# refreshed -- not just the current branch's
+@test "--commit refreshes a remote other than the branch's own" {
+  make_pushed_repo
+  git init -q --bare "$TEST_DIR/elsewhere.git"
+  git remote add elsewhere "$TEST_DIR/elsewhere.git"
+  git commit --no-gpg-sign --allow-empty -m "Published elsewhere" >/dev/null
+  git push -q "$TEST_DIR/elsewhere.git" HEAD:refs/heads/topic
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r --contains "$sha")" ]] || return 1
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
+# A detached checkout -- the common CI shape -- has no branch at all, and
+# still gets every remote fetched before the commit is refused
+@test "--commit refreshes all remotes on a detached HEAD" {
+  make_nested_repo
+  add_bare_remote
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git checkout -q --detach
+  sha=$(git rev-parse HEAD)
+  [[ -z "$(git branch -r)" ]] || return 1
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+
+  # Plain signoff has no branch to judge and still refuses, as before --
+  # without fetching, since no refresh can make a detached HEAD judgeable
+  git update-ref -d refs/remotes/origin/main
+  run -1 gh-signoff
+  [[ "$output" == *"cannot verify the current branch is pushed"* ]] || return 1
+  [[ -z "$(git branch -r)" ]] || return 1
+}
+
+# One dead remote must not defeat the refresh for the others
+@test "--commit on a detached HEAD refreshes past an unreachable remote" {
+  make_nested_repo
+  add_bare_remote
+  git remote add gone "$TEST_DIR/no-such-remote.git"
+  git push -q "$TEST_DIR/remote.git" HEAD:main
+  git checkout -q --detach
+  sha=$(git rev-parse HEAD)
+
+  run -0 gh-signoff --commit HEAD
+  [[ "$output" == *"Signed off on $sha"* ]] || return 1
+}
+
 @test "signoff fails with clear message when no push destination or upstream" {
   make_nested_repo
 
@@ -2824,7 +3154,7 @@ EOF
               "uninstall --commit nope" "--commit nope uninstall" \
               "check --commit nope" "--commit nope check"; do
     run -1 gh-signoff $args
-    [[ "$output" == *"--commit is only valid for create and status"* ]] || return 1
+    [[ "$output" == *"--commit is only valid for create, fail, and status"* ]] || return 1
     [[ ! "$output" == *"invalid commit"* ]] || return 1
   done
 }

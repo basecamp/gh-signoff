@@ -27,7 +27,7 @@ gh extension install basecamp/gh-signoff
 gh signoff
 ```
 
-Without `-f`, signoff requires HEAD to be contained in `@{push}`. When `@{push}` doesn't resolve, signoff falls back to `@{upstream}` only in the narrow centralized case — `push.default` simple (or unset), an upstream on a real remote whose single push URL matches its fetch URL, and no `pushRemote`/`pushDefault`/push-refspec rerouting — and otherwise refuses. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`.
+Without `-f`, signoff requires HEAD to be contained in `@{push}`. When `@{push}` doesn't resolve, signoff falls back to `@{upstream}` only in the narrow centralized case — `push.default` simple (or unset), an upstream on a real remote whose single push URL matches its fetch URL, and no `pushRemote`/`pushDefault`/push-refspec rerouting — and otherwise refuses. CI worktrees that check out a differently-named tracking branch may want `git config push.default upstream`. When the check would report published work as unpushed only because the tracking ref is stale or absent — a CI runner's slot, or any second machine — signoff fetches the remote that ref lives on (the effective `@{push}` remote, or the upstream's when falling back to it) once and rechecks. `--commit` gets the same kind of refresh before refusing a commit as not on any remote — every remote, since any of them counts.
 
 ### Signing off on a specific commit
 
@@ -42,6 +42,27 @@ gh signoff status --commit abc1234
 `--commit` takes anything `git rev-parse` resolves. The commit still has to be on a remote — a commit you haven't fetched can't be checked, so it needs `-f`, same as any other override.
 
 A branch checked out from a cross-repository pull request (`gh pr checkout` on a fork PR) tracks a bare URL rather than a named remote, so it has no tracking ref for either `@{push}` or `@{upstream}` to resolve. Signoff asks that repository directly instead — one `git ls-remote` for the tracked ref — and accepts HEAD when it's contained in the advertised tip. If that tip isn't already in your repository, or a push wouldn't provably land on the same URL, it refuses rather than guess.
+
+### Reporting a failure
+
+When a run fails — especially one detached on a CI runner, where silence
+is indistinguishable from "never ran" — leave a visible red mark:
+
+```bash
+gh signoff fail
+gh signoff fail tests                      # a partial context
+gh signoff fail --commit abc1234 --description "suite exploded"
+```
+
+A red status is a warning, not an attestation, so no cleanliness check
+applies and no git identity is needed: the only requirement is that GitHub
+knows the commit. The default description is `<user.name>: CI failed`, or
+just `CI failed` on a checkout with no identity configured; GitHub caps
+descriptions at 140 characters, and longer ones are cut to fit.
+
+`fail` is a command word now, like `create` and `check`. A context literally
+named `fail` is still reachable the way every command-named context is:
+`gh signoff create fail`.
 
 ### To require signoff for PR merges
 
